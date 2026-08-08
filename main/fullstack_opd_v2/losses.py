@@ -79,9 +79,15 @@ def low_var_kl_support(s_topk_logp: torch.Tensor, ref_logp_at_support: torch.Ten
 
 
 def expected_reward(dists: torch.Tensor, delta: torch.Tensor,
-                    mask: torch.Tensor | None = None) -> torch.Tensor:
-    """E_{π_dists}[Δ_T]：(B,T,V),(B,T,V) -> (B,T)。监控用（不反传）。"""
-    rm = (dists.exp() * delta).sum(-1)
+                    mask: torch.Tensor | None = None,
+                    p_dists: torch.Tensor | None = None) -> torch.Tensor:
+    """E_{π_dists}[Δ_T]：(B,T,V),(B,T,V) -> (B,T)。监控用（不反传）。
+
+    p_dists: 可选，= dists.exp() 的预计算值；调用方已缓存时复用，省一次 (B,T,V) exp。
+            默认 None 时内部自算 dists.exp()（语义与原版一致）。
+    """
+    rm = (p_dists if p_dists is not None else dists.exp()) * delta
+    rm = rm.sum(-1)
     if mask is not None:
         rm = rm * mask
     return rm

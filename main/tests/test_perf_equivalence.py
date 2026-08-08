@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from fullstack_opd_v2.losses import pg_loss
+from fullstack_opd_v2.losses import expected_reward, pg_loss
 from fullstack_opd_v2.scheduler import AsyncBatchedScheduler
 
 
@@ -59,6 +59,15 @@ def test_pg_loss_p_old_equals_internal_exp():
     delta = torch.randn(3, 5, 32, generator=torch.Generator().manual_seed(2))
     a = pg_loss(s_cur, s_old, delta)
     b = pg_loss(s_cur, s_old, delta, p_old=s_old.exp())
+    assert torch.equal(a, b)
+
+
+def test_expected_reward_p_dists_equals_internal_exp():
+    """expected_reward 传 p_dists 与内部 dists.exp() 必须逐位相等。"""
+    dists = _logp(3, 5, 32, seed=0)
+    delta = torch.randn(3, 5, 32, generator=torch.Generator().manual_seed(2))
+    a = expected_reward(dists, delta)
+    b = expected_reward(dists, delta, p_dists=dists.exp())
     assert torch.equal(a, b)
 
 

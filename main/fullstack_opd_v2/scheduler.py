@@ -242,7 +242,7 @@ class AsyncBatchedScheduler:
                                 enabled=self.amp):
             s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
             s_old = s_old.to(s_cur.dtype)                       # 与 s_cur 同精度，保证 ratio 一致
-            # P2-2：缓存 s_old.exp()（p_old），避免每步重算 (B,T,V) exp（约 36%）；全 1 mask 走 None 快路径
+            # P2-2：缓存 p_old 供 pg_loss 与 adv 监控复用，省掉 expected_reward 内部那次 s_old.exp()；全 1 mask 走 None 快路径
             # ⚠️ mask 快路径前提：调度器无 padding（responses 等长），恒全 1。
             #    若将来引入真实 padding mask 必须改回传 mask。
             p_old = s_old.exp()
@@ -275,8 +275,8 @@ class AsyncBatchedScheduler:
 
         version = self._publish()
         with torch.no_grad():
-            reward = expected_reward(s_cur.detach(), delta_d, None).mean()
-            adv = expected_reward(s_old, delta_d, None).mean()
+            reward = expected_reward(s_cur.detach(), delta_d, None, p_dists=s_cur.detach().exp()).mean()
+            adv = expected_reward(s_old, delta_d, None, p_dists=p_old.detach()).mean()
         return {
             "step": done,
             "version": version,
