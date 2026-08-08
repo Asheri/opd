@@ -1,10 +1,11 @@
 """性能优化的数值等价性回归：任何优化不得改变不可回退的算法内核。
 
-四组断言把「优化没改数学」变成 CI 可验证的事实：
+断言把「优化没改数学」变成 CI 可验证的事实：
   1. pg_loss 加 log_ratio_max=80 后，正常 dense 输入下逐位等于 None（原路径）。
   2. log_ratio_max=80 在支撑外场景恢复「π_old=0 处贡献为 0」的数学真值。
-  3. searchsorted 支撑匹配等于原 O(K²) 全对比较（含重复 student id 边界）。
-  4. pg_loss 传 p_old 版等于内部计算 s_old.exp() 版。
+  3. pg_loss 传 p_old 版等于内部计算 s_old.exp() 版。
+
+（searchsorted 支撑匹配的等价性测试见测试文件末尾，属任务 3 的 P1-1。）
 """
 from __future__ import annotations
 
