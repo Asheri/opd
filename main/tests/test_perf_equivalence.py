@@ -62,6 +62,69 @@ def test_pg_loss_p_old_equals_internal_exp():
 
 
 def test_response_dists_topk_shape_and_keys():
-    """response_dists_topk 返回 (B,T,K) 的 (ids,logps)，且去重后不重复。"""
-    from fullstack_opd_v2.rollout_vllm import _LOG_ZERO
-    assert _LOG_ZERO < 0
+    """response_dists_topk 把 prompt_logprobs 的 [P:P+T] 响应段拍平成 (B,T,K) 的 (ids,logps)，
+    形状、索引与落回设备均与手工输入一致（logprob 以 float32 容差比较）。"""
+    import unittest.mock as mock
+    from fullstack_opd_v2.rollout_vllm import VLLMRolloutEngine
+
+    B, P, T, V = 2, 3, 4, 6
+    full_cap = 6
+    device = "cpu"
+    k = min(V, full_cap)
+
+    class _LP:
+        """vLLM 的 Logprob 对象：行为上只需要 .logprob 属性。"""
+
+        def __init__(self, logprob):
+            self.logprob = logprob
+
+    def make_plp(seq_off):
+        """构造长度为 P+T 的 prompt_logprobs：prompt 段为 None，响应段 [P:P+T] 为稀疏 dict。
+        第 t 个响应 token 的键为 seq_off*100 + t*10 + i（i ∈ [0,V)），值 logprob = t + i*0.1。"""
+        plp = [None] * P
+        for t in range(T):
+            plp.append({seq_off * 100 + t * 10 + i: _LP(float(t) + i * 0.1)
+                        for i in range(V)})
+        return plp
+
+    plp0, plp1 = make_plp(0), make_plp(1)
+
+    # mock self.llm.generate：返回带 prompt_logprobs 属性的假输出对象。
+    fake_llm = mock.MagicMock()
+    fake_llm.generate.return_value = [
+        mock.Mock(prompt_logprobs=plp0),
+        mock.Mock(prompt_logprobs=plp1),
+    ]
+
+    # 绕过真实 __init__（本地无 vLLM 会抛 RuntimeError），手工设好方法所需属性。
+    eng = object.__new__(VLLMRolloutEngine)
+    eng.vocab_size = V
+    eng.full_cap = full_cap
+    eng.device = device
+    eng.llm = fake_llm
+
+    prompts = torch.zeros(B, P, dtype=torch.long)
+    responses = torch.zeros(B, T, dtype=torch.long)
+
+    # _VLLM_AVAILABLE=False 时模块级 SamplingParams 是 None，方法体内 SamplingParams(...) 会失败，
+    # 直接 patch 成假类（只关心它被调用，不关心真实构造）。
+    with mock.patch("fullstack_opd_v2.rollout_vllm.SamplingParams",
+                    new=lambda **kw: mock.sentinel.sampling):
+        ids, logps = eng.response_dists_topk(prompts, responses)
+
+    # 1) 形状：各 (B,T,K)，K = min(vocab, full_cap)
+    assert ids.shape == (B, T, k), ids.shape
+    assert logps.shape == (B, T, k), logps.shape
+    # 3) 落回 self.device
+    assert ids.device.type == device
+    assert logps.device.type == device
+
+    # 2) 索引与 logprob 与手工 prompt_logprobs 输入逐位一致
+    for b, plp in ((0, plp0), (1, plp1)):
+        for t in range(T):
+            d = plp[P + t]
+            items = list(d.items())
+            for j, (tid, lp) in enumerate(items):
+                assert ids[b, t, j].item() == tid, (b, t, j)
+                # float32 落盘有舍入误差，比较用容差
+                assert abs(logps[b, t, j].item() - lp.logprob) < 1e-6, (b, t, j)
