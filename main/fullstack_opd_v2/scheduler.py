@@ -242,27 +242,29 @@ class AsyncBatchedScheduler:
                                 enabled=self.amp):
             s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
             s_old = s_old.to(s_cur.dtype)                       # 与 s_cur 同精度，保证 ratio 一致
-            mask = torch.ones(s_cur.size(0), s_cur.size(1),
-                              device=self.device, dtype=s_cur.dtype)
+            # P2-2：缓存 s_old.exp()（p_old），避免每步重算 (B,T,V) exp（约 36%）；全 1 mask 走 None 快路径
+            # ⚠️ mask 快路径前提：调度器无 padding（responses 等长），恒全 1。
+            #    若将来引入真实 padding mask 必须改回传 mask。
+            p_old = s_old.exp()
 
             # ★ Direct-OPD 迁移对象：按 student 自身 top-K 支撑取 Δ_T（L4 稀疏缓存）
             if self.use_topk:
                 s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
                 delta_d = self.cache.delta_for_student_topk(
                     idxs_dev, s_topk.indices)                   # (B,T,V) 支撑外=0
-                loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)
+                loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old)
                 # 稀疏 KL 锚点
                 if self.kl_mode == "topk":
                     ref_at = self._ref_logp_at_student_topk(
                         idxs_dev, s_topk.indices)               # (B,T,Ks)
-                    loss_kl = low_var_kl_support(s_topk.values, ref_at, mask)
+                    loss_kl = low_var_kl_support(s_topk.values, ref_at, None)
                 else:
-                    loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], mask)
+                    loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], None)
             else:
                 # dense 模式（demo 默认）：delta 已是完整 (B,T,V)
                 delta_d = delta
-                loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)
-                loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], mask)
+                loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old)
+                loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], None)
 
             loss = loss_pg + self.kl_coef * loss_kl
 
@@ -273,8 +275,8 @@ class AsyncBatchedScheduler:
 
         version = self._publish()
         with torch.no_grad():
-            reward = expected_reward(s_cur.detach(), delta_d, mask).mean()
-            adv = expected_reward(s_old, delta_d, mask).mean()
+            reward = expected_reward(s_cur.detach(), delta_d, None).mean()
+            adv = expected_reward(s_old, delta_d, None).mean()
         return {
             "step": done,
             "version": version,

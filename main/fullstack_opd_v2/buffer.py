@@ -66,7 +66,13 @@ class WeightStore:
             if self.offload_to_cpu:
                 self._snapshot = {k: v.detach().cpu() for k, v in state_dict.items()}
             else:
-                self._snapshot = {k: v.detach().clone() for k, v in state_dict.items()}
+                # P2-2：复用缓冲，copy_ 原地覆盖，避免每步全量再分配（7B fp32 28 GiB/步）。
+                # 键须与已有快照一致（__init__ 预填 / 首次 publish 均来自 student.state_dict()）。
+                if self._snapshot is None:
+                    self._snapshot = {k: v.detach().clone() for k, v in state_dict.items()}
+                else:
+                    for k, v in state_dict.items():
+                        self._snapshot[k].copy_(v.detach())
             self._version += 1
             return self._version
 

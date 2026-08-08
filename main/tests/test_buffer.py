@@ -73,3 +73,42 @@ def test_weight_store_snapshot_is_detached_copy():
     with torch.no_grad():
         sd["w"].add_(100)
     assert torch.equal(snap["w"], torch.ones(2))
+
+
+def test_weight_store_publish_reuses_buffer_and_returns_independent_clone():
+    ws = WeightStore(offload_to_cpu=False)
+    sd1 = {"a": torch.ones(3), "b": torch.zeros(2)}
+    ws.publish(sd1)
+    # 拿到快照引用
+    snap_a_id = id(ws._snapshot["a"])
+    # 第二次 publish 更新值
+    sd2 = {"a": torch.full((3,), 5.0), "b": torch.full((2,), 7.0)}
+    ws.publish(sd2)
+    # 缓冲对象复用（id 不变），值已更新
+    assert id(ws._snapshot["a"]) == snap_a_id
+    assert torch.equal(ws._snapshot["a"], torch.full((3,), 5.0))
+    # acquire 返回独立克隆，不受后续 publish 影响
+    snap2, _ = ws.acquire_if_newer(0)
+    ws.publish(sd1)
+    assert torch.equal(snap2["a"], torch.full((3,), 5.0))
+
+
+def test_weight_store_publish_after_init_prefill_reuses_buffer():
+    """复现 scheduler.__init__ 预填 _snapshot 后首步 publish 的交互：
+    预填已使 _snapshot 非 None，publish 应走 copy_ 复用分支而非重建，
+    且键一致时不应 KeyError。"""
+    ws = WeightStore(offload_to_cpu=False)
+    # 模拟 scheduler.__init__ 直接预填（绕过 publish，版本=0）
+    student = {"a": torch.ones(3), "b": torch.zeros(2)}
+    ws._snapshot = {k: v.detach().clone() for k, v in student.items()}
+    ws._version = 0
+    snap_id = id(ws._snapshot["a"])
+    # 首步 publish：键一致 → copy_ 原地覆盖，对象复用
+    sd = {"a": torch.full((3,), 9.0), "b": torch.full((2,), 1.0)}
+    v = ws.publish(sd)
+    assert v == 1
+    assert id(ws._snapshot["a"]) == snap_id
+    assert torch.equal(ws._snapshot["a"], torch.full((3,), 9.0))
+    # acquire 返回独立克隆
+    snap, ver = ws.acquire_if_newer(last_ver=0)
+    assert ver == 1 and torch.equal(snap["a"], torch.full((3,), 9.0))
