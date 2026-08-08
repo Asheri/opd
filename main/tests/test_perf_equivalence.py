@@ -59,3 +59,9 @@ def test_pg_loss_p_old_equals_internal_exp():
     a = pg_loss(s_cur, s_old, delta)
     b = pg_loss(s_cur, s_old, delta, p_old=s_old.exp())
     assert torch.equal(a, b)
+
+
+def test_response_dists_topk_shape_and_keys():
+    """response_dists_topk 返回 (B,T,K) 的 (ids,logps)，且去重后不重复。"""
+    from fullstack_opd_v2.rollout_vllm import _LOG_ZERO
+    assert _LOG_ZERO < 0

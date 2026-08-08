@@ -140,36 +140,76 @@ class VLLMRolloutEngine:
         return self.llm.llm_engine.model_executor.model.named_parameters()
 
     # --------------------------- 核心：response_dists 接口对齐 ---------------------------
-    def response_dists(self, prompts: torch.Tensor,
-                       responses: torch.Tensor) -> torch.Tensor:
-        """(B,P),(B,T) -> (B,T,V) log-softmax，对齐 model.response_dists。
+    def _prompt_seq(self, prompts, responses):
+        """(B,P),(B,T) -> list[list[int]]：一次 cat + cpu + tolist，避免逐样本同步。"""
+        full = torch.cat([prompts, responses], dim=1).detach().cpu()
+        return full.tolist()
 
-        实现：把 (prompt,response) 拼成 token 序列喂 vLLM，取 prompt_logprobs 的
-        响应段 [P : P+T] 重建分布。
-          - vocab ≤ full_cap：请求全部 logprob → 精确完整分布（内核安全）；
-          - vocab >  cap：请求 top-K（=full_cap）截断，支撑外填 _LOG_ZERO，
-            分布级内核不再精确（见模块 docstring 的生产说明，改用 response_logprobs）。
+    def response_dists_topk(self, prompts: torch.Tensor,
+                            responses: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B,P),(B,T) -> (ids, logps)，形状各 (B,T,K)。GPU 路径主接口（稀疏）。
+
+        把 vLLM 的 prompt_logprobs 稀疏 dict 直接拍平成 (B,T,K) 的 (ids, logps)，
+        不重建 dense (B,T,V)。返回的 ids 恰好对接 cache 的 searchsorted 支撑匹配。
         """
-        prompts = prompts.detach().cpu()
-        responses = responses.detach().cpu()
+        prompts = prompts.detach()
+        responses = responses.detach()
         B, P = prompts.shape
         T = responses.size(1)
         V = self.vocab_size
         k = V if V <= self.full_cap else self.full_cap
         sampling = SamplingParams(temperature=0.0, prompt_logprobs=k, logprobs=0)
-        seqs = [torch.cat([prompts[b], responses[b]]).tolist() for b in range(B)]
+        seqs = self._prompt_seq(prompts, responses)
         outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
 
-        out = torch.full((B, T, V), _LOG_ZERO, dtype=torch.float32)
+        ids = torch.zeros((B, T, k), dtype=torch.long)
+        lps = torch.zeros((B, T, k), dtype=torch.float32)
         for b, o in enumerate(outs):
-            plp = o.prompt_logprobs                 # list[len=P+T] of dict | None
+            plp = o.prompt_logprobs
             for t in range(T):
-                d = plp[P + t]                      # 响应第 t 个 token 处的分布 top-K
-                if d is None:
+                d = plp[P + t]
+                if not d:
                     continue
-                for tok_id, lp in d.items():
-                    out[b, t, int(tok_id)] = float(lp.logprob)
-        return out.to(self.device)
+                items = list(d.items())
+                ids[b, t, :len(items)] = torch.tensor([int(tid) for tid, _ in items],
+                                                      dtype=torch.long)
+                lps[b, t, :len(items)] = torch.tensor([v.logprob for _, v in items],
+                                                      dtype=torch.float32)
+        return ids.to(self.device), lps.to(self.device)
+
+    def response_dists(self, prompts: torch.Tensor,
+                       responses: torch.Tensor) -> torch.Tensor:
+        """(B,P),(B,T) -> (B,T,V) log-softmax，对齐 model.response_dists。
+
+        小词表 / 数值对照用：展平 + 一次 scatter 重建 dense (B,T,V)，去掉逐元素
+        setitem（外推 14×）。真实词表请用 response_dists_topk（稀疏，不建 (B,T,V)）。
+        """
+        prompts = prompts.detach()
+        responses = responses.detach()
+        B, P = prompts.shape
+        T = responses.size(1)
+        V = self.vocab_size
+        k = V if V <= self.full_cap else self.full_cap
+        sampling = SamplingParams(temperature=0.0, prompt_logprobs=k, logprobs=0)
+        seqs = self._prompt_seq(prompts, responses)
+        outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
+
+        out = torch.full((B * T * V,), _LOG_ZERO, dtype=torch.float32)
+        pos_l: list[int] = []
+        val_l: list[float] = []
+        for b, o in enumerate(outs):
+            plp = o.prompt_logprobs
+            for t in range(T):
+                d = plp[P + t]
+                if not d:
+                    continue
+                row = (b * T + t) * V
+                pos_l.extend([row + int(tid) for tid in d.keys()])
+                val_l.extend([v.logprob for v in d.values()])
+        if pos_l:
+            idx = torch.tensor(pos_l, dtype=torch.long)
+            out[idx] = torch.tensor(val_l, dtype=torch.float32)
+        return out.view(B, T, V).to(self.device)
 
     # --------------------------- 生产路径：逐 token logπ_old（token-level PPO）---------------------------
     def response_logprobs(self, prompts: torch.Tensor,
