@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from fullstack_opd_v2.losses import pg_loss
+from fullstack_opd_v2.scheduler import AsyncBatchedScheduler
 
 
 def _logp(B, T, V, seed):
@@ -149,3 +150,43 @@ def test_searchsorted_match_equals_full_compare():
     found = sids_srt.gather(-1, pos) == student_ids
     new = vals_srt.gather(-1, pos) * found
     assert torch.equal(old, new)
+
+
+def test_ref_logp_at_student_topk_searchsorted_equals_full_compare():
+    """真实方法 `AsyncBatchedScheduler._ref_logp_at_student_topk` 的 searchsorted 二分必须
+    等于原 O(Ks×Kr) 全对比较参考（含重复 student id 边界）。
+
+    该方法是 GPU 部署防 OOM 的稀疏 KL 锚点路径，但 test_scheduler 全跑 dense 模式
+    （top_k_student=0），从未触发。这里用 `object.__new__` 绕过完整 scheduler 构造
+    （避免模型前向/缓存 build），只设它依赖的三个稀疏字段，直接调用真实方法。
+    """
+    N, B, T, Kr, Ks, V = 5, 3, 4, 6, 5, 40
+    g = torch.Generator().manual_seed(0)
+    # 每位置 top-K token id 唯一（randperm），对应真实 topk 输出
+    ref_ids = torch.stack([torch.stack(
+        [torch.randperm(V, generator=g)[:Kr] for _ in range(T)]) for _ in range(N)])
+    ref_logp = torch.randn(N, T, Kr, generator=torch.Generator().manual_seed(1))
+    student_ids = torch.stack([torch.stack(
+        [torch.randperm(V, generator=g)[:Ks] for _ in range(T)]) for _ in range(B)])
+    student_ids[..., 1] = student_ids[..., 0]          # 重复 student id 边界
+    idxs = torch.tensor([2, 0, 4])                     # (B,) 批次索引
+    ref_tail_logp = -1e2
+
+    # 参考实现（旧逻辑）：O(Ks×Kr) 全对比较，用未排序的原始 ref 张量
+    rids = ref_ids[idxs]                               # (B,T,Kr)
+    rlogp = ref_logp[idxs]
+    match = (student_ids.unsqueeze(-1) == rids.unsqueeze(-2)).to(ref_logp.dtype)
+    gathered = (match * rlogp.unsqueeze(-2)).sum(-1)   # (B,T,Ks)
+    has = match.max(-1).values
+    old = gathered.where(has > 0.0,
+                         torch.full_like(gathered, ref_tail_logp))
+
+    # 二分方法：只设方法依赖的三个稀疏字段（__init__ 会预排序，这里手动等价处之）
+    sched = object.__new__(AsyncBatchedScheduler)
+    sched.ref_ids_sorted, order = ref_ids.sort(dim=-1)
+    sched.ref_logp_sorted = ref_logp.gather(-1, order)
+    sched.ref_tail_logp = ref_tail_logp
+
+    out = sched._ref_logp_at_student_topk(idxs, student_ids)
+    assert out.shape == old.shape
+    assert torch.equal(out, old), "searchsorted 二分必须逐位等于 O(K²) 全对比较"
