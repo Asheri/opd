@@ -71,6 +71,28 @@ def test_expected_reward_p_dists_equals_internal_exp():
     assert torch.equal(a, b)
 
 
+def test_pg_loss_mask_ones_equals_none():
+    """全 1 mask 分支必须逐位等于 mask=None 快路径（P2-2 去冗余的前提）。"""
+    s_cur = _logp(3, 5, 32, seed=0)
+    s_old = _logp(3, 5, 32, seed=1)
+    delta = torch.randn(3, 5, 32, generator=torch.Generator().manual_seed(2))
+    ones = torch.ones(3, 5)
+    a = pg_loss(s_cur, s_old, delta, mask=ones)
+    b = pg_loss(s_cur, s_old, delta, mask=None)
+    assert torch.equal(a, b)
+
+
+def test_low_var_kl_mask_ones_equals_none():
+    """低方差 KL 的全 1 mask 分支必须逐位等于 mask=None 快路径。"""
+    from fullstack_opd_v2.losses import low_var_kl
+    s = _logp(3, 5, 32, seed=0)
+    ref = _logp(3, 5, 32, seed=1)
+    ones = torch.ones(3, 5)
+    a = low_var_kl(s, ref, mask=ones)
+    b = low_var_kl(s, ref, mask=None)
+    assert torch.equal(a, b)
+
+
 def test_response_dists_topk_shape_and_keys():
     """response_dists_topk 把 prompt_logprobs 的 [P:P+T] 响应段拍平成 (B,T,K) 的 (ids,logps)，
     形状、索引与落回设备均与手工输入一致（logprob 以 float32 容差比较）。"""
