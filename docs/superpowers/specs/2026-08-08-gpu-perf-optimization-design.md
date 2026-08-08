@@ -62,14 +62,16 @@ GPU 预设（B=32, T=512, K=4096）下是 6710 万次 `Tensor.__setitem__`，
 
 ### 方案
 
-采用**稀疏直返**为主接口，dense 重建降级为兼容路径：
+`response_dists()` 重写为展平 + 一次 `scatter`（真实落地，14.3×，数值 `torch.equal`）：
 
-1. 新增 `response_dists_topk(prompts, responses) -> (ids, logps)`，形状 `(B,T,K)`，
-   为 GPU 路径主接口。返回值直接对接 P1-1 的 `searchsorted` 支撑匹配。
-2. `response_dists()` 保留（小词表 demo / 数值对照需要），内部改为展平 + 一次
-   `scatter`，并直接在目标设备上按配置 `dtype` 建张量，去掉 `.cpu()` 往返。
-3. `prompts`/`responses` 的 `.cpu()` + 逐样本 `.tolist()` 合并为一次
-   `torch.cat(...).cpu().tolist()`：每批次一次 GPU→CPU 同步，而非 2B 次。
+1. `response_dists()` 内部改为展平 + 一次 `scatter`，去掉逐元素 `setitem`。
+2. `prompts`/`responses` 的逐样本 `.tolist()` 合并为一次 `torch.cat(...).cpu().tolist()`
+   （`_prompt_seq`）：每批次一次 GPU→CPU 同步，而非 2B 次。
+
+新增 `response_dists_topk(prompts, responses) -> (ids, logps)`（形状 `(B,T,K)`）为
+**预留接口，本轮未接进训练循环（未启用）**。原因见 §10 已知边界：稀疏 `s_old`
+会改变 `pg_loss` 语义（探针实测与 dense 差 77%），需单独立项做成有界近似。本接口
+仅实现 + mock 测试锁定，供后续 L2 或稀疏损失项目复用。
 
 ## 5. P0-2 · `_LOG_ZERO` NaN 修复
 
@@ -185,10 +187,15 @@ GPU 上这等于 vLLM 推理算力烧掉 3/4。本轮**只量化，不改行为*
 
 | 项 | 现状 | 改法 | 实测收益 |
 |----|------|------|----------|
-| `s_old.exp()` | `pg_loss` 内每步重算 `(B,T,V)` | 调用方传入已算好的 `p_old` | 0.1124 → 0.0717 ms（**36%**） |
+| `s_old.exp()` | `pg_loss` 内每步重算 `(B,T,V)` | `expected_reward` 复用 `p_old`（`p_dists` 参数） | 省掉 `expected_reward(s_old,...)` 内部那次 `s_old.exp()` |
 | 全 1 mask | 仍走乘/求和/除 | 走 `mask=None` 快路径 | 已验证 `torch.equal` 完全相等 |
-| 监控双遍历 | 每步两次 `(B,T,V)` `expected_reward` | 每 N 步采样 | 0.0943 ms = pg+kl(0.2501) 的 **38%** |
 | `_publish` | 每步全克隆 state_dict | `WeightStore` 预分配缓冲 + `copy_` 原地覆盖 | 7B fp32 下省 28 GiB 分配/步 |
+
+> **监控降频已移除**：原设计的「每 N 步采样」会破坏现有
+> `test_scheduler_runs_all_steps_and_fields_finite` 的「每步 finite」断言，且收益
+> （0.094 ms = 单步 18.35 ms 的 0.5%）不值得。每步监控保留。
+> 另：`p_old` 缓存 + `expected_reward(p_dists)` 后，`s_old` 的 exp 从 2 次降到 1 次
+> （`pg_loss` 与 `adv` 监控共享），已兑现该子项的去冗余。
 
 说明：
 - `p_old` 作为 `pg_loss` 的**可选**参数（不传则内部计算 `s_old.exp()`），签名向后兼容。
@@ -213,30 +220,36 @@ GPU 上这等于 vLLM 推理算力烧掉 3/4。本轮**只量化，不改行为*
    顺序按依赖排：P0-2 先于 P0-1（P0-1 的稀疏返回喂给已加固的损失）。
 3. **运行时开关** — `pg_loss(log_ratio_max=None)` 为默认，即默认逐位等于今日行为；
    出问题时显式传 `80.0` 开启加固，无需改代码即可二分定位。
-4. **数值等价测试** — 新增 `tests/test_perf_equivalence.py`：
+4. **数值等价测试** — 新增 `tests/test_perf_equivalence.py`（9 个）：
    - `pg_loss(log_ratio_max=80)` vs `None` 在正常 dense 输入下 `torch.equal`
-   - `searchsorted` 支撑匹配 vs 原全对比较 `torch.equal`（含重复 id 边界）
-   - 全 1 mask 快路径 vs mask 分支 `torch.equal`
+   - `log_ratio_max=80` 在支撑外场景恢复「仅支撑内求和」真值
    - `p_old` 传入版 vs 内部计算版 `torch.equal`
+   - `expected_reward(p_dists)` vs 内部 `dists.exp()` `torch.equal`
+   - 全 1 mask 快路径 vs `mask=None` `torch.equal`（`pg_loss` + `low_var_kl` 两条）
+   - `searchsorted` 支撑匹配 vs 原全对比较 `torch.equal`（含重复 id 边界）
+   - `_ref_logp_at_student_topk` 二分 vs O(K²) `torch.equal`
+   - `response_dists_topk` mock 引擎形状/索引验证
 5. **基线指标存档** — 见 §2（`E[Δ_T]=+0.757`、42 passed、6.40 s），作为改后比对依据。
 
 ## 9. 验收标准
 
 **正确性（硬门槛）**：
-- 现有 42 个测试全绿
+- 现有 42 个测试全绿（现状 52 个，净 +10 全为追加，无一改动断言）
 - **不得放宽或改写任何现有断言**。允许的唯一例外是**追加**新断言：
   `test_save_load_roundtrip_topk` 需增加 sorted 字段的 roundtrip 检查（§6.1）。
   若某项优化导致现有断言失败，视为该优化不正确 —— 回退优化，而非调整断言。
-- `tests/test_perf_equivalence.py` 全绿（§8.4 四条等价性）
+- `tests/test_perf_equivalence.py` 全绿（§8.4 九条等价性）
 - `E[Δ_T]` 仍单调上升、末值与基线 `+0.757` 同量级
 - `age > 0` 仍成立（异步确实在消费陈旧样本）
 - 训练循环内无任何 teacher 前向
 
 **性能（GPU 路径，按外推验证）**：
-- vLLM 分布重建 ≥ 14×（dense 路径）/ ≥ 28×（稀疏路径）
-- 稀疏支撑匹配峰值显存降 `Kt` 倍
-- dense 缓存显存 3× → 1×
-- vLLM 路径不再产生 `nan` loss
+- vLLM 分布重建 ≥ 14×（dense 路径，已落地）
+- 稀疏支撑匹配（searchsorted）峰值显存降 `Kt` 倍（已落地）
+- dense 缓存显存 3× → 1×（已落地）
+- vLLM 路径不再产生 `nan` loss（已落地）
+- （`response_dists_topk` 的 ≥28× / 16× 显存收益**未启用** —— 稀疏 s_old 需单独立项，
+  见 §10，不列入本轮验收）
 
 **可观测性**：
 - `run()` 返回值含 §7.1 全部字段，`waste_ratio` 可复现当前 77% 的量级
@@ -245,7 +258,13 @@ GPU 上这等于 vLLM 推理算力烧掉 3/4。本轮**只量化，不改行为*
 
 - 本设计不解决 rollout 77% 浪费的**根因**（需背压或速率匹配），只使其可测。
 - 稀疏 top-K 不重归一化仍是有意近似（`CLAUDE.md` 既有约束），本次不触碰。
-- `response_dists` 的 dense 路径在 V=128k 下仍需 7.81 GiB；真实部署应走
-  `response_dists_topk`。dense 路径保留仅为小词表数值对照。
+- **`response_dists_topk` 未接进训练循环**。稀疏 `s_old` 会让 `pg_loss` 变成
+  「仅对 student top-K 支撑加权」的**有损近似**：探针实测（K=16/V=64 随机分布）
+  与 dense 相对差 77%，误差正比于「支撑外 π_old 质量 × 支撑外 Δ 加权」，**无全局上界**，
+  随策略/温度/词表形态变化。这解除了「损失与 dense 逐位等价」的承诺，须像
+  `low_var_kl_support` 一样单独立项做成有界近似（支撑覆盖、方向性、适用词表形态论证）。
+  故 `response_dists_topk` 本轮仅实现 + mock 测试锁定，不作 GPU 主接口。
+- 真实 V=128k 下 `response_dists` 的 dense 路径仍需 7.81 GiB —— 这是已认知的边界，
+  由「稀疏 s_old 未启用」直接导致；若需上线大词表，必须先完成稀疏损失立项。
 - stage0 那 3.5 s 的 `torch._dynamo` import 开销属 CPU 冷启动问题，
   本轮不在范围内（用户选择只优化 GPU 路径）。
