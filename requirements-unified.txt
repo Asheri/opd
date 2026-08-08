@@ -1,0 +1,83 @@
+# ============================================================================
+# requirements-unified.txt  —  全栈 OPD 【单一环境】部署（GPU 服务）
+# ----------------------------------------------------------------------------
+# 一套环境跑完整条流水线：
+#   小模型 RL → Lightning 离线缓存教师对 Δ_T → AsyncOPD 调度器上的 Direct-OPD 训练
+#
+# 统一思路（四处架构裁剪，而非硬凑版本）：
+#   ① 推理引擎统一为 vLLM 0.16.0
+#      - AsyncOPD 的 rollout 本来就用 vllm；
+#      - Lightning-OPD 的离线 logprob 预计算（phase2/curation）本来就用 vllm；
+#      - sglang 只在 slime 训练器里用 —— 全栈架构里训练器由 AsyncOPD 承担，
+#        因此 sglang（及其 torch==2.8.0 钉死）整体裁掉。
+#   ② Direct-OPD 不装 verl，vendor 其核心两个纯 torch 函数
+#      - _compute_delta_opd_rm_scores / compute_token_reward_direct_advantage
+#        都是纯张量运算（本 demo main/fullstack_opd/direct_opd.py 即对应实现）；
+#      - verl 的 numpy<2.0.0 / vllm<=0.11.0 / tensordict 钉死随之消失。
+#      - 若坚持装完整 verl：pip install -e ./Direct-OPD/verl --no-deps 后手动
+#        核对 numpy2 兼容性（备选方案，见 DEPLOY.md 附录）。
+#   ③ 训练后端统一为 megatron-core 0.16.1（AsyncOPD 基座）
+#      - slime 训练器所需的 megatron-bridge / sglang / modelopt 裁掉；
+#      - Lightning 只保留「离线缓存产物」—— 生成它只需 vllm+transformers+
+#        pandas+pyarrow（即其 curation 环境，与本环境天然兼容）。
+#   ④ SFT 用 async-opd 自带流水线（其 pyproject 明确含 SFT），llamafactory 裁掉。
+#
+# 锚点：async-opd/requirements.txt 的 freeze 已验证以下组合共存。
+# Python 3.12 | CUDA 12.8（驱动 ≥ R570）| 8×H100（demo 不需要 GPU）
+#
+# 安装：pip install -r requirements-unified.txt
+# ============================================================================
+
+# ---- 核心框架 ----
+torch==2.9.1          # pip 默认 wheel 即 cu12.8；否则用 --index-url https://download.pytorch.org/whl/cu128
+transformers==4.57.6
+tokenizers==0.22.2
+safetensors==0.7.0
+sentencepiece==0.2.1
+tiktoken==0.12.0
+
+# ---- 统一推理引擎（rollout + 离线教师 logprob 预计算）----
+vllm==0.16.0
+
+# ---- 统一训练后端 ----
+megatron-core==0.16.1
+accelerate==1.13.0
+# flash-attn 预编译 wheel（cu12 + torch2.9，需 Python 3.12/linux x86_64）；
+# 其他平台改为 `pip install flash-attn==2.8.3` 从源码编译（需 CUDA toolkit + ninja）
+flash_attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl#sha256=4e2f9e39313266b1544b68138b15b91ee6221eccf14f7902b7c6620351340810
+
+# ---- 分布式调度（AsyncOPD 协调器）----
+ray[default]==2.54.1
+pyzmq==27.1.0
+
+# ---- 数据（rollout / 缓存产物 parquet）----
+numpy==2.2.6          # 统一后只有这一个 numpy；verl 的 <2.0.0 限制随 verl 一起被裁掉
+pandas==3.0.1
+datasets==4.7.0
+pyarrow==23.0.1
+pyyaml==6.0.3
+
+# ---- 训练辅助 ----
+triton==3.5.1
+peft==0.18.1
+tensordict==0.10.0    # 支持 numpy 2（verl 的 <=0.10.0,!=0.9.0 窗口内）
+liger-kernel          # kernel 融合加速（Lightning/verl 都用；纯增益，可选）
+
+# ---- 评测 / 奖励校验 ----
+math-verify==0.9.0
+latex2sympy2_extended==1.11.0
+
+# ---- 日志 / 可观测 ----
+wandb
+tensorboard
+
+# ---- 全栈 demo（main/）----
+# demo 仅需 torch 即可跑（CPU 可），以上全量安装天然覆盖。
+
+# ---- 被裁掉的组件（统一环境【不】需要，保留注释备查）----
+# sglang / sglang-router          → slime 训练器专用；训练器已由 AsyncOPD 承担
+# megatron-bridge / modelopt      → 同上；训练后端统一为 megatron-core
+# ring_flash_attn                 → slime 专用序列并行 attention
+# trl<=0.9.6                      → verl TRL extra；Direct-OPD 核心不依赖 TRL
+# llamafactory                    → SFT 已由 async-opd 自带 pipeline 承担
+# verl                            → Direct-OPD 核心已 vendor 为纯 torch 模块

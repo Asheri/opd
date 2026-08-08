@@ -1,0 +1,60 @@
+# ============================================================================
+# requirements-direct-opd.txt  —  Direct-OPD 运行时（基于 verl）
+# 论文：Direct-OPD (arXiv:2607.05394)  [Direct-OPD/verl]
+# ----------------------------------------------------------------------------
+# ⚠️ 【已降级为备选】2026-08-06 起推荐单环境方案 requirements-unified.txt：
+#    Direct-OPD 的核心（Δ_T 奖励两个函数）已 vendor 为纯 torch 模块
+#    （main/fullstack_opd/direct_opd.py），不再需要完整 verl。
+#    本文件仅在「必须使用完整 verl 框架」时保留。
+# ----------------------------------------------------------------------------
+# ⚠️ 必须独立环境：verl 要求 numpy<2.0.0，与统一环境的 numpy==2.2.6 冲突。
+# Python 建议 3.11（sglang==0.5.2 对 3.12 的支持随版本变化，3.11 最稳）。
+#
+# 安装：
+#   conda create -n direct-opd python=3.11 -y
+#   conda activate direct-opd
+#   pip install -r requirements-direct-opd.txt
+#   pip install -e ./Direct-OPD/verl        # 基础安装
+#   # 再按需加 extra：
+#   pip install -e ./Direct-OPD/verl[vllm]   # 或 [sglang] / [trl] / [mcore]
+#
+# 关于 TRL 版本（用户提问）：
+#   verl 的 TRL 集成的 extra 钉死  trl<=0.9.6 。
+#   仅当你走 verl 的「HuggingFace TRL 路径」(--actor 使用 trl) 时才需要 TRL；
+#   Direct-OPD 的核心 Δ_T 奖励逻辑在 verl 内部（dp_actor.py / core_algos.py），
+#   不依赖 TRL 也能跑。如确需：在下面放开 # trl<=0.9.6 一行。
+# ============================================================================
+
+torch==2.8.0                 # verl 的 sglang 路径钉死 2.8.0；若只用 vllm 路径可用 2.9.x
+numpy<2.0.0
+transformers
+accelerate
+ray[default]>=2.41.0
+datasets
+pandas
+pyarrow>=19.0.0
+pybind11
+pylatexenc
+hydra-core
+dill
+codetiming
+tensordict>=0.8.0,<=0.10.0,!=0.9.0
+torchdata
+peft
+wandb
+tensorboard
+packaging>=20.0
+
+# ---- 奖励 / 数学校验 ----
+math-verify                  # MATH_REQUIRES
+
+# ---- 推理后端（二选一）----
+# 方案 A：vLLM 路径（推荐，版本区间与 AsyncOPD 接近）
+vllm>=0.8.5,<=0.11.0
+# 方案 B：SGLang 路径（verl 钉死 torch==2.8.0 + sglang==0.5.2）
+# sglang[srt,openai]==0.5.2
+
+# ---- 可选 extras（对应 verl setup.py 的 extras_require）----
+# flash-attn                 # GPU_REQUIRES
+# trl<=0.9.6                 # TRL_REQUIRES（仅走 TRL 路径时需要）
+# mbridge                    # MCORE_REQUIRES（= megatron-bridge，等价于 Lightning-OPD 的 megatron-bridge）

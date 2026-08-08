@@ -1,0 +1,61 @@
+# 全栈 OPD 叠加 demo（v2）配置 —— 本文件现在会被代码真正加载（见 fullstack_opd_v2/config.py）。
+# 运行：python run_fullstack_v2.py --config configs/fullstack_opd.yaml
+# 结构对齐 DEFAULT_CONFIG_V2；未写的键自动用内置默认补全。
+# 任何未知/拼错的键都会被 pydantic schema 拒绝（不再静默忽略）。
+
+vocab_size: 64          # demo 极小词表；真实为 32k~150k（用 topk 缓存）
+d_model: 48
+n_layers: 2
+prompt_len: 6
+resp_len: 8
+n_prompts: 16
+seed: 42
+batch_size: 8
+
+# ---- GPU 部署键（本地 demo 默认 fp32/dense，不影响跑通）----
+dtype: fp32             # fp32 | bf16（bf16 仅 cuda 生效）
+cache_mode: dense       # dense | topk（真实词表用 topk）
+top_k_teacher: 0        # >0 → 教师缓存每位置存 top-K（L4 稀疏）
+top_k_student: 0        # >0 → 训练时在 student top-K 支撑上取 Δ_T
+ref_topk: 0             # >0 → KL 锚点存初始 student top-K（防 (N,T,V) OOM）
+offload_to_cpu: false   # colocated 换入换出（L6）
+
+stage0:                 # 小模型 RL → post-RL weak teacher
+  lr: 1.0e-3
+  n_rl_steps: 40
+  max_new_tokens: 8
+  batch_size: 8
+  grad_clip: 1.0
+
+stage1:                 # Lightning-OPD 离线缓存教师对 Δ_T（消除常驻教师）
+  enforce_teacher_consistency: true
+  cache_path: fullstack_opd_cache_v2.pt
+  build_batch_size: 16
+  # ---- L1 离线 rollout 暖缓存（缓解曝光偏差）----
+  warmup_M: 0           # >0 → 每 prompt 额外采样 M 条响应拼胖 D（默认 0 = 关闭 = L0）
+  warmup_source: none   # none | student_init | teacher_perturbed | mix
+  warmup_temperature: 1.0
+
+stage2:                 # Direct-OPD 迁移对象 + AsyncOPD 异步调度器
+  scheduling_mode: fully_async
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 0.05
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 1.0e-3
+  n_steps: 30
+  batch_size: 8
+  # ---- GPU 部署骨架开关（本地 demo 默认全关）----
+  distributed: false
+  n_gpus: 2
+  prefetch: 4
+  master_addr: 127.0.0.1
+  master_port: 29500
+  tp_size: 1
+  sequence_parallel: true
+  rollout_engine: toy   # toy | vllm
+  rollout_tp_size: 2
+  rollout_model: Qwen/Qwen2.5-7B
+  rollout_dtype: auto
+  rollout_logprobs_cap: 4096

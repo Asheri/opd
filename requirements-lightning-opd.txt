@@ -1,0 +1,47 @@
+# ============================================================================
+# requirements-lightning-opd.txt  —  Lightning-OPD 运行时（基于 slime）
+# 论文：Lightning-OPD (arXiv:2604.13010)  [Lightning-OPD/slime]
+# ----------------------------------------------------------------------------
+# ⚠️ 【已降级为备选】2026-08-06 起推荐单环境方案 requirements-unified.txt：
+#    全栈架构里训练器由 AsyncOPD 承担（megatron-core），Lightning 只保留
+#    「离线缓存产物」，其生成只需 vllm+transformers+pandas+pyarrow（统一环境
+#    已覆盖）；slime 训练器所需的 sglang / megatron-bridge / modelopt 被裁掉。
+#    本文件仅在「必须跑原版 slime 训练器」时保留。
+# ----------------------------------------------------------------------------
+# 官方推荐用 Docker（run_docker.sh）预装 sglang / Megatron / torch，再 pip install -e .
+# 若要自建环境：Python 3.10；torch>=2.0（与 requirements.txt 的 2.9.1 基本兼容）。
+#
+# 安装：
+#   conda create -n lightning-opd python=3.10 -y
+#   conda activate lightning-opd
+#   pip install -r requirements-lightning-opd.txt
+#   pip install -e ./Lightning-OPD
+#
+# 离线教师缓存（本论文核心）只需在训练前跑一次 logprob 预计算，
+# 训练阶段不再需要常驻教师 —— 这是摆脱「常驻教师」限制的关键。
+# ============================================================================
+
+torch>=2.0
+transformers
+accelerate
+datasets
+pyyaml
+omegaconf
+ray[default]
+tensorboard
+wandb
+pillow
+pylatexenc
+httpx[http2]
+mcp[cli]
+blobfile
+liger_kernel
+ring_flash_attn
+sglang-router>=0.2.3
+nvidia-modelopt[torch]>=0.37.0
+
+# Megatron-Bridge（dev_rl 分支，含 RL 相关修改）—— Lightning-OPD 的并行/训练后端
+megatron-bridge @ git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl
+
+# 调试用（可选）
+# memray

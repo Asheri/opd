@@ -1,0 +1,10 @@
+# ============================================================================
+# requirements-demo.txt  —  全栈 demo (main/) 最小运行环境
+# ----------------------------------------------------------------------------
+# main/ 里的全栈叠加 demo 用 ToyModel 占位真实 LLM，仅依赖 PyTorch，
+# 不需要 numpy / transformers / vllm / flash-attn，CPU 即可跑通（验证过 exit 0）。
+#
+# 安装：pip install -r requirements-demo.txt
+# 运行：cd main && python run_fullstack.py
+# ============================================================================
+torch>=2.0

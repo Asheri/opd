@@ -1,0 +1,108 @@
+"""losses.py 内核单测：π_old 加权 PG、k3 KL 恒等式、clip 行为。"""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from fullstack_opd_v2.losses import (
+    pg_loss,
+    low_var_kl,
+    low_var_kl_support,
+    expected_reward,
+)
+
+
+def _logp(B, T, V, seed):
+    g = torch.Generator().manual_seed(seed)
+    return F.log_softmax(torch.randn(B, T, V, generator=g), dim=-1)
+
+
+def test_pg_loss_onpolicy_equals_neg_expected_delta():
+    """ratio=1（s_cur==s_old）时 pg_loss = -E_{π_old}[Δ_T]（Direct-OPD 目标）。"""
+    s = _logp(4, 6, 32, seed=0)
+    delta = torch.randn(4, 6, 32, generator=torch.Generator().manual_seed(1))
+    loss = pg_loss(s, s, delta)
+    expected = -(s.exp() * delta).sum(-1).mean()
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_pg_loss_has_nonzero_gradient():
+    """一阶梯度必须非零（回归：v1 曾把 PG 写成 token 级标量 adv，梯度恒为 0）。"""
+    s_old = _logp(2, 4, 16, seed=2)
+    logits = torch.randn(2, 4, 16, generator=torch.Generator().manual_seed(3),
+                         requires_grad=True)
+    s_cur = F.log_softmax(logits, dim=-1)
+    delta = torch.randn(2, 4, 16, generator=torch.Generator().manual_seed(4))
+    loss = pg_loss(s_cur, s_old, delta)
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0
+
+
+def test_pg_loss_clipping_bounds_ratio():
+    """clip：ratio 超出 [1-eps,1+eps] 时应被裁剪（悲观下界）。
+
+    构造：s_old 均匀、s_cur 集中到 token0（其 ratio≫1+eps）、delta 仅在 token0=+1。
+    此时仅 token0 有贡献，且被 clip 到 1+eps。"""
+    import math
+    V = 8
+    eps = 0.2
+    s_old = torch.full((1, 1, V), -math.log(V))            # 均匀分布
+    logits = torch.zeros(1, 1, V)
+    logits[0, 0, 0] = 10.0
+    s_cur = F.log_softmax(logits, dim=-1)                   # 集中 token0 → ratio_0≈8≫1.2
+    delta = torch.zeros(1, 1, V)
+    delta[0, 0, 0] = 1.0                                    # 仅 token0 有正 advantage
+    loss = pg_loss(s_cur, s_old, delta, clip_eps=eps)
+    # token0: min(ratio,1+eps)*1 = 1+eps；其余 delta=0。s_old.exp()[0]=1/V
+    expected = torch.tensor(-(1.0 / V) * (1 + eps))
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_low_var_kl_equals_true_kl():
+    """k3 在 π_s 下取期望恒等真 KL(π_s||π_ref)（稠密、全词表求和时）。"""
+    s = _logp(3, 5, 24, seed=6)
+    ref = _logp(3, 5, 24, seed=7)
+    est = low_var_kl(s, ref)
+    p_s, p_ref = s.exp(), ref.exp()
+    true_kl = (p_s * (s - ref)).sum(-1).mean()
+    assert torch.allclose(est, true_kl, atol=1e-5)
+
+
+def test_low_var_kl_zero_when_identical():
+    s = _logp(2, 4, 16, seed=8)
+    assert torch.allclose(low_var_kl(s, s), torch.tensor(0.0), atol=1e-7)
+
+
+def test_low_var_kl_support_leq_true_kl():
+    """稀疏版只对 top-K 支撑求和 → 系统性【略低估】真 KL（有界近似，非恒等）。"""
+    V, K = 64, 8
+    s = _logp(2, 4, V, seed=9)
+    ref = _logp(2, 4, V, seed=10)
+    s_topk = s.topk(K, dim=-1).values            # (B,T,K)
+    ref_at = ref.gather(-1, s.topk(K, dim=-1).indices)  # ref 在同一支撑上的 logp
+    sparse = low_var_kl_support(s_topk, ref_at)
+    p_s = s.exp()
+    true_kl = (p_s * (s - ref)).sum(-1).mean()
+    assert sparse <= true_kl + 1e-5
+    assert sparse >= 0  # k3 ≥ 0，支撑内仍非负
+
+
+def test_expected_reward():
+    dists = _logp(2, 4, 16, seed=11)
+    delta = torch.randn(2, 4, 16, generator=torch.Generator().manual_seed(12))
+    rm = expected_reward(dists, delta)
+    assert rm.shape == (2, 4)
+    assert torch.allclose(rm, (dists.exp() * delta).sum(-1), atol=1e-6)
+
+
+def test_pg_loss_mask_averaging():
+    """mask 应屏蔽 padding 位置（只对 mask=1 取均值）。"""
+    s = _logp(2, 4, 16, seed=13)
+    delta = torch.randn(2, 4, 16, generator=torch.Generator().manual_seed(14))
+    mask = torch.ones(2, 4)
+    mask[0, 2:] = 0  # 第 0 条只留前 2 位
+    loss_masked = pg_loss(s, s, delta, mask=mask)
+    pg = -(s.exp() * delta).sum(-1)
+    expected = (pg * mask).sum() / mask.sum()
+    assert torch.allclose(loss_masked, expected, atol=1e-6)

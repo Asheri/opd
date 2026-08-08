@@ -1,0 +1,77 @@
+# ============================================================================
+# requirements.txt  —  全栈 OPD 部署（GPU 服务 · 调度层 + demo 运行时）
+# ----------------------------------------------------------------------------
+# ⚠️ 【已降级为备选】2026-08-06 起推荐单环境方案 requirements-unified.txt
+#    （通过架构裁剪把三套环境合一，详见 DEPLOY.md 第 3 节）。
+#    本文件仅在「想保留完整 verl/slime 框架、接受多环境」时使用。
+# ============================================================================
+# 涵盖论文：
+#   AsyncOPD    (arXiv:2606.24143)  -> 流式异步调度器   [opd/]
+#   Direct-OPD  (arXiv:2607.05394)  -> verl，改迁移对象  [Direct-OPD/verl]
+#   Lightning-OPD(arXiv:2604.13010) -> slime，离线教师缓存 [Lightning-OPD/slime]
+#
+# 本文件以 AsyncOPD 的 pin 为锚点（torch 2.9.1 / CUDA 12.8），作为「异步调度器」
+# 的统一运行时，也是 main/ 全栈 demo 的运行底座。
+#
+# ⚠️ 为什么不能直接把三个 repo 装进同一个环境？
+#   - numpy：AsyncOPD 钉 numpy==2.2.6，而 Direct-OPD(verl) 要求 numpy<2.0.0 —— 硬冲突。
+#   - vllm ：AsyncOPD 用 vllm==0.16.0，verl 的 vllm extra 上限 vllm<=0.11.0 —— 冲突。
+#   - torch：verl 的 sglang 路径钉 torch==2.8.0，本环境用 2.9.1。
+#   => 建议：AsyncOPD 用本环境；Direct-OPD / Lightning-OPD 各自独立虚拟环境
+#      （见 requirements-direct-opd.txt / requirements-lightning-opd.txt）。
+#      三者仅在「数据 / 离线缓存」层耦合（这正是 main/ demo 抽象掉的部分）。
+#
+# Python: 3.12（flash-attn 预编译 wheel 为 cp312）
+# 安装：  pip install -r requirements.txt
+#   若 pip 默认拉到的不是 CUDA12.8 wheel，可改用：
+#   pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+# ============================================================================
+
+# ---- 核心深度学习框架 ----
+torch==2.9.1
+# torchvision==0.24.1      # 真实训练需要，demo 不依赖（按需放开）
+# torchaudio==2.9.1
+transformers==4.57.6
+tokenizers==0.22.2
+safetensors==0.7.0
+sentencepiece==0.2.1
+tiktoken==0.12.0
+
+# ---- 推理 / Rollout 服务（学生在线采样）----
+vllm==0.16.0
+megatron-core==0.16.1
+# flash-attn 2.8.3 的 cu12+torch2.9 预编译 wheel（cp312-linux）；非 3.12 请删此行改用源码编译：
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl#sha256=4e2f9e39313266b1544b68138b15b91ee6221eccf14f7902b7c6620351340810
+
+# ---- 分布式 / 调度 ----
+ray[default]==2.54.1
+accelerate==1.13.0
+
+# ---- 数据与工具 ----
+numpy==2.2.6
+pandas==3.0.1
+datasets==4.7.0
+pyarrow==23.0.1
+pyyaml==6.0.3
+pyzmq==27.1.0
+triton==3.5.1
+cupy-cuda12x==14.0.1
+
+# ---- 训练辅助 ----
+peft==0.18.1
+tensordict>=0.8.0,<=0.10.0,!=0.9.0   # verl 需要，AsyncOPD 可选
+
+# ---- 奖励 / 评测校验 ----
+math-verify==0.9.0
+latex2sympy2_extended==1.11.0
+
+# ---- 日志 / 可观测 ----
+wandb
+tensorboard
+
+# ---- 若要把 Lightning-OPD(slime) 也并进统一环境（不推荐，建议独立环境）----
+# nvidia-modelopt[torch]>=0.37.0
+# ring_flash_attn
+# liger_kernel
+# sglang-router>=0.2.3
+# megatron-bridge @ git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl

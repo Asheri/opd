@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# 上游 clone（各自是独立 git 仓库，有自己的 remote 和历史，不纳入本仓库）
+#   async-opd/     https://github.com/furiosa-ai/async-opd
+#   Direct-OPD/    https://github.com/BytedTsinghua-SIA/Direct-OPD.git
+#   Lightning-OPD/ https://github.com/jet-ai-projects/Lightning-OPD.git
+# ---------------------------------------------------------------------------
+/async-opd/
+/Direct-OPD/
+/Lightning-OPD/
+
+# 虚拟环境
+/.venv/
+
+# 会话日志（本机工作记录，非项目产物）
+/.workbuddy/
+
+# ---------------------------------------------------------------------------
+# Python 产物
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 测试 / 类型检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# 训练产物（体积大 / 可重新生成，不入库）
+# ---------------------------------------------------------------------------
+# 离线教师对 Δ_T 缓存（Stage 1 产物，由 stage1_build_cache 重新生成）
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# 训练输出 / 日志
+results/
+checkpoints/
+runs/
+wandb/
+*.log
+main/dlog.txt
+
+# 数据集（本地生成，不随仓库分发）
+data/
+datasets/
+*.parquet
+
+# ---------------------------------------------------------------------------
+# 编辑器 / 操作系统
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+desktop.ini

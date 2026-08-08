@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fullstack-opd"
+version = "2.0.0"
+description = "全栈 OPD 叠加 demo：Direct-OPD ▢ Lightning-OPD ▢ AsyncOPD（批量化重构版 v2）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+# 真实 GPU 部署（2×RTX PRO 6000）：L2 Megatron TP=2+SP / L3 vLLM rollout / L5 Ray 多 worker
+gpu = ["vllm", "megatron-core>=0.16", "ray"]
+
+[project.scripts]
+fullstack-opd-v2 = "fullstack_opd_v2.demo:main"
+
+[tool.setuptools]
+packages = ["fullstack_opd", "fullstack_opd_v2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

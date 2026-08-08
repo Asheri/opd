@@ -1,0 +1,316 @@
+"""v2 编排器：全栈 OPD 流水线的批量化重构版。
+
+  小模型 RL ──► 离线缓存教师对 Δ_T ──► Direct-OPD 训练跑在 AsyncOPD 批量调度器上
+
+相对 v1 的底层变化：
+- toy 数据 = 堆叠张量 (N,P)/(N,T) 设备常驻（v1 是 list of CPU tensors，逐步搬运）；
+- 规则奖励 = 查找表 (V,) 向量化索引（v1 逐 token python 循环）；
+- stage0 REINFORCE 批量化（一次批量解码 + 一次批量前向）；
+- stage1 缓存 = 设备常驻张量 + 预计算 delta；
+- stage2 调度器队列传 batch，learner 按 mini-batch 更新；
+- 每个 stage 计时，便于 benchmark 对比。
+"""
+
+from __future__ import annotations
+
+import time
+
+import torch
+
+from .cache import TensorTeacherCache
+from .model import CausalToyLM, generate_batch, token_logprobs, response_dists
+from .scheduler import AsyncBatchedScheduler
+
+DEFAULT_CONFIG_V2 = {
+    "vocab_size": 64,
+    "d_model": 48,
+    "n_layers": 2,
+    "prompt_len": 6,
+    "resp_len": 8,
+    "n_prompts": 16,
+    "seed": 42,
+    "batch_size": 8,
+    # ---- GPU 部署相关（与硬件无关，本地 demo 默认 fp32 / dense 仍可跑）----
+    "dtype": "fp32",          # "fp32" | "bf16"（L1；bf16 仅 cuda 生效）
+    "cache_mode": "dense",    # "dense" | "topk"（L4；真实词表用 topk）
+    "top_k_teacher": 0,       # >0 → 教师缓存每位置存 teacher top-K（L4 稀疏）
+    "top_k_student": 0,       # >0 → 训练时在 student top-K 支撑上取 Δ_T（L4）
+    "ref_topk": 0,            # >0 → KL 锚点存初始 student top-K（避免 (N,T,V) 撑爆）
+    "offload_to_cpu": False,  # colocated 换入换出（L6）
+    "stage0": {              # 小模型 RL（产生 post-RL weak teacher）
+        "lr": 1e-3, "n_rl_steps": 40, "max_new_tokens": 8,
+        "batch_size": 8, "grad_clip": 1.0,
+    },
+    "stage1": {              # Lightning-OPD 离线缓存
+        "enforce_teacher_consistency": True,
+        "cache_path": "fullstack_opd_cache_v2.pt",
+        "build_batch_size": 16,
+        # ---- L1 离线 rollout 暖缓存（缓解曝光偏差）----
+        "warmup_M": 0,            # >0 → 每 prompt 额外采样 M 条响应拼「胖 D」(默认 0 = 关闭 = L0)
+        "warmup_source": "none",  # "none" | "student_init" | "teacher_perturbed" | "mix"
+        "warmup_temperature": 1.0,
+    },
+    "stage2": {              # Direct-OPD + AsyncOPD
+        "scheduling_mode": "fully_async",
+        "staleness_threshold": 4,
+        "queue_size": 8,
+        "kl_reg_coef": 0.05,
+        "clip_eps": 0.2,
+        "grad_clip": 1.0,
+        "lr": 1e-3,
+        "n_steps": 30,
+        "batch_size": 8,
+        # ---- GPU 部署骨架开关（L5/L2），本地 CPU demo 默认全关 ----
+        "distributed": False,      # True → 走 DistAsyncScheduler（Ray worker + NCCL 广播）
+        "n_gpus": 2,              # 2×RTX PRO 6000
+        "prefetch": 4,            # 在途 rollout 数（Ray future 流水线）
+        "master_addr": "127.0.0.1",
+        "master_port": 29500,
+        "tp_size": 1,             # >1 → L2 Megatron TP=2+SP（需 model.py 换 megatron parallel 层）
+        "sequence_parallel": True,
+        # ---- L3 vLLM rollout 替换（GPU 部署）："toy" 走朴素前向，"vllm" 走 vLLM TP=2 ----
+        "rollout_engine": "toy",  # "toy" | "vllm"
+        "rollout_tp_size": 2,     # vLLM tensor parallel（NVLink 桥）
+        "rollout_model": "Qwen/Qwen2.5-7B",  # vLLM 模型路径/名（仅 vllm 时生效）
+        "rollout_dtype": "auto",  # "auto" | "bf16" | "fp8"（Blackwell 可 fp8）
+        "rollout_logprobs_cap": 4096,  # 触发「精确完整分布」重建的词表上限（>则 top-K 截断）
+    },
+}
+
+# ---- 2×RTX PRO 6000 部署预设（见 OPTIMIZATION_PLAN_2xRTXPRO6000.md）----
+# 本地不跑（玩具模型无法到 7B），仅作为上服务器时的配置起点。
+# 尺寸依据 §0.1：learner（被训练 student）≤13B（8-bit Adam+梯度检查点）；
+#               teacher/rollout（仅推理）可上 70B（TP=2 / fp8）。
+CLOUD_CONFIG = {
+    **DEFAULT_CONFIG_V2,
+    "vocab_size": 128000,      # 真实词表（Qwen/Llama 系）；dense 缓存会因 (N,T,V) 撑爆 → 必须 topk
+    "dtype": "bf16",           # L1：Blackwell 原生 bf16 tensor core
+    "cache_mode": "topk",      # L4：稀疏缓存，体积 ↓~1000×
+    "top_k_teacher": 256,      # 教师每位置 top-K（覆盖绝大部分概率质量）
+    "top_k_student": 256,      # 训练时 student top-K 支撑
+    "ref_topk": 256,           # KL 锚点稀疏化（避免 (N,T,V) 锚点 OOM）
+    "offload_to_cpu": True,    # L6：colocated 换入换出，避免 2×96GB 同卡同时驻留
+        "stage1": {           # L1：云部署默认开启暖缓存（与 L0 相比仅 Stage1 多一次离线采样）
+            **DEFAULT_CONFIG_V2["stage1"],
+            "warmup_M": 4,
+            "warmup_source": "mix",
+            "warmup_temperature": 1.0,
+        },
+        "stage2": {
+            **DEFAULT_CONFIG_V2["stage2"],
+            "batch_size": 32,       # 4090 无关：PRO 6000 有 NVLink，批更大更值
+            "n_steps": 1000,
+            # learner 用 Megatron TP=2+SP（NVLink）；rollout 用 vLLM TP=2+FP8（见方案 L2/L3）
+            # 此处仅为 demo 内核的 GPU 配置骨架，真实并行由 verl/slime/vLLM 接管。
+            "rollout_engine": "vllm",   # L3：vLLM TP=2 rollout 替换朴素前向
+            "rollout_tp_size": 2,
+            "rollout_model": "Qwen/Qwen2.5-7B",
+            "rollout_dtype": "auto",
+        },
+}
+
+
+# ----------------------------- Stage 0 -----------------------------
+def stage0_small_rl(prompts, reward_lookup, cfg: dict, device,
+                    vocab: int, d_model: int, n_layers: int):
+    """批量 REINFORCE：产生 post-RL weak teacher；pre-RL reference 为其训练前副本。"""
+    weak = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(device)
+    ref = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(device)
+    ref.load_state_dict(weak.state_dict())
+    ref.eval()
+
+    opt = torch.optim.Adam(weak.parameters(), lr=cfg.get("lr", 1e-3))
+    B = cfg.get("batch_size", 8)
+    N = prompts.size(0)
+    for _ in range(cfg.get("n_rl_steps", 40)):
+        idxs = torch.randint(0, N, (B,), device=device)
+        p_b = prompts[idxs]                                   # (B, P)
+        r = generate_batch(weak, p_b, cfg.get("max_new_tokens", 8))   # (B, T)
+        weak.train()
+        logp = token_logprobs(weak, p_b, r)                   # (B, T) 保留梯度
+        reward = reward_lookup[r]                             # (B, T) 向量化查找
+        loss = -(logp * (reward - reward.mean())).mean()      # REINFORCE + 均值基线
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(weak.parameters(), cfg.get("grad_clip", 1.0))
+        opt.step()
+    weak.eval()
+    return weak, ref
+
+
+# ----------------------------- Stage 1 -----------------------------
+def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
+                       cfg: dict, warmup_student=None):
+    """Lightning-OPD：批量预计算教师对并预计算 Δ_T，训练期不再启 teacher server。
+
+    cache_mode="topk"（且 top_k_teacher>0）时走 L4 稀疏缓存：每位置只存 teacher top-K，
+    体积从 (N,T,V) 降到 (N,T,K)；真实词表 V=128k 下才存得下。
+
+    **L1（离线 rollout 暖缓存，缓解曝光偏差）**：若 `cfg["warmup_M"]>0` 且
+    `warmup_source≠"none"`，在 build 前用 student / teacher 分布对每个 prompt 额外
+    采样 M 条响应，拼成「胖 D」`(N·(1+K),T)`（K=额外条数），使缓存覆盖学生/教师分布
+    支撑。返回的 `fat_prompts/fat_responses` 供 Stage 2 入口的 KL 锚点与调度器使用。
+    warmup 关闭时退化为原行为：`fat_* = 原 (prompts, responses)`。
+
+    返回 `(cache, fat_prompts, fat_responses)`。
+    """
+    top_k = cfg.get("top_k_teacher", 0) if cfg.get("cache_mode", "dense") == "topk" else 0
+    cache = TensorTeacherCache(cfg.get("enforce_teacher_consistency", True), top_k=top_k)
+
+    warmup_M = int(cfg.get("warmup_M", 0) or 0)
+    source = cfg.get("warmup_source", "none")
+    temp = float(cfg.get("warmup_temperature", 1.0))
+    T = responses.size(1)
+
+    _VALID_SOURCES = ("student_init", "teacher_perturbed", "mix")
+    fat_prompts, fat_responses = prompts, responses
+    if warmup_M > 0 and source not in (None, "none"):
+        if source not in _VALID_SOURCES:
+            raise ValueError(
+                f"stage1 warmup_source 必须是 {_VALID_SOURCES} 之一，收到 {source!r}")
+        extra_p, extra_r = [], []
+        # 注：采样只消耗 RNG、不改权重；warmup_student 即 Stage 2 的同一初始 student，
+        # 因此「warmup 上下文分布」与「KL 锚点分布」同源，曝光偏差缓解自洽。
+        if source in ("student_init", "mix"):
+            if warmup_student is None:
+                raise ValueError(
+                    "stage1 warmup_source='student_init'/'mix' 需要 warmup_student "
+                    "(请在上游把初始 student 传入 stage1_build_cache)。")
+            for _ in range(warmup_M):
+                rp = generate_batch(warmup_student, prompts, max_new=T,
+                                    temperature=temp)        # (B,T) 学生初始分布采样
+                extra_p.append(prompts)
+                extra_r.append(rp)
+        if source in ("teacher_perturbed", "mix"):
+            for _ in range(warmup_M):
+                rt = generate_batch(teacher_rl, prompts, max_new=T,
+                                    temperature=temp)        # (B,T) 教师扰动分布采样
+                extra_p.append(prompts)
+                extra_r.append(rt)
+        if extra_p:
+            fat_prompts = torch.cat([prompts, *extra_p], dim=0)
+            fat_responses = torch.cat([responses, *extra_r], dim=0)
+
+    cache.build(fat_prompts, fat_responses, teacher_rl, teacher_ref,
+                cfg.get("build_batch_size", 16))
+    cache.save(cfg.get("cache_path", "fullstack_opd_cache_v2.pt"))
+    return cache, fat_prompts, fat_responses
+
+
+# ----------------------------- 编排器 -----------------------------
+class FullStackOPDv2:
+    def __init__(self, cfg: dict | None = None, device: str = "cpu"):
+        self.cfg = {**DEFAULT_CONFIG_V2, **(cfg or {})}
+        self.device = device
+        self._make_toy_data()
+
+    def _make_toy_data(self):
+        vocab = self.cfg["vocab_size"]
+        # 与 v1 相同的生成顺序（randint 按行主序消耗同一流），保证数据完全一致
+        rng = torch.Generator().manual_seed(0)
+        self.prompts = torch.randint(
+            0, vocab, (self.cfg["n_prompts"], self.cfg["prompt_len"]),
+            generator=rng).to(self.device)                     # (N, P) 设备常驻
+        self.responses = torch.randint(
+            0, vocab, (self.cfg["n_prompts"], self.cfg["resp_len"]),
+            generator=rng).to(self.device)                     # (N, T) 设备常驻
+        # 奖励查找表：偶数 token = 好 action（+1），其余 -0.2
+        lut = torch.full((vocab,), -0.2, dtype=torch.float32)
+        lut[0::2] = 1.0
+        self.reward_lookup = lut.to(self.device)               # (V,)
+
+    def run(self) -> dict:
+        torch.manual_seed(self.cfg.get("seed", 42))
+        vocab = self.cfg["vocab_size"]
+        d_model = self.cfg["d_model"]
+        n_layers = self.cfg["n_layers"]
+        timings: dict = {}
+
+        print("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
+        t = time.perf_counter()
+        teacher_rl, teacher_ref = stage0_small_rl(
+            self.prompts, self.reward_lookup, self.cfg["stage0"],
+            self.device, vocab, d_model, n_layers)
+        timings["stage0_rl"] = time.perf_counter() - t
+
+        # L1：把 student 提前创建，使「离线 warmup 采样」与「Stage 2 KL 锚点」共享同一份
+        # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
+        student = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(self.device)
+
+        print("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
+        t = time.perf_counter()
+        # 部署键（cache_mode/top_k_teacher）若在顶层（CLOUD_CONFIG 风格）则下渗到 stage1，
+        # stage1 子键优先。否则顶层 CLOUD_CONFIG 的稀疏缓存开关会被静默忽略（退回 dense）。
+        s1cfg = dict(self.cfg["stage1"])
+        for _k in ("cache_mode", "top_k_teacher"):
+            if _k not in s1cfg and _k in self.cfg:
+                s1cfg[_k] = self.cfg[_k]
+        # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
+        cache, fat_prompts, fat_responses = stage1_build_cache(
+            self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
+            warmup_student=student)
+        timings["stage1_cache"] = time.perf_counter() - t
+
+        print("[Stage 2] Direct-OPD 训练跑在 AsyncOPD 批量调度器上")
+        t = time.perf_counter()
+        # KL 正则锚点：student 初始分布（在【胖 D】上计算，与训练上下文同源）。
+        #  - ref_topk>0（GPU/真实词表）→ 只存初始分布 top-K，训练时按 student 支撑取回（L4/L6 防 OOM）
+        #  - 否则 dense (N,T,V)（demo 默认，小词表无压力）
+        student.eval()
+        ref_dists = ref_ids = ref_logp = None
+        with torch.no_grad():
+            full = response_dists(student, fat_prompts, fat_responses)  # (N_fat,T,V)
+        ref_topk = self.cfg.get("ref_topk", 0)
+        if ref_topk and ref_topk > 0:
+            Kr = min(ref_topk, full.size(-1))
+            topk = full.topk(Kr, dim=-1)
+            ref_ids, ref_logp = topk.indices, topk.values            # (N,T,Kr)
+        else:
+            ref_dists = full
+
+        # 部署键（dtype/offload_to_cpu/top_k_student）若在顶层（CLOUD_CONFIG 风格）则下渗到
+        # stage2，stage2 子键优先。否则云部署的 bf16 / colocated offload / student top-K 会被
+        # 静默忽略（退回 fp32 / 无 offload / dense）。
+        s2cfg = dict(self.cfg["stage2"])
+        for _k in ("dtype", "offload_to_cpu", "top_k_student"):
+            if _k not in s2cfg and _k in self.cfg:
+                s2cfg[_k] = self.cfg[_k]
+        if bool(s2cfg.get("distributed", False)):
+            # L5/L2 GPU 部署骨架：Ray 多 worker + NCCL 权重广播（取代线程版）。
+            # ⚠️ 仅云 GPU 运行；需要 torch.distributed 已建组 + ray 已装。本地 CPU demo 默认不走。
+            # L3 vLLM rollout 由各 Ray worker 从 cfg 自行构建（单独进程），learner 侧不持引擎。
+            from .scheduler import launch_distributed_scheduler
+            metrics = launch_distributed_scheduler(
+                student, cache, fat_prompts, fat_responses,
+                ref_dists, ref_ids, ref_logp, s2cfg,
+                master_addr=s2cfg.get("master_addr", "127.0.0.1"),
+                master_port=s2cfg.get("master_port", 29500),
+                n_gpus=s2cfg.get("n_gpus", 2))
+        else:
+            # L3 vLLM rollout：单进程下在此构建引擎并注入 scheduler；"toy" 则不注入。
+            rollout_engine = None
+            if s2cfg.get("rollout_engine") == "vllm":
+                from .rollout_vllm import VLLMRolloutEngine
+                rollout_engine = VLLMRolloutEngine(
+                    model=s2cfg.get("rollout_model", "Qwen/Qwen2.5-7B"),
+                    tp_size=int(s2cfg.get("rollout_tp_size", 1)),
+                    dtype=s2cfg.get("rollout_dtype", "auto"),
+                    vocab_size=vocab,
+                    full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
+                    device=self.device)
+            scheduler = AsyncBatchedScheduler(
+                student, cache, fat_prompts, fat_responses,
+                ref_dists, ref_ids, ref_logp, s2cfg, self.device,
+                rollout_engine=rollout_engine)
+            metrics = scheduler.run(s2cfg.get("n_steps", 30))
+        timings["stage2_train"] = time.perf_counter() - t
+        timings["total"] = sum(timings.values())
+
+        return {
+            "teacher_rl": teacher_rl,
+            "teacher_ref": teacher_ref,
+            "cache": cache,
+            "student": student,
+            "metrics": metrics,
+            "timings": timings,
+        }
