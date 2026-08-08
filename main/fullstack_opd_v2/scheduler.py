@@ -66,6 +66,14 @@ class AsyncBatchedScheduler:
         self.ref_dists = ref_dists      # dense 锚点（可为 None）
         self.ref_ids = ref_ids          # 稀疏锚点 token id
         self.ref_logp = ref_logp        # 稀疏锚点 logp
+        # P1-1：ref 锚点按 token id 预排序，训练期 searchsorted 二分匹配（省 O(K²)）。
+        # ⚠️ 与 cache.ids_sorted **不同源**：ref_ids 是初始 student 分布的 top-K，
+        # token 值与顺序都和 teacher 缓存不同，必须单独预排序，不能复用 cache 的。
+        self.ref_ids_sorted: torch.Tensor | None = None
+        self.ref_logp_sorted: torch.Tensor | None = None
+        if self.ref_ids is not None:
+            self.ref_ids_sorted, _ro = self.ref_ids.sort(dim=-1)
+            self.ref_logp_sorted = self.ref_logp.gather(-1, _ro)
         self.kl_mode = "dense" if ref_dists is not None else "topk"
         self.cfg = cfg
         self.device = device
@@ -175,13 +183,15 @@ class AsyncBatchedScheduler:
         匹配上的取 teacher/ref logp；未匹配（student 高概率但初始分布几乎为零）填
         ref_tail_logp（≈ -1e2），使 k3 正确给出强惩罚（防策略漂移）。
         """
-        rids = self.ref_ids[idxs]                       # (B, T, Kr)
-        rlogp = self.ref_logp[idxs]                     # (B, T, Kr)
-        match = (student_ids.unsqueeze(-1) == rids.unsqueeze(-2)).to(
-            rlogp.dtype)                                # (B, T, Ks, Kr)
-        gathered = (match * rlogp.unsqueeze(-2)).sum(-1)   # (B, T, Ks)
-        has = match.max(-1).values                          # (B, T, Ks)
-        return gathered.where(has > 0.0,
+        # P1-1：searchsorted 二分匹配替代 O(Ks×Kr) 全对比较。ref 锚点已升序预排序，
+        # found 是 bool 张量（`==` 结果），torch.where(bool, a, b) 语义与原来 has>0.0 等价。
+        rids_sorted = self.ref_ids_sorted[idxs]              # (B, T, Kr) 已升序
+        rlogp_sorted = self.ref_logp_sorted[idxs]            # (B, T, Kr)
+        Kr = rids_sorted.size(-1)
+        pos = torch.searchsorted(rids_sorted, student_ids.contiguous()).clamp(max=Kr - 1)
+        found = rids_sorted.gather(-1, pos) == student_ids
+        gathered = rlogp_sorted.gather(-1, pos)              # (B, T, Ks)
+        return gathered.where(found,
                               torch.full_like(gathered, self.ref_tail_logp))
 
     def _teacher_scorer(self):

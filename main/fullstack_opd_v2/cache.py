@@ -43,6 +43,10 @@ class TensorTeacherCache:
         self.rl_k: torch.Tensor | None = None     # (N, T, K)  teacher_rl logp @ top-K
         self.ref_k: torch.Tensor | None = None    # (N, T, K)  teacher_ref logp @ top-K
         self.delta_k: torch.Tensor | None = None  # (N, T, K)  = rl_k − ref_k，预计算
+        # P1-1：按 token id 升序预排序的 teacher top-K 支撑，训练期 torch.searchsorted 二分
+        # 匹配（省 O(K²) 全对比较，峰值显存从 (B,T,Ks,Kt) 降到 (B,T,Ks)）。
+        self.ids_sorted: torch.Tensor | None = None              # (N,T,Kt) teacher top-K token id 升序
+        self.delta_k_sorted: torch.Tensor | None = None          # (N,T,Kt) 按 ids_sorted 对齐的 delta_k
 
     # --------------------------- 构建 ---------------------------
     @torch.no_grad()
@@ -99,6 +103,9 @@ class TensorTeacherCache:
             self.rl_k = torch.cat(rlk_l)
             self.ref_k = torch.cat(refk_l)
             self.delta_k = self.rl_k - self.ref_k                      # 预计算一次
+            # P1-1：按 token id 升序预排序，训练期 searchsorted 二分匹配（省 O(K²) 全对比较）
+            self.ids_sorted, _order = self.ids.sort(dim=-1)
+            self.delta_k_sorted = self.delta_k.gather(-1, _order)
         return self
 
     # --------------------------- 读取 ---------------------------
@@ -130,12 +137,15 @@ class TensorTeacherCache:
         T = student_topk_ids.size(1)
         Kt = self.ids.size(-1)
         Ks = student_topk_ids.size(-1)
-        teacher_ids = self.ids[idxs]                       # (B, T, Kt)
-        teacher_delta = self.delta_k[idxs]                 # (B, T, Kt)
-        # 匹配：(B,T,Ks,Kt)，student id 是否落在 teacher top-K
-        match = (student_topk_ids.unsqueeze(-1) == teacher_ids.unsqueeze(-2)).to(
-            teacher_delta.dtype)                           # (B, T, Ks, Kt)
-        matched = (match * teacher_delta.unsqueeze(-2)).sum(-1)   # (B, T, Ks)
+        # P1-1：二分匹配（searchsorted）替代 O(Ks×Kt) 全对比较。teacher 支撑已升序预排序，
+        # 每个 student id 二分定位到 ≤ 它的最大 teacher 位置，命中即取对齐 delta，未命中置 0。
+        # 数值与全对比较完全一致（含重复 student id）：searchsorted 定位任意一个相等位置即可。
+        teacher_ids_sorted = self.ids_sorted[idxs]             # (B, T, Kt) 已升序
+        teacher_delta_sorted = self.delta_k_sorted[idxs]       # (B, T, Kt)
+        pos = torch.searchsorted(teacher_ids_sorted, student_topk_ids.contiguous()).clamp(
+            max=Kt - 1)
+        found = teacher_ids_sorted.gather(-1, pos) == student_topk_ids
+        matched = teacher_delta_sorted.gather(-1, pos) * found  # 未匹配置 0
         out = torch.full((B, T, self.vocab), fill,
                          dtype=matched.dtype, device=matched.device)
         out.scatter_(-1, student_topk_ids, matched)
@@ -152,6 +162,8 @@ class TensorTeacherCache:
             torch.save({"mode": "topk", "vocab": self.vocab, "top_k": self.top_k,
                         "ids": self.ids, "rl_k": self.rl_k,
                         "ref_k": self.ref_k, "delta_k": self.delta_k,
+                        "ids_sorted": self.ids_sorted,
+                        "delta_k_sorted": self.delta_k_sorted,
                         "enforce": self.enforce}, path)
 
     @classmethod
@@ -162,6 +174,12 @@ class TensorTeacherCache:
             obj.vocab = ck["vocab"]
             obj.ids, obj.rl_k, obj.ref_k, obj.delta_k = (
                 ck["ids"], ck["rl_k"], ck["ref_k"], ck["delta_k"])
+            if ck.get("ids_sorted") is None:
+                obj.ids_sorted, _o = obj.ids.sort(dim=-1)          # 旧缓存兼容：现场预排序
+                obj.delta_k_sorted = obj.delta_k.gather(-1, _o)
+            else:
+                obj.ids_sorted = ck["ids_sorted"]
+                obj.delta_k_sorted = ck["delta_k_sorted"]
         else:
             obj = cls(enforce_consistency=ck["enforce"], top_k=0)
             obj.vocab = ck["vocab"]

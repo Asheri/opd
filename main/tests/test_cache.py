@@ -101,6 +101,11 @@ def test_save_load_roundtrip_topk(tmp_path):
     assert loaded.mode == "topk"
     assert torch.equal(loaded.ids, cache.ids)
     assert torch.allclose(loaded.delta_k, cache.delta_k, atol=1e-6)
+    # P1-1：sorted 支撑字段须随 roundtrip 持久化且逐位一致
+    assert loaded.ids_sorted is not None
+    assert loaded.delta_k_sorted is not None
+    assert torch.equal(loaded.ids_sorted, cache.ids_sorted)
+    assert torch.equal(loaded.delta_k_sorted, cache.delta_k_sorted)
 
 
 def test_teacher_consistency_raises_on_mismatch():

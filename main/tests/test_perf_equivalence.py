@@ -128,3 +128,24 @@ def test_response_dists_topk_shape_and_keys():
                 assert ids[b, t, j].item() == tid, (b, t, j)
                 # float32 落盘有舍入误差，比较用容差
                 assert abs(logps[b, t, j].item() - lp.logprob) < 1e-6, (b, t, j)
+
+
+def test_searchsorted_match_equals_full_compare():
+    """searchsorted 支撑匹配必须等于原 O(K²) 全对比较（含重复 student id 边界）。"""
+    B, T, Kt, Ks, V = 3, 4, 6, 5, 40
+    g = torch.Generator().manual_seed(0)
+    teacher_ids = torch.stack([torch.stack(
+        [torch.randperm(V, generator=g)[:Kt] for _ in range(T)]) for _ in range(B)])
+    teacher_delta = torch.randn(B, T, Kt, generator=torch.Generator().manual_seed(1))
+    student_ids = torch.stack([torch.stack(
+        [torch.randperm(V, generator=g)[:Ks] for _ in range(T)]) for _ in range(B)])
+    student_ids[..., 1] = student_ids[..., 0]          # 造重复 id 边界
+
+    m = (student_ids.unsqueeze(-1) == teacher_ids.unsqueeze(-2)).to(teacher_delta.dtype)
+    old = (m * teacher_delta.unsqueeze(-2)).sum(-1)
+    sids_srt, order = teacher_ids.sort(-1)
+    vals_srt = teacher_delta.gather(-1, order)
+    pos = torch.searchsorted(sids_srt, student_ids.contiguous()).clamp(max=Kt - 1)
+    found = sids_srt.gather(-1, pos) == student_ids
+    new = vals_srt.gather(-1, pos) * found
+    assert torch.equal(old, new)
