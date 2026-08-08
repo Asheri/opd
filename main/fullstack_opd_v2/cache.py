@@ -79,9 +79,8 @@ class TensorTeacherCache:
             rl_full = torch.cat(rl_full)
             ref_full = torch.cat(ref_full)
             self.vocab = rl_full.size(-1)
-            self.rl = rl_full
-            self.ref = ref_full
             self.delta = rl_full - ref_full
+            del rl_full, ref_full          # P1-2：只留 delta，释放 (N,T,V) 两份（GPU 省 2/3 显存）
         else:
             # 稀疏 top-K：⚠️ 必须【逐 chunk】取 teacher top-K，绝不把完整 (N,T,V) 稠密
             # 张量 cat 出来再 topk —— 否则 build 阶段就把 L4 要省的内存又花掉了
@@ -155,8 +154,7 @@ class TensorTeacherCache:
     def save(self, path: str) -> None:
         if self.mode == "dense":
             torch.save({"mode": "dense", "vocab": self.vocab,
-                        "rl": self.rl, "ref": self.ref, "delta": self.delta,
-                        "enforce": self.enforce}, path)
+                        "delta": self.delta, "enforce": self.enforce}, path)
         else:
             # 稀疏张量极小，可直接 torch.save；生产环境改用 mmap 跨进程共享（见方案 L4/L6）
             torch.save({"mode": "topk", "vocab": self.vocab, "top_k": self.top_k,
@@ -183,5 +181,5 @@ class TensorTeacherCache:
         else:
             obj = cls(enforce_consistency=ck["enforce"], top_k=0)
             obj.vocab = ck["vocab"]
-            obj.rl, obj.ref, obj.delta = ck["rl"], ck["ref"], ck["delta"]
+            obj.delta = ck["delta"]          # rl/ref 不再落盘（只留 delta）
         return obj
