@@ -13,17 +13,30 @@ import torch
 
 
 def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
-            mask: torch.Tensor | None = None, clip_eps: float = 0.2) -> torch.Tensor:
+            mask: torch.Tensor | None = None, clip_eps: float = 0.2,
+            p_old: torch.Tensor | None = None,
+            log_ratio_max: float | None = None) -> torch.Tensor:
     """Direct-OPD 的 PG 损失 + AsyncOPD 陈旧截断（批量版）。
 
     s_cur / s_old: (B, T, V) log-softmax（cur 带梯度，old 为 rollout 时刻快照）
     delta:         (B, T, V) Δ_T = logπ_rl − logπ_ref（离线缓存，常量）
+    p_old:         (B, T, V) π_old = s_old.exp() 的预计算版（调用方可缓存省一次 exp）。
+                   None 时内部用 s_old.exp() 现算，逐位等价。
+    log_ratio_max: 可选纵深防御——对 logr=s_cur−s_old 先 clamp 到 max 再 exp，防止支撑外
+                   s_old=log0 近似（如 rollout_vllm._LOG_ZERO=-30）在 ratio.exp() 下溢出成
+                   inf → inf×0(稀疏 delta)=nan。默认 None 走原路径，正常输入下逐位不变。
     """
-    ratio = (s_cur - s_old).exp()                              # (B, T, V)
+    logr = s_cur - s_old
+    if log_ratio_max is not None:
+        logr = torch.clamp(logr, max=log_ratio_max)
+    ratio = logr.exp()                                         # (B, T, V)
     unclipped = ratio * delta
     clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * delta
     pointwise = torch.min(unclipped, clipped)                  # 悲观下界
-    pg = -(s_old.exp() * pointwise).sum(-1)                    # E_{π_old}[·], (B, T)
+    if p_old is not None:
+        pg = -(p_old * pointwise).sum(-1)                      # E_{π_old}[·], (B, T)
+    else:
+        pg = -(s_old.exp() * pointwise).sum(-1)                # E_{π_old}[·], (B, T)
     if mask is not None:
         return (pg * mask).sum() / (mask.sum() + 1e-8)
     return pg.mean()

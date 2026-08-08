@@ -42,7 +42,9 @@ except Exception:                                       # pragma: no cover
 
 
 # 支撑外 logp：用一个极大负值近似 log 0（避免 -inf 直接参与比率/梯度数值）。
-_LOG_ZERO = -1e4
+# 注意：不能太负——pg_loss 里会做 (s_cur - s_old).exp()，-1e4 会算出 exp(≈1e4)=inf，
+# 再乘稀疏模式下为 0 的 delta → inf×0=nan。-30 下 exp(30)≈1e13，bf16 安全，恢复「π_old=0 处贡献为 0」。
+_LOG_ZERO = -30.0
 
 
 def vllm_available() -> bool:
