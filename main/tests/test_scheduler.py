@@ -74,3 +74,16 @@ def test_scheduler_reward_is_real_scalar():
     metrics = sched.run(6)
     rewards = [m["reward"] for m in metrics]
     assert all(isinstance(r, float) for r in rewards)
+
+
+def test_scheduler_summary_reports_waste():
+    student, cache, prompts, responses, ref_dists = _setup(seed=4)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, _cfg(n_steps=6), "cpu")
+    sched.run(6)
+    s = sched.summary
+    assert s["trained_steps"] == 6
+    assert s["rollout_forwards"] >= 6
+    assert 0.0 <= s["waste_ratio"] <= 1.0
+    assert set(("rollout_forwards", "dropped_at_put", "dropped_at_consume",
+                "trained_steps", "waste_ratio", "rollout_idle_s", "scorer_idle_s")) <= set(s)

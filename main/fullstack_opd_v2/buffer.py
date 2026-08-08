@@ -20,6 +20,7 @@ class StalenessQueue:
         self._q: "queue.Queue" = queue.Queue(maxsize=max(16, staleness_threshold * 2))
         self._cur_version = 0
         self._lock = threading.Lock()
+        self.n_rejected = 0          # P2-1：入队侧因过旧拒绝的样本数（只观测）
 
     def advance_version(self) -> int:
         with self._lock:
@@ -31,6 +32,7 @@ class StalenessQueue:
         with self._lock:
             age = self._cur_version - version
         if age > self.threshold:
+            self.n_rejected += 1
             return False
         self._q.put((item, version, age), timeout=timeout)
         return True

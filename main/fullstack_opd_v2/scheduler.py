@@ -99,6 +99,11 @@ class AsyncBatchedScheduler:
         self.weight_store = WeightStore(offload_to_cpu=self.offload_to_cpu)
         self.stop = threading.Event()
         self.metrics: list = []
+        # P2-1：只观测计数器（不改控制流）
+        self._n_rollout = 0          # rollout 实际前向次数
+        self._n_dropped_consume = 0  # 消费侧因过旧丢弃数
+        self._rollout_idle = 0.0     # RolloutCollector 累计空转秒
+        self._scorer_idle = 0.0      # TeacherScorer 累计空转秒
 
         # 优化器 + 超参提升为实例属性，供 _train_step 在两种调度器间复用
         self.kl_coef = cfg.get("kl_reg_coef", 0.05)
@@ -146,6 +151,7 @@ class AsyncBatchedScheduler:
             try:
                 idxs = self._pq.get(timeout=1)
             except queue.Empty:
+                self._rollout_idle += 1.0      # 空转 1s
                 continue
             # ★ 只在权重版本推进时才加载（v1 每样本一次 load_state_dict）
             snap, ver = self.weight_store.acquire_if_newer(self._loaded_ver)
@@ -159,6 +165,7 @@ class AsyncBatchedScheduler:
                 else:
                     self.worker.load_state_dict(snap)
                 self._loaded_ver = ver
+            self._n_rollout += 1
             idxs_dev = idxs.to(self.device)
             if self.rollout_engine is not None:
                 # L3 · vLLM TP=2 推理：response_dists 接口对齐，返回 (B,T,V) 落设备
@@ -173,6 +180,7 @@ class AsyncBatchedScheduler:
             try:
                 self._rq.put((idxs, s_old, self._loaded_ver), timeout=0.5)
             except queue.Full:
+                self._rollout_idle += 0.5      # 因队列满等待 0.5s
                 continue
 
     def _ref_logp_at_student_topk(self, idxs: torch.Tensor,
@@ -199,6 +207,7 @@ class AsyncBatchedScheduler:
             try:
                 idxs, s_old, ver = self._rq.get(timeout=1)
             except queue.Empty:
+                self._scorer_idle += 1.0
                 continue
             if self.cache.mode == "topk":
                 # 稀疏模式：Δ_T 按 student top-K 支撑在 learner 现场展开（见 _train_dispatcher），
@@ -287,6 +296,7 @@ class AsyncBatchedScheduler:
                 continue
             m = self._train_step(done, idxs, s_old, delta, ver)
             if m is None:
+                self._n_dropped_consume += 1   # 消费侧因过旧丢弃
                 continue
             self.metrics.append(m)
             done += 1
@@ -309,6 +319,17 @@ class AsyncBatchedScheduler:
 
         for t in threads:
             t.join(timeout=5)
+        rollouts = self._n_rollout
+        trained = len(self.metrics)
+        self.summary = {
+            "rollout_forwards": rollouts,
+            "dropped_at_put": self.staleness_q.n_rejected,
+            "dropped_at_consume": self._n_dropped_consume,
+            "trained_steps": trained,
+            "waste_ratio": (rollouts - trained) / max(rollouts, 1),
+            "rollout_idle_s": round(self._rollout_idle, 2),
+            "scorer_idle_s": round(self._scorer_idle, 2),
+        }
         return self.metrics
 
 
