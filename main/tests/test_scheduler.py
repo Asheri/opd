@@ -32,6 +32,25 @@ def _cfg(**over):
     return cfg
 
 
+def _setup_topk(N=6, P=4, T=5, V=24, d=16, L=1, K=6, seed=0):
+    """稀疏 topk 模式：topk 缓存 + 稀疏 ref 锚点（M6：P1-1 优化主场的端到端覆盖）。
+
+    返回 (student, cache, prompts, responses, ref_ids, ref_logp, cfg)。
+    """
+    g = torch.Generator().manual_seed(seed)
+    prompts = torch.randint(0, V, (N, P), generator=g)
+    responses = torch.randint(0, V, (N, T), generator=g)
+    teacher_rl = CausalToyLM(vocab=V, d_model=d, n_layers=L)
+    teacher_ref = CausalToyLM(vocab=V, d_model=d, n_layers=L)
+    cache = TensorTeacherCache(True, top_k=K).build(prompts, responses, teacher_rl, teacher_ref)
+    student = CausalToyLM(vocab=V, d_model=d, n_layers=L)
+    with torch.no_grad():
+        full = response_dists(student, prompts, responses)
+    ref_ids, ref_logp = full.topk(K, dim=-1).indices, full.topk(K, dim=-1).values
+    cfg = _cfg(cache_mode="topk", top_k_student=K, ref_topk=K)
+    return student, cache, prompts, responses, ref_ids, ref_logp, cfg
+
+
 def test_scheduler_runs_all_steps_and_fields_finite():
     student, cache, prompts, responses, ref_dists = _setup()
     sched = AsyncBatchedScheduler(student, cache, prompts, responses,
@@ -87,3 +106,22 @@ def test_scheduler_summary_reports_waste():
     assert 0.0 <= s["waste_ratio"] <= 1.0
     assert set(("rollout_forwards", "dropped_at_put", "dropped_at_consume",
                 "trained_steps", "waste_ratio", "rollout_idle_s", "scorer_idle_s")) <= set(s)
+
+
+def test_scheduler_topk_mode_runs_end_to_end():
+    """稀疏 topk 训练分支真实端到端跑通（M6）。
+
+    回归：此前 test_scheduler 全跑 dense 模式，P1-1 的 searchsorted/_ref_logp
+    二分主场（_train_step use_topk 分支）从未被覆盖。本测试构造 topk 缓存 +
+    稀疏 ref 锚点，跑满步数并断言损失有限。
+    """
+    student, cache, prompts, responses, ref_ids, ref_logp, cfg = _setup_topk()
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  None, ref_ids, ref_logp, cfg, "cpu")
+    metrics = sched.run(6)
+    assert len(metrics) == 6
+    assert sched.use_topk is True
+    assert sched.kl_mode == "topk"
+    for m in metrics:
+        for k in ("loss", "pg_loss", "kl_loss"):
+            assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"
