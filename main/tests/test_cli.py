@@ -1,5 +1,6 @@
 """cli.py 单测：子命令 train/cache/eval/info 端到端可跑。"""
 import os
+import re
 
 import pytest
 
@@ -59,13 +60,20 @@ def test_cli_unknown_command_system_exit_2():
     assert e.value.code == 2
 
 
+def _latest_ckpt(run_dir):
+    """按 step 号（非词法序）取最新断点，避免 step_10 < step_3 的词法陷阱。"""
+    ck_dir = os.path.join(run_dir, "checkpoints")
+    names = os.listdir(ck_dir)
+    assert names
+    step = max(int(re.match(r"step_(\d+)\.pt$", n).group(1)) for n in names)
+    return os.path.join(ck_dir, f"step_{step}.pt")
+
+
 def test_cli_eval_end_to_end(tmp_path, capsys):
     cfg = _write_cfg(tmp_path)
     run_dir = str(tmp_path / "r_eval")
     main(["train", "--config", str(cfg), "--run-dir", run_dir, "--device", "cpu"])
-    ckpts = sorted(os.listdir(os.path.join(run_dir, "checkpoints")))
-    assert ckpts
-    ckpt = os.path.join(run_dir, "checkpoints", ckpts[-1])
+    ckpt = _latest_ckpt(run_dir)
     assert main(["eval", "--config", str(cfg), "--checkpoint", ckpt, "--device", "cpu"]) == 0
     out = capsys.readouterr().out
     assert "step=" in out

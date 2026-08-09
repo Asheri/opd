@@ -58,6 +58,7 @@ def test_manager_constructed_with_dir_but_loads_file(tmp_path):
     cm = CheckpointManager(str(tmp_path), every=1)
     p = cm.save(3, m, version=3, cfg={}, force=True)
     assert p is not None
-    cm2 = CheckpointManager(str(tmp_path))          # 目录构造
+    # 镜像 cli eval 调用形态：run_dir 传 "."，checkpoint_dir 显式给文件父目录
+    cm2 = CheckpointManager(".", checkpoint_dir=os.path.dirname(p))
     ck = cm2.load(p)                                 # 文件路径 load
     assert ck["step"] == 3
