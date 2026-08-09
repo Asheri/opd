@@ -37,6 +37,13 @@ DEFAULT_CONFIG_V2 = {
     "top_k_student": 0,       # >0 → 训练时在 student top-K 支撑上取 Δ_T（L4）
     "ref_topk": 0,            # >0 → KL 锚点存初始 student top-K（避免 (N,T,V) 撑爆）
     "offload_to_cpu": False,  # colocated 换入换出（L6）
+    "model_kind": "toy",      # 可插拔模型工厂（model_factory.py）：toy 默认
+    # ---- 工程化新增段（run 目录 / 日志 / 指标 / 数据）----
+    "run": {"seed": 42, "run_dir": None, "checkpoint_every": 10},
+    "logging": {"level": "INFO", "file": "train.log"},
+    "metrics": {"backend": "csv", "csv_path": None, "wandb_project": None},
+    "dataset": {"type": "toy", "path": None, "prompt_key": "prompt",
+                "response_key": "response"},
     "stage0": {              # 小模型 RL（产生 post-RL weak teacher）
         "lr": 1e-3, "n_rl_steps": 40, "max_new_tokens": 8,
         "batch_size": 8, "grad_clip": 1.0,

@@ -78,3 +78,37 @@ def test_loaded_config_runs_end_to_end(tmp_path):
     ])
     out = FullStackOPDv2(cfg, device="cpu").run()
     assert len(out["metrics"]) == 4
+
+
+def test_new_sections_defaults():
+    """T9：新增 run/logging/metrics/dataset/model_kind 段有默认值。"""
+    cfg = load_config()
+    assert cfg["model_kind"] == "toy"
+    assert cfg["run"]["checkpoint_every"] == 10
+    assert cfg["logging"]["level"] == "INFO"
+    assert cfg["metrics"]["backend"] == "csv"
+    assert cfg["dataset"]["type"] == "toy"
+
+
+def test_new_sections_dotted_overrides():
+    cfg = load_config(overrides=["run.checkpoint_every=5", "logging.level=DEBUG",
+                                 "metrics.backend=wandb", "dataset.type=jsonl",
+                                 "dataset.path=x.jsonl", "model_kind=toy"])
+    assert cfg["run"]["checkpoint_every"] == 5
+    assert cfg["logging"]["level"] == "DEBUG"
+    assert cfg["metrics"]["backend"] == "wandb"
+    assert cfg["dataset"]["path"] == "x.jsonl"
+
+
+def test_new_section_unknown_key_rejected(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("run:\n  bogus: 1\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_config(path=str(bad))
+
+
+def test_bad_model_kind_rejected(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("model_kind: nope\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_config(path=str(bad))

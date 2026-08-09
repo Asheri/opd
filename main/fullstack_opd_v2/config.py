@@ -66,6 +66,35 @@ class Stage2Cfg(_Strict):
     rollout_logprobs_cap: int = 4096
 
 
+# --------------------------- 工程化新增段 ---------------------------
+class RunCfg(_Strict):
+    """run 目录与断点续跑配置。"""
+    seed: int = 42
+    run_dir: str | None = None
+    checkpoint_every: int = 10
+
+
+class LoggingCfg(_Strict):
+    """结构化日志配置。"""
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    file: str = "train.log"
+
+
+class MetricsCfg(_Strict):
+    """指标追踪配置。"""
+    backend: Literal["csv", "wandb", "none"] = "csv"
+    csv_path: str | None = None
+    wandb_project: str | None = None
+
+
+class DatasetCfg(_Strict):
+    """数据加载配置（可插拔接口，见 data.py）。"""
+    type: Literal["toy", "jsonl"] = "toy"
+    path: str | None = None
+    prompt_key: str = "prompt"
+    response_key: str = "response"
+
+
 class OPDConfig(_Strict):
     vocab_size: int = 64
     d_model: int = 48
@@ -81,9 +110,14 @@ class OPDConfig(_Strict):
     top_k_student: int = 0
     ref_topk: int = 0
     offload_to_cpu: bool = False
+    model_kind: Literal["toy", "hf", "megatron", "vllm"] = "toy"
     stage0: Stage0Cfg = Field(default_factory=Stage0Cfg)
     stage1: Stage1Cfg = Field(default_factory=Stage1Cfg)
     stage2: Stage2Cfg = Field(default_factory=Stage2Cfg)
+    run: RunCfg = Field(default_factory=RunCfg)
+    logging: LoggingCfg = Field(default_factory=LoggingCfg)
+    metrics: MetricsCfg = Field(default_factory=MetricsCfg)
+    dataset: DatasetCfg = Field(default_factory=DatasetCfg)
 
 
 # --------------------------- 加载 ---------------------------
@@ -135,4 +169,5 @@ def load_config(path: str | None = None,
 
 
 __all__ = ["OPDConfig", "Stage0Cfg", "Stage1Cfg", "Stage2Cfg",
+           "RunCfg", "LoggingCfg", "MetricsCfg", "DatasetCfg",
            "load_config", "ValidationError"]
