@@ -26,6 +26,11 @@ from .model import CausalToyLM, response_dists
 # 正常 s_old 最小值 ≈ -ln V（V=128k 时约 -11.5），10 以内的余量不误伤；_LOG_ZERO=-30 闭合。
 LOG_RATIO_MAX = 20.0
 
+# 队列操作超时（秒）：put 满 / get 空时的轮询间隔，平衡吞吐与线程响应
+_PUT_TIMEOUT = 0.5        # 入队侧（prompt→rollout、rollout→scorer、scorer→staleness_q）
+_GET_TIMEOUT = 1.0        # 消费侧空转轮询（rollout/scorer 无批次时）
+_DISPATCH_GET_TIMEOUT = 10.0  # 训练调度器等待批次（远超 GET_TIMEOUT，容忍长队列空窗）
+
 # ---- 分布式 / 高性能推理（GPU 部署骨架）：ray / megatron-core / vllm 可选 ----
 # L5 用 Ray 把 rollout 拆到多卡进程；L2 用 megatron 把 learner 切 TP=2+SP；
 # L3 用 vLLM TP=2 取代朴素前向做 rollout（response_dists 接口包一层）。
@@ -153,14 +158,14 @@ class AsyncBatchedScheduler:
         while not self.stop.is_set():
             idxs = torch.randint(0, self.n_prompts, (self.batch,))
             try:
-                self._pq.put(idxs, timeout=0.5)
+                self._pq.put(idxs, timeout=_PUT_TIMEOUT)
             except queue.Full:
                 continue
 
     def _rollout_collector(self):
         while not self.stop.is_set():
             try:
-                idxs = self._pq.get(timeout=1)
+                idxs = self._pq.get(timeout=_GET_TIMEOUT)
             except queue.Empty:
                 self._rollout_idle += 1.0      # 空转 1s
                 continue
@@ -189,7 +194,7 @@ class AsyncBatchedScheduler:
                     s_old = response_dists(self.worker, self.prompts[idxs_dev],
                                            self.responses[idxs_dev])     # (B,T,V) device
             try:
-                self._rq.put((idxs, s_old, self._loaded_ver), timeout=0.5)
+                self._rq.put((idxs, s_old, self._loaded_ver), timeout=_PUT_TIMEOUT)
             except queue.Full:
                 self._rollout_idle += 0.5      # 因队列满等待 0.5s
                 self._n_dropped_qfull += 1     # M5：已算完的 rollout 因队满被丢弃
@@ -217,7 +222,7 @@ class AsyncBatchedScheduler:
     def _teacher_scorer(self):
         while not self.stop.is_set():
             try:
-                idxs, s_old, ver = self._rq.get(timeout=1)
+                idxs, s_old, ver = self._rq.get(timeout=_GET_TIMEOUT)
             except queue.Empty:
                 self._scorer_idle += 1.0
                 continue
@@ -228,7 +233,7 @@ class AsyncBatchedScheduler:
             else:
                 delta_payload = self.cache.get_delta(idxs.to(self.device))   # (B,T,V) 零拷贝
             try:
-                self.staleness_q.put((idxs, s_old, delta_payload), version=ver, timeout=0.5)
+                self.staleness_q.put((idxs, s_old, delta_payload), version=ver, timeout=_PUT_TIMEOUT)
             except queue.Full:
                 self._n_dropped_qfull += 1     # M5：scored 样本因队满被丢弃
                 continue
@@ -322,7 +327,7 @@ class AsyncBatchedScheduler:
         done = 0
         while done < n_steps:
             try:
-                (idxs, s_old, delta), ver, _ = self.staleness_q.get(timeout=10)
+                (idxs, s_old, delta), ver, _ = self.staleness_q.get(timeout=_DISPATCH_GET_TIMEOUT)
             except queue.Empty:
                 continue
             m = self._train_step(done, idxs, s_old, delta, ver)

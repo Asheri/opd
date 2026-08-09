@@ -11,13 +11,16 @@ from __future__ import annotations
 import queue
 import threading
 
+# 队列最小容量（staleness_threshold*2 的下限；容量太小会导致吞吐受限）
+_MIN_QUEUE_SIZE = 16
+
 
 class StalenessQueue:
     """有界 FIFO + 版本号。入队侧截断过旧样本，消费侧再截一次（双保险）。"""
 
     def __init__(self, staleness_threshold: int = 8):
         self.threshold = staleness_threshold
-        self._q: "queue.Queue" = queue.Queue(maxsize=max(16, staleness_threshold * 2))
+        self._q: "queue.Queue" = queue.Queue(maxsize=max(_MIN_QUEUE_SIZE, staleness_threshold * 2))
         self._cur_version = 0
         self._lock = threading.Lock()
         self.n_rejected = 0          # P2-1：入队侧因过旧拒绝的样本数（只观测）
