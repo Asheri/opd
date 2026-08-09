@@ -49,7 +49,10 @@ class Stage1Cfg(_Strict):
 
 
 class Stage2Cfg(_Strict):
-    scheduling_mode: Literal["fully_async", "n_step_off", "fused_hybrid_sync"] = "fully_async"
+    # A6：scheduling_mode 只收已实现的 fully_async——n_step_off / fused_hybrid_sync
+    # 并未在 scheduler 实现（scheduler 不读取该键），请求其它值应抛校验错误而非
+    # 静默按 fully_async 跑（诚实降级，不做假配置）。
+    scheduling_mode: Literal["fully_async"] = "fully_async"
     staleness_threshold: int = 4
     queue_size: int = 8
     kl_reg_coef: float = 0.05

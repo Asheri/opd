@@ -157,3 +157,10 @@ def test_stage_subkey_priority_kept():
     assert cfg["cache_mode"] == "topk"
     # stage2 无 cache_mode 槽位（死槽位已清，下渗已分流到 stage1）
     assert "cache_mode" not in cfg["stage2"]
+
+
+def test_unimplemented_scheduling_mode_rejected(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("stage2:\n  scheduling_mode: n_step_off\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_config(path=str(bad))
