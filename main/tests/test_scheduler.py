@@ -162,3 +162,14 @@ def test_scheduler_on_step_callback_invoked_per_step():
     sched.run(5, on_step=lambda m: calls.append(m["step"]))
     assert len(calls) == 5
     assert calls == [0, 1, 2, 3, 4]
+
+
+def test_train_step_metrics_finite_collected():
+    """C3：.item() 收集后一次同步，指标仍有限。"""
+    student, cache, prompts, responses, ref_dists = _setup(seed=9)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses, ref_dists,
+                                  None, None, _cfg(n_steps=4), "cpu")
+    ms = sched.run(4)
+    for m in ms:
+        for k in ("loss", "pg_loss", "kl_loss", "adv_mean", "reward"):
+            assert math.isfinite(m[k])

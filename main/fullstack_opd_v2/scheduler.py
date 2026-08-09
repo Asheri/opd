@@ -299,16 +299,23 @@ class AsyncBatchedScheduler:
         with torch.no_grad():
             reward = expected_reward(s_cur.detach(), delta_d, None, p_dists=s_cur.detach().exp()).mean()
             adv = expected_reward(s_old, delta_d, None, p_dists=p_old.detach()).mean()
+
+        # C3：热路径 5 个标量收集成一个大张量一次 device→cpu，避免逐 .item() 各触发
+        # 一次同步。autocast 下 loss 族可能为 bf16/fp16，adv/reward 在 no_grad 外为
+        # fp32——先统一转 fp32 再 stack（stack 要求同 dtype）。
+        scalars = [loss, loss_pg, loss_kl, adv, reward]
+        scalars = [s.float() if s.dtype != torch.float32 else s for s in scalars]
+        loss_v, pg_v, kl_v, adv_v, rew_v = torch.stack(scalars).detach().cpu().tolist()
         return {
             "step": done,
             "version": version,
             "age": version - ver,
             "batch": int(s_cur.size(0)),
-            "loss": float(loss.item()),
-            "pg_loss": float(loss_pg.item()),
-            "kl_loss": float(loss_kl.item()),
-            "adv_mean": float(adv.item()),
-            "reward": float(reward.item()),
+            "loss": loss_v,
+            "pg_loss": pg_v,
+            "kl_loss": kl_v,
+            "adv_mean": adv_v,
+            "reward": rew_v,
         }
 
     def _train_dispatcher(self, n_steps: int, on_step=None):
