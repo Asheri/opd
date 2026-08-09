@@ -40,3 +40,13 @@ def test_wandb_without_wandb_falls_back(tmp_path):
     mr.record({"loss": 0.1})
     mr.close()
     assert os.path.isfile(os.path.join(str(tmp_path), "metrics.csv"))
+
+
+def test_flush_throttled_close_flushes(tmp_path):
+    """flush 节流：record 不每步刷，close 终刷保证完整。"""
+    mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path), flush_every=3)
+    for i in range(5):
+        mr.record({"loss": i})
+    mr.close()
+    lines = open(os.path.join(str(tmp_path), "metrics.csv"), encoding="utf-8").read().splitlines()
+    assert len(lines) == 6   # 表头 + 5 行

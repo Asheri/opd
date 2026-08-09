@@ -20,7 +20,8 @@ class MetricsRecorder:
     """每步指标记录器。"""
 
     def __init__(self, backend: str = "csv", run_dir: str | None = None,
-                 wandb_project: str | None = None, csv_path: str | None = None):
+                 wandb_project: str | None = None, csv_path: str | None = None,
+                 flush_every: int = 10):
         self.backend = backend
         self.csv_path = csv_path or (os.path.join(run_dir, "metrics.csv")
                                      if run_dir else None)
@@ -29,6 +30,9 @@ class MetricsRecorder:
         self._file = None
         self._writer = None
         self._wandb = None
+        # C2：每 N 步才 flush 一次（默认 10），close 时终刷；避免每步一次系统调用
+        self._flush_every = max(1, int(flush_every))
+        self._n_records = 0
         # C1：后台消费线程与主线程可能并发 record/close，统一加锁保护
         self._lock = threading.Lock()
 
@@ -70,7 +74,10 @@ class MetricsRecorder:
             if self.backend == "csv" and self._writer is not None:
                 self._ensure_fields(m)
                 self._writer.writerow(m)
-                self._file.flush()
+                # C2：每 N 步 flush 一次，避免每步一次系统调用；close 时终刷兜底
+                self._n_records += 1
+                if self._n_records % self._flush_every == 0:
+                    self._file.flush()
             if self._wandb is not None:
                 self._wandb.log(m)
 
@@ -92,6 +99,8 @@ class MetricsRecorder:
     def close(self):
         with self._lock:
             if self._file is not None:
+                # C2：终刷兜底——最后一次不满 flush_every 的记录也落盘
+                self._file.flush()
                 self._file.close()
                 self._file = None
             if self._wandb is not None:
