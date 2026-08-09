@@ -107,3 +107,22 @@ def test_distributed_branch_no_unbound_local(tmp_path, monkeypatch):
     cfg["stage2"]["n_steps"] = 1
     out = FullStackOPDv2(cfg, device="cpu").run()
     assert len(out["metrics"]) == 1
+
+
+def test_build_model_used_for_models(monkeypatch):
+    """student/teacher 构造走 build_model（B2）。"""
+    import os
+    import tempfile
+    import fullstack_opd_v2.pipeline as P
+    calls = []
+    real = P.build_model
+    def spy(cfg, device, role=None):
+        calls.append(role)
+        return real(cfg, device, role=role)
+    monkeypatch.setattr(P, "build_model", spy)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})()
+        FullStackOPDv2(_cfg(tmp), device="cpu").run()
+    assert calls
+    assert "teacher" in calls
+    assert "student" in calls

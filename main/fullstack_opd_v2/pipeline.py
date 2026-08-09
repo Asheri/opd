@@ -128,12 +128,15 @@ CLOUD_CONFIG = {
 
 # ----------------------------- Stage 0 -----------------------------
 def stage0_small_rl(prompts, reward_fn, cfg: dict, device,
-                    vocab: int, d_model: int, n_layers: int):
+                    vocab: int, d_model: int, n_layers: int, teacher=None):
     """批量 REINFORCE：产生 post-RL weak teacher；pre-RL reference 为其训练前副本。
 
     reward_fn: `(B,T) token` -> `(B,T) 奖励` 的可调用对象（来自 DataLoader，toy 为查找表）。
+    teacher: 预构建的初始模型（B2：由 build_model 注入，model_kind 配置生效）；
+             None 时退回 CausalToyLM 默认构造（原行为不变）。
     """
-    weak = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(device)
+    weak = teacher if teacher is not None else \
+        CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(device)
     ref = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(device)
     ref.load_state_dict(weak.state_dict())
     ref.eval()
@@ -226,12 +229,17 @@ class FullStackOPDv2:
             self.cfg, self.device).load()
 
     def _stage0_teachers(self):
-        """跑 Stage 0 小模型 RL，返回 (teacher_rl, teacher_ref)。供 run()/CLI cache 复用。"""
+        """跑 Stage 0 小模型 RL，返回 (teacher_rl, teacher_ref)。供 run()/CLI cache 复用。
+
+        B2：教师初始权重由可插拔工厂 build_model 构建（model_kind 配置生效）并注入
+        stage0_small_rl；后者内部仍用 CausalToyLM 构造 ref 副本（toy RL 阶段最小改动）。
+        """
         vocab = self.cfg["vocab_size"]
         d_model = self.cfg["d_model"]
         n_layers = self.cfg["n_layers"]
+        teacher = build_model(self.cfg, self.device, role="teacher")
         return stage0_small_rl(self.prompts, self.reward_fn, self.cfg["stage0"],
-                               self.device, vocab, d_model, n_layers)
+                               self.device, vocab, d_model, n_layers, teacher=teacher)
 
     def run(self, run_dir: str | None = None, resume: dict | None = None) -> dict:
         """跑全栈流水线（Stage 0/1/2），落盘 run 目录（config/日志/checkpoint/metrics）。
@@ -287,7 +295,7 @@ class FullStackOPDv2:
 
         # L1：把 student 提前创建，使「离线 warmup 采样」与「Stage 2 KL 锚点」共享同一份
         # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
-        student = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(self.device)
+        student = build_model(self.cfg, self.device, role="student")
 
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
         initial_version = 0
