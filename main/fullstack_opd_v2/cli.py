@@ -19,7 +19,7 @@ import os
 
 from pydantic import ValidationError
 
-from .exceptions import ConfigError, CheckpointError, OPDError
+from .exceptions import ConfigError, CheckpointError, DataError, OPDError
 
 
 def _device_arg(args) -> str:
@@ -132,6 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("info", help="打印解析后配置")
     p.add_argument("--config", default=None)
     p.add_argument("--set", action="append", default=[])
+
+    p = sub.add_parser("eval-aime", help="真实模型 AIME24/25 评估（main/ 自包含）")
+    p.add_argument("--model", default=None, help="HF 模型路径 / id（与 --run-dir 二选一）")
+    p.add_argument("--run-dir", default=None, help="run 目录（读 config.yaml 的 eval.model_path）")
+    p.add_argument("--checkpoint", default=None, help="（预留）checkpoint 路径")
+    p.add_argument("--datasets", nargs="+", default=None, help="如 AIME24 AIME25（默认两者）")
+    p.add_argument("--out", default=None, help="输出目录（默认 run-dir/aime 或 results/aime）")
+    p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument("--n-samples", type=int, default=1)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--device", default=None)
     return ap
 
 
@@ -146,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_eval(args)
         if args.command == "info":
             return _cmd_info(args)
+        if args.command == "eval-aime":
+            return _cmd_eval_aime(args)
         raise ConfigError(f"未知子命令: {args.command}")
     except (OPDError, ValidationError) as e:
         print(f"[error] {type(e).__name__}: {e}")
@@ -157,3 +170,44 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _cmd_eval_aime(args) -> int:
+    """AIME 评估：--model 直评 / --run-dir 桥接（读 config.yaml 的 eval.model_path）。"""
+    import os
+    import yaml
+    from .eval_aime import AimeEvaluator, DEFAULT_DATASETS
+
+    if args.model:
+        model_path = args.model
+    elif args.run_dir:
+        cfg_path = os.path.join(args.run_dir, "config.yaml")
+        if not os.path.isfile(cfg_path):
+            raise ConfigError(f"run 目录缺 config.yaml: {args.run_dir}")
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        mp = (cfg.get("eval") or {}).get("model_path")
+        if not mp:
+            raise DataError(
+                f"run 目录 {args.run_dir!r} 未配置 eval.model_path——toy run 目录无法跑真实 AIME；"
+                "请用真实模型的 run 目录（config.yaml 的 eval.model_path 指向 HF 模型路径/id）")
+        model_path = mp
+    else:
+        raise ConfigError("eval-aime 需要 --model 或 --run-dir")
+
+    datasets = args.datasets or list(DEFAULT_DATASETS)
+    device = _device_arg(args)
+    out_dir = args.out or (os.path.join(args.run_dir, "aime") if args.run_dir else "results/aime")
+    ev = AimeEvaluator(
+        model_path, device=device,
+        max_new_tokens=args.max_new_tokens, n_samples=args.n_samples,
+        temperature=args.temperature)
+    print(f"[eval-aime] model={model_path}  datasets={datasets}  device={device}")
+    print(f"[eval-aime] 输出目录: {out_dir}")
+    for ds in datasets:
+        out_path = os.path.join(out_dir, f"{ds}.jsonl")
+        res = ev.evaluate_to_jsonl(ds, out_path)
+        print(f"[eval-aime] {ds}: {res.correct}/{res.total} = {res.accuracy * 100:.2f}%  "
+              f"→ {out_path}")
+    print("[eval-aime] 汇总：teacher 基线 / 学生蒸馏前后对比见 benchmarks/aime24_25/aggregate.py")
+    return 0

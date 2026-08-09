@@ -113,6 +113,19 @@ class DatasetCfg(_Strict):
     response_key: str = "response"
 
 
+class EvalCfg(_Strict):
+    """AIME 评估配置（eval-aime 子命令与 run 目录桥接）。
+
+    model_path: 真实 HF 模型路径 / HF id（toy run 目录无此键 → 无法跑真实 AIME）。
+    供 `opd eval-aime --run-dir <dir>` 读取 run_dir/config.yaml 用。
+    """
+    model_path: str | None = None
+    datasets: list[str] = ["AIME24", "AIME25"]
+    max_new_tokens: int = 2048
+    n_samples: int = 1
+    temperature: float = 0.0
+
+
 class OPDConfig(_Strict):
     vocab_size: int = 64
     d_model: int = 48
@@ -136,6 +149,7 @@ class OPDConfig(_Strict):
     logging: LoggingCfg = Field(default_factory=LoggingCfg)
     metrics: MetricsCfg = Field(default_factory=MetricsCfg)
     dataset: DatasetCfg = Field(default_factory=DatasetCfg)
+    eval: EvalCfg = Field(default_factory=EvalCfg)
 
 
 # --------------------------- 顶层部署键下渗 ---------------------------
@@ -228,5 +242,5 @@ def load_config(path: str | None = None,
 
 
 __all__ = ["OPDConfig", "Stage0Cfg", "Stage1Cfg", "Stage2Cfg",
-           "RunCfg", "LoggingCfg", "MetricsCfg", "DatasetCfg",
+           "RunCfg", "LoggingCfg", "MetricsCfg", "DatasetCfg", "EvalCfg",
            "load_config", "ValidationError"]

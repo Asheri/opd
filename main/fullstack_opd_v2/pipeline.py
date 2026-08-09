@@ -55,6 +55,8 @@ DEFAULT_CONFIG_V2 = {
     "metrics": {"backend": "csv", "csv_path": None, "wandb_project": None},
     "dataset": {"type": "toy", "path": None, "prompt_key": "prompt",
                 "response_key": "response"},
+    "eval": {"model_path": None, "datasets": ["AIME24", "AIME25"],
+             "max_new_tokens": 2048, "n_samples": 1, "temperature": 0.0},
     "stage0": {              # 小模型 RL（产生 post-RL weak teacher）
         "lr": 1e-3, "n_rl_steps": 40, "max_new_tokens": 8,
         "batch_size": 8, "grad_clip": 1.0,

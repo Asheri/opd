@@ -21,7 +21,7 @@ def _write_cfg(tmp_path, n_steps=3):
 def test_parser_has_subcommands():
     p = build_parser()
     sub = next(a for a in p._actions if a.dest == "command")
-    assert set(sub.choices) == {"train", "cache", "eval", "info"}
+    assert set(sub.choices) == {"train", "cache", "eval", "info", "eval-aime"}
 
 
 def test_cli_info(tmp_path, capsys):
@@ -97,3 +97,38 @@ def test_no_args_requires_subcommand(capsys):
     with pytest.raises(SystemExit) as e:
         main([])
     assert e.value.code == 2
+
+def test_cli_eval_aime_run_dir_missing_model_path(tmp_path, capsys):
+    """toy run 目录无 eval.model_path → DataError → exit 2。"""
+    cfg = _write_cfg(tmp_path)
+    run_dir = str(tmp_path / "r_evalaime")
+    main(["train", "--config", str(cfg), "--run-dir", run_dir, "--device", "cpu"])
+    rc = main(["eval-aime", "--run-dir", run_dir, "--device", "cpu"])
+    assert rc == 2
+    assert "model_path" in capsys.readouterr().out
+
+
+def test_cli_eval_aime_run_dir_bridge(tmp_path, capsys, monkeypatch):
+    """run-dir 配置 eval.model_path → 桥接评估真实模型（mock AimeEvaluator）。"""
+    import json
+    import os
+    import yaml
+    import fullstack_opd_v2.eval_aime as EA
+
+    class FakeAimeEvaluator:
+        def __init__(self, *a, **k):
+            pass
+        def evaluate_to_jsonl(self, ds, out_path):
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"dataset": ds, "correct": True}) + "\n")
+            return type("R", (), {"correct": 1, "total": 1, "accuracy": 1.0})()
+
+    monkeypatch.setattr(EA, "AimeEvaluator", FakeAimeEvaluator)
+    run_dir = str(tmp_path / "r2")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "config.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump({"eval": {"model_path": "/path/to/real-model"}}, f)
+    rc = main(["eval-aime", "--run-dir", run_dir, "--datasets", "AIME24", "--device", "cpu"])
+    assert rc == 0
+    assert os.path.isfile(os.path.join(run_dir, "aime", "AIME24.jsonl"))
