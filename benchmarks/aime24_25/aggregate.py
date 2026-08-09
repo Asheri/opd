@@ -31,7 +31,10 @@ def _accuracy(path: str) -> float:
             line = line.strip()
             if not line:
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue                      # R4：跳过损坏行，不整表崩溃
             n += 1
             correct += int(row.get("correct", False))
     return (correct / n * 100.0) if n else float("nan"), correct, n

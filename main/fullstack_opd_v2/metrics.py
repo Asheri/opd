@@ -81,13 +81,6 @@ class MetricsRecorder:
         new = [k for k in m if k not in self._fields]
         if not new:
             return False
-        # L1：append（resume 续写）模式下不整表重写（_rewrite_csv 会截断旧历史行）——
-        # 新字段跳过 CSV 列（DictWriter 只写 fieldnames 列，多余键静默丢弃），仅警告。
-        # 正常 resume 同流水线 schema 一致，此分支不应触发。
-        if self.append and self._header_written:
-            warnings.warn(
-                f"append 模式出现新字段 {new}：跳过 CSV 列（resume 同流水线 schema 应一致）")
-            return False
         self._fields.extend(new)
         if self._writer is None:
             return False
@@ -96,7 +89,15 @@ class MetricsRecorder:
             self._writer.writeheader()
             self._header_written = True
             return False            # 首个表头刚写出：本行仍由调用方 writerow
-        self._rewrite_csv()         # 表头已存在 + 新字段晚到 → 整表重建（含 _rows 全部行）
+        if self.append:
+            # L1/R2：append（resume 续写）模式——本行及后续行带新列（DictWriter 写 fieldnames），
+            # 旧行在文件里天然缺该列（留空）。**不整表重写**（_rewrite_csv 只有新行、会截断历史）。
+            # 正常 resume 同流水线 schema 一致，此分支不应触发。
+            self._writer.fieldnames = self._fields
+            warnings.warn(
+                f"append 模式出现新字段 {new}：旧行该列为空（resume 同流水线 schema 应一致）")
+            return False
+        self._rewrite_csv()         # 非 append：表头已存在 + 新字段晚到 → 整表重建（含 _rows 全部行）
         return True
 
     def _rewrite_csv(self):

@@ -132,3 +132,15 @@ def test_cli_eval_aime_run_dir_bridge(tmp_path, capsys, monkeypatch):
     rc = main(["eval-aime", "--run-dir", run_dir, "--datasets", "AIME24", "--device", "cpu"])
     assert rc == 0
     assert os.path.isfile(os.path.join(run_dir, "aime", "AIME24.jsonl"))
+
+
+def test_cli_eval_aime_malformed_config(tmp_path, capsys):
+    """R3：run-dir config.yaml 非法 YAML → ConfigError → exit 2。"""
+    import os
+    run_dir = str(tmp_path / "r_bad")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "config.yaml"), "w", encoding="utf-8") as f:
+        f.write("eval:\n  model_path: [unclosed\n")
+    rc = main(["eval-aime", "--run-dir", run_dir, "--device", "cpu"])
+    assert rc == 2
+    assert "config.yaml" in capsys.readouterr().out
