@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from fullstack_opd_v2.exceptions import DataError
+from fullstack_opd_v2.model import CausalToyLM
 from fullstack_opd_v2.pipeline import FullStackOPDv2, DEFAULT_CONFIG_V2
 
 
@@ -202,3 +203,21 @@ def test_resume_keeps_kl_anchor_invariant():
         FullStackOPDv2(cfg, device="cpu").run(run_dir=os.path.join(td, "r"), resume=ck)
         ck2 = CheckpointManager(os.path.join(td, "r")).resume()
         assert torch.allclose(ck2["ref"]["ref_dists"], ck["ref"]["ref_dists"])
+
+
+def test_warmup_requires_student_raises_dataerror():
+    """B1 收尾：warmup_source=student_init 但未传 warmup_student 时抛 DataError（非裸 ValueError）。"""
+    import pytest
+    from fullstack_opd_v2.exceptions import DataError
+    from fullstack_opd_v2.pipeline import stage1_build_cache
+    import torch
+    p = torch.zeros(4, 3, dtype=torch.long)
+    r = torch.zeros(4, 2, dtype=torch.long)
+    tr = CausalToyLM(vocab=16, d_model=8, n_layers=1)
+    t = CausalToyLM(vocab=16, d_model=8, n_layers=1)
+    cfg = {"cache_mode": "dense", "top_k_teacher": 0, "warmup_M": 2,
+           "warmup_source": "student_init", "warmup_temperature": 1.0,
+           "enforce_teacher_consistency": True,
+           "cache_path": "x.pt", "build_batch_size": 4}
+    with pytest.raises(DataError):
+        stage1_build_cache(p, r, tr, t, cfg, warmup_student=None)

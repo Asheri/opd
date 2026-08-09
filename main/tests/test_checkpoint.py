@@ -93,3 +93,11 @@ def test_load_missing_raises(tmp_path):
     """D3：加载不存在的断点文件抛 CheckpointError（精确类型可捕获）。"""
     with pytest.raises(CheckpointError):
         CheckpointManager(str(tmp_path)).load(str(tmp_path / "nope.pt"))
+
+
+def test_load_corrupt_raises(tmp_path):
+    """D3：文件内容损坏（非 torch 断点）时也抛 CheckpointError 而非裸异常。"""
+    bad = tmp_path / "bad.pt"
+    bad.write_bytes(b"not a torch checkpoint")
+    with pytest.raises(CheckpointError):
+        CheckpointManager(str(tmp_path)).load(str(bad))

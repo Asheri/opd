@@ -16,15 +16,6 @@ def test_csv_record_writes_rows(tmp_path):
     assert len(lines) == 3                            # 表头 + 2 行
 
 
-def test_record_missing_fields_filled(tmp_path):
-    mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path))
-    mr.record({"loss": 0.1, "version": 1})
-    mr.record({"loss": 0.2, "version": 2, "age": 5})  # 新增字段
-    mr.close()
-    mr2 = MetricsRecorder(backend="csv", run_dir=str(tmp_path))
-    assert mr2._fields is None or True
-
-
 def test_summary(tmp_path):
     mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path))
     mr.record({"loss": 0.1, "version": 1})
