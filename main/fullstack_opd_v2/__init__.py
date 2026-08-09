@@ -24,6 +24,7 @@ from .run import RunManager
 from .checkpoint import CheckpointManager
 from .metrics import MetricsRecorder
 from .logging import setup_logging, get_logger, close_logging
+from .eval_aime import AimeEvaluator, AimeResult, extract_answer, normalize_answer, format_prompt
 from .exceptions import (
     OPDError, ConfigError, DataError, ModelError, CheckpointError, TrainingError,
 )
@@ -53,6 +54,11 @@ __all__ = [
     "setup_logging",
     "get_logger",
     "close_logging",
+    "AimeEvaluator",
+    "AimeResult",
+    "extract_answer",
+    "normalize_answer",
+    "format_prompt",
     "OPDError",
     "ConfigError",
     "DataError",
