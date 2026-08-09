@@ -17,6 +17,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .exceptions import ConfigError
 from .pipeline import DEFAULT_CONFIG_V2
 
 
@@ -198,7 +199,8 @@ def load_config(path: str | None = None,
 
     - path=None 时仅用内置默认（等价 DEFAULT_CONFIG_V2）。
     - overrides: ["stage2.lr=1e-4", "n_steps=50", "stage1.warmup_source=mix"]。
-    - 任何未知键 / 非法枚举值 / 类型不符 → 抛 ValidationError（静默忽略→显式报错）。
+    - 任何未知键 / 非法枚举值 / 类型不符 / 覆盖项缺 `=` → 抛 ConfigError
+      （pydantic ValidationError 被包装为 ConfigError，调用方可统一按配置错误捕获）。
     """
     data: dict = {}
     if path:
@@ -206,7 +208,7 @@ def load_config(path: str | None = None,
             data = yaml.safe_load(f) or {}
     for item in (overrides or []):
         if "=" not in item:
-            raise ValueError(f"覆盖项需形如 key=value，收到 {item!r}")
+            raise ConfigError(f"覆盖项需形如 key=value，收到 {item!r}")
         k, v = item.split("=", 1)
         _set_dotted(data, k.strip(), _parse_scalar(v))
     # 顶层部署键按 stage 分流下渗（stage 子键优先，见 _seep_deployment_keys）。
@@ -214,7 +216,10 @@ def load_config(path: str | None = None,
     # stage schema 无合法位置，校验后补会破坏"快照=有效配置"（A4/A5/B4）。
     # --set 点分覆盖已在 _set_dotted 应用过，下渗只补 stage 里没有的键。
     data = _seep_deployment_keys(data)
-    cfg = OPDConfig(**data)                      # 校验（未知键/非法值在此报错）
+    try:
+        cfg = OPDConfig(**data)                  # 校验（未知键/非法值在此报错）
+    except ValidationError as e:
+        raise ConfigError(f"配置校验失败: {e}") from e
     # 合并到内置默认（pydantic 已用默认补全所有键，model_dump 即为完整配置）
     merged = {**DEFAULT_CONFIG_V2, **cfg.model_dump()}
     for stage in ("stage0", "stage1", "stage2"):

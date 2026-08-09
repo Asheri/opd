@@ -4,9 +4,9 @@ from __future__ import annotations
 import os
 
 import pytest
-from pydantic import ValidationError
 
 from fullstack_opd_v2.config import load_config
+from fullstack_opd_v2.exceptions import ConfigError
 from fullstack_opd_v2.pipeline import DEFAULT_CONFIG_V2, FullStackOPDv2
 
 YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -30,21 +30,21 @@ def test_load_real_yaml():
 def test_unknown_top_level_key_rejected(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("vocab_size: 64\nbogus_key: 1\n", encoding="utf-8")
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(path=str(bad))
 
 
 def test_unknown_nested_key_rejected(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("stage2:\n  n_steps: 5\n  bogus: 1\n", encoding="utf-8")
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(path=str(bad))
 
 
 def test_bad_enum_rejected(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("dtype: fp16\n", encoding="utf-8")   # 非法枚举
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(path=str(bad))
 
 
@@ -58,12 +58,12 @@ def test_dotted_overrides():
 
 
 def test_override_unknown_key_rejected():
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(overrides=["stage2.nonexistent=1"])
 
 
 def test_override_bad_value_rejected():
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(overrides=["stage2.rollout_engine=foo"])
 
 
@@ -103,14 +103,14 @@ def test_new_sections_dotted_overrides():
 def test_new_section_unknown_key_rejected(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("run:\n  bogus: 1\n", encoding="utf-8")
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(path=str(bad))
 
 
 def test_bad_model_kind_rejected(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("model_kind: nope\n", encoding="utf-8")
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(path=str(bad))
 
 
@@ -146,7 +146,7 @@ def test_stage2_ref_topk_not_seeped():
     """ref_topk 是顶层键，不注入 stage2（stage2 不接受该键，extra=forbid）。"""
     cfg = load_config(overrides=["ref_topk=128"])
     assert cfg["ref_topk"] == 128
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
         load_config(overrides=["stage2.ref_topk=128"])
 
 
@@ -162,5 +162,12 @@ def test_stage_subkey_priority_kept():
 def test_unimplemented_scheduling_mode_rejected(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("stage2:\n  scheduling_mode: n_step_off\n", encoding="utf-8")
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigError):
+        load_config(path=str(bad))
+
+
+def test_validation_error_wrapped_as_config_error(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("stage2:\n  bogus: 1\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
         load_config(path=str(bad))

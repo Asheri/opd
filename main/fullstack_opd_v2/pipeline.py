@@ -28,7 +28,7 @@ from .run import RunManager
 from .checkpoint import CheckpointManager
 from .metrics import MetricsRecorder
 from .logging import setup_logging, get_logger, close_logging
-from .exceptions import TrainingError
+from .exceptions import DataError, TrainingError
 
 DEFAULT_CONFIG_V2 = {
     "vocab_size": 64,
@@ -185,7 +185,7 @@ def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
     fat_prompts, fat_responses = prompts, responses
     if warmup_M > 0 and source not in (None, "none"):
         if source not in _VALID_SOURCES:
-            raise ValueError(
+            raise DataError(
                 f"stage1 warmup_source 必须是 {_VALID_SOURCES} 之一，收到 {source!r}")
         extra_p, extra_r = [], []
         # 注：采样只消耗 RNG、不改权重；warmup_student 即 Stage 2 的同一初始 student，

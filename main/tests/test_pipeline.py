@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from fullstack_opd_v2.exceptions import DataError
 from fullstack_opd_v2.pipeline import FullStackOPDv2, DEFAULT_CONFIG_V2
 
 
@@ -45,7 +46,7 @@ def test_warmup_mix_fat_count(tmp_path):
 
 
 def test_warmup_invalid_source_raises(tmp_path):
-    with pytest.raises(ValueError):
+    with pytest.raises(DataError):
         FullStackOPDv2(_cfg(tmp_path, warmup_M=4, warmup_source="bogus"),
                        device="cpu").run()
 

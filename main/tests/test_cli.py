@@ -60,6 +60,12 @@ def test_cli_unknown_command_system_exit_2():
     assert e.value.code == 2
 
 
+def test_cli_bad_override_friendly(capsys):
+    rc = main(["info", "--set", "stage2.n_steps"])
+    assert rc == 2
+    assert "error" in capsys.readouterr().out.lower()
+
+
 def _latest_ckpt(run_dir):
     """按 step 号（非词法序）取最新断点，避免 step_10 < step_3 的词法陷阱。"""
     ck_dir = os.path.join(run_dir, "checkpoints")

@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import os
 
+from pydantic import ValidationError
+
 from .exceptions import ConfigError, CheckpointError, OPDError
 
 
@@ -145,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "info":
             return _cmd_info(args)
         raise ConfigError(f"未知子命令: {args.command}")
-    except OPDError as e:
+    except (OPDError, ValidationError) as e:
         print(f"[error] {type(e).__name__}: {e}")
         return 2
     except KeyboardInterrupt:
