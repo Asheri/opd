@@ -106,6 +106,7 @@ class AsyncBatchedScheduler:
         # P2-1：只观测计数器（不改控制流）
         self._n_rollout = 0          # rollout 实际前向次数
         self._n_dropped_consume = 0  # 消费侧因过旧丢弃数
+        self._n_dropped_qfull = 0    # 队列满丢弃数（rollout→scorer 或 scorer→staleness_q）
         self._rollout_idle = 0.0     # RolloutCollector 累计空转秒
         self._scorer_idle = 0.0      # TeacherScorer 累计空转秒
 
@@ -185,6 +186,7 @@ class AsyncBatchedScheduler:
                 self._rq.put((idxs, s_old, self._loaded_ver), timeout=0.5)
             except queue.Full:
                 self._rollout_idle += 0.5      # 因队列满等待 0.5s
+                self._n_dropped_qfull += 1     # M5：已算完的 rollout 因队满被丢弃
                 continue
 
     def _ref_logp_at_student_topk(self, idxs: torch.Tensor,
@@ -222,6 +224,7 @@ class AsyncBatchedScheduler:
             try:
                 self.staleness_q.put((idxs, s_old, delta_payload), version=ver, timeout=0.5)
             except queue.Full:
+                self._n_dropped_qfull += 1     # M5：scored 样本因队满被丢弃
                 continue
 
     def _train_step(self, done, idxs, s_old, delta, ver):
@@ -245,7 +248,9 @@ class AsyncBatchedScheduler:
         with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
                                 enabled=self.amp):
             s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
-            s_old = s_old.to(s_cur.dtype)                       # 与 s_cur 同精度，保证 ratio 一致
+            # 与 s_cur 同设备同精度，保证 ratio 一致（M2：分布式路径 s_old 由 worker 进程
+            # 回传在 CPU，此前只转 dtype 不转 device → s_cur-s_old 设备不匹配崩溃）。
+            s_old = s_old.to(self.device, dtype=s_cur.dtype)
             # P2-2：缓存 p_old 供 pg_loss 与 adv 监控复用，省掉 expected_reward 内部那次 s_old.exp()；全 1 mask 走 None 快路径
             # ⚠️ mask 快路径前提：调度器无 padding（responses 等长），恒全 1。
             #    若将来引入真实 padding mask 必须改回传 mask。
@@ -266,7 +271,12 @@ class AsyncBatchedScheduler:
                 else:
                     loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], None)
             else:
-                # dense 模式（demo 默认）：delta 已是完整 (B,T,V)
+                # dense 模式（demo 默认）：delta 应为完整 (B,T,V)。
+                # M2 防御：DistAsyncScheduler.run 传 None（worker 只回传 idxs/s_old），
+                # 此处现场从缓存零拷贝取 Δ_T，与线程版 _teacher_scorer 的 get_delta 同源——
+                # 线程版已传真实 delta 则跳过，不重复搬运。
+                if delta is None:
+                    delta = self.cache.get_delta(idxs_dev)
                 delta_d = delta
                 loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
                                   log_ratio_max=LOG_RATIO_MAX)
@@ -329,14 +339,22 @@ class AsyncBatchedScheduler:
             t.join(timeout=5)
         rollouts = self._n_rollout
         trained = len(self.metrics)
+        stale_drops = self.staleness_q.n_rejected + self._n_dropped_consume
+        qfull_drops = self._n_dropped_qfull
+        # M5：停机尾段 = 已算完但主循环已到 n_steps 未及消费的 rollout（残差口径）。
+        #   rollouts = trained + stale_drops + qfull_drops + shutdown_tail 恒等成立。
+        shutdown_tail = max(0, rollouts - trained - stale_drops - qfull_drops)
         from collections import Counter
         ages = Counter(m["age"] for m in self.metrics)
         self.summary = {
             "rollout_forwards": rollouts,
-            "dropped_at_put": self.staleness_q.n_rejected,
-            "dropped_at_consume": self._n_dropped_consume,
             "trained_steps": trained,
-            "waste_ratio": (rollouts - trained) / max(rollouts, 1),
+            "dropped_at_put": self.staleness_q.n_rejected,     # 入队侧陈旧拒收
+            "dropped_at_consume": self._n_dropped_consume,     # 消费侧陈旧截断
+            "dropped_queue_full": qfull_drops,                 # 队列满丢弃
+            "shutdown_tail": shutdown_tail,                    # 停机尾段（残差）
+            "stale_discard_ratio": stale_drops / max(rollouts, 1),  # 纯陈旧丢弃率
+            "waste_ratio": (rollouts - trained) / max(rollouts, 1),  # 总浪费（陈旧+队满+停机尾）
             "rollout_idle_s": round(self._rollout_idle, 2),
             "scorer_idle_s": round(self._scorer_idle, 2),
             "age_histogram": dict(sorted(ages.items())),   # {age: 步数}，兑现设计 §7.1

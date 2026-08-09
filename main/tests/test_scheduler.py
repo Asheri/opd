@@ -109,6 +109,29 @@ def test_scheduler_summary_reports_waste():
                 "age_histogram")) <= set(s)
     assert isinstance(s["age_histogram"], dict)
     assert sum(s["age_histogram"].values()) == 6   # 每步一个 age
+    # M5：waste 拆解为 陈旧(put+consume) / 队满 / 停机尾 三源，且口径封闭（恒等式成立）
+    assert 0.0 <= s["stale_discard_ratio"] <= 1.0
+    assert s["dropped_queue_full"] >= 0
+    assert s["shutdown_tail"] >= 0
+    assert s["rollout_forwards"] == (s["trained_steps"] + s["dropped_at_put"]
+                                     + s["dropped_at_consume"] + s["dropped_queue_full"]
+                                     + s["shutdown_tail"])
+
+
+def test_train_step_dense_fetches_delta_when_none():
+    """M2 回归：dense 模式 `_train_step` 传 delta=None（分布式路径由 worker 回传 idxs/s_old、
+    不送 Δ_T）必须现场从缓存零拷贝取 Δ_T，而非 ratio*None 崩溃。"""
+    student, cache, prompts, responses, ref_dists = _setup(seed=5)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, _cfg(), "cpu")
+    idxs = torch.tensor([0, 1, 2, 3])
+    with torch.no_grad():
+        s_old = response_dists(student, prompts[idxs], responses[idxs])   # CPU 张量（模拟 worker 回传）
+    m = sched._train_step(0, idxs, s_old, None, 0)                        # delta=None（M2 现场取）
+    assert m is not None
+    assert m["batch"] == 4
+    for k in ("loss", "pg_loss", "kl_loss"):
+        assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"
 
 
 def test_scheduler_topk_mode_runs_end_to_end():
