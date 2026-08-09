@@ -162,8 +162,12 @@ class VLLMRolloutEngine:
         seqs = self._prompt_seq(prompts, responses)
         outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
 
+        # M3：logp 填充用 _LOG_ZERO（≈log 0）而非 0.0——0.0 是合法高概率，稀疏支撑匹配
+        # 会把未填充槽位当成「token id=0 处 logp=0.0」从而污染 searchsorted 匹配 / 伪高置信。
+        # 正常操作（V≤cap 枚全或 V>cap 取满 top-cap）len(items)==k 无残留；残留只出现在
+        # 空 dict / 部分返回的异常路径，此时 -30 使 padding 槽位数值上≈0 贡献（M1 同哲学）。
         ids = torch.zeros((B, T, k), dtype=torch.long)
-        lps = torch.zeros((B, T, k), dtype=torch.float32)
+        lps = torch.full((B, T, k), _LOG_ZERO, dtype=torch.float32)
         for b, o in enumerate(outs):
             plp = o.prompt_logprobs
             for t in range(T):

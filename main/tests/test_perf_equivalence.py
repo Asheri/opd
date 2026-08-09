@@ -183,6 +183,51 @@ def test_response_dists_topk_shape_and_keys():
                 assert abs(logps[b, t, j].item() - lp.logprob) < 1e-6, (b, t, j)
 
 
+def test_response_dists_topk_padding_is_log_zero():
+    """M3 回归：vLLM 只返回部分 logprob（异常/部分返回）时，未填充槽位 logp 必须是
+    _LOG_ZERO（≈log 0）而非 0.0——0.0 是合法高概率，会把 padding 槽位当成「token id=0
+    处 logp=0.0」污染稀疏支撑匹配。"""
+    import unittest.mock as mock
+    from fullstack_opd_v2.rollout_vllm import VLLMRolloutEngine, _LOG_ZERO
+
+    B, P, T, V = 1, 2, 2, 6
+    k = 6                                        # V<=full_cap → k=V，但只返回 3 项
+    device = "cpu"
+
+    class _LP:
+        def __init__(self, logprob):
+            self.logprob = logprob
+
+    def make_plp():
+        plp = [None] * P
+        for t in range(T):
+            plp.append({100 + t * 10 + i: _LP(float(t) + i * 0.1) for i in range(3)})
+        return plp
+
+    fake_llm = mock.MagicMock()
+    fake_llm.generate.return_value = [mock.Mock(prompt_logprobs=make_plp())]
+
+    eng = object.__new__(VLLMRolloutEngine)
+    eng.vocab_size = V
+    eng.full_cap = 100
+    eng.device = device
+    eng.llm = fake_llm
+
+    prompts = torch.zeros(B, P, dtype=torch.long)
+    responses = torch.zeros(B, T, dtype=torch.long)
+    with mock.patch("fullstack_opd_v2.rollout_vllm.SamplingParams",
+                    new=lambda **kw: mock.sentinel.sampling):
+        ids, lps = eng.response_dists_topk(prompts, responses)
+
+    assert ids.shape == (B, T, k) and lps.shape == (B, T, k)
+    # 每位置只填 3 项，剩余 k-3 槽位 logp 必须 = _LOG_ZERO（非 0.0）
+    assert (lps[..., 3:] == _LOG_ZERO).all(), "padding logp 应为 _LOG_ZERO"
+    assert (lps[..., :3] != _LOG_ZERO).all(), "真实项的 logp 不应被填充覆盖"
+    for t in range(T):
+        for j in range(3):
+            assert abs(lps[0, t, j].item() - (float(t) + j * 0.1)) < 1e-6
+
+
 def test_searchsorted_match_equals_full_compare():
     """searchsorted 支撑匹配必须等于原 O(K²) 全对比较（含重复 student id 边界）。"""
     B, T, Kt, Ks, V = 3, 4, 6, 5, 40
