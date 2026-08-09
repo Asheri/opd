@@ -1,5 +1,5 @@
-"""`python -m fullstack_opd_v2` 入口 → 转调 demo.main()。"""
-from .demo import main
+"""`python -m fullstack_opd_v2` 入口 → 转调 cli.main()（train/cache/eval/info）。"""
+from .cli import main
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

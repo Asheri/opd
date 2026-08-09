@@ -61,7 +61,8 @@ class AsyncBatchedScheduler:
     def __init__(self, student: CausalToyLM, cache, prompts: torch.Tensor,
                  responses: torch.Tensor, ref_dists: torch.Tensor | None,
                  ref_ids: torch.Tensor | None, ref_logp: torch.Tensor | None,
-                 cfg: dict, device, rollout_engine=None):
+                 cfg: dict, device, rollout_engine=None,
+                 initial_version: int = 0):
         self.student = student
         self.cache = cache
         self.prompts = prompts          # (N, P) device
@@ -124,6 +125,11 @@ class AsyncBatchedScheduler:
         self.weight_store._snapshot = {
             k: v.detach().clone() for k, v in student.state_dict().items()}
         self.weight_store._version = 0
+
+        # resume（T11）：断点续跑时恢复版本号，使 staleness age 计算与陈旧度一致。
+        if initial_version > 0:
+            self.staleness_q._cur_version = initial_version
+            self.weight_store._version = initial_version
 
         # L3 · vLLM rollout 引擎（可选）：包成 response_dists 的 drop-in 替换。
         # 提供时，rollout 阶段用 vLLM TP=2 推理取代 self.worker 的朴素前向；

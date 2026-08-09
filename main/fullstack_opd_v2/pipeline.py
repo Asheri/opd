@@ -225,10 +225,20 @@ class FullStackOPDv2:
         self.prompts, self.responses, self.reward_fn = build_data_loader(
             self.cfg, self.device).load()
 
-    def run(self, run_dir: str | None = None) -> dict:
+    def _stage0_teachers(self):
+        """跑 Stage 0 小模型 RL，返回 (teacher_rl, teacher_ref)。供 run()/CLI cache 复用。"""
+        vocab = self.cfg["vocab_size"]
+        d_model = self.cfg["d_model"]
+        n_layers = self.cfg["n_layers"]
+        return stage0_small_rl(self.prompts, self.reward_fn, self.cfg["stage0"],
+                               self.device, vocab, d_model, n_layers)
+
+    def run(self, run_dir: str | None = None, resume: dict | None = None) -> dict:
         """跑全栈流水线（Stage 0/1/2），落盘 run 目录（config/日志/checkpoint/metrics）。
 
         - run_dir: 显式指定则复用（如 --resume）；None 时自动时间戳。
+        - resume: CheckpointManager.resume() 的结果（含 state/version），加载学生权重并
+          恢复版本号续跑（Stage 0/1 确定性重放，Stage 2 从断点版本继续）。
         - 计时落 run_dir/timings.json（衡量异步+预加载的时间优化）。
         - 学生 checkpoint 每 checkpoint_every 步落盘（供 AIME 蒸馏后评估）。
         """
@@ -255,14 +265,19 @@ class FullStackOPDv2:
 
         logger.info("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
         t = time.perf_counter()
-        teacher_rl, teacher_ref = stage0_small_rl(
-            self.prompts, self.reward_fn, self.cfg["stage0"],
-            self.device, vocab, d_model, n_layers)
+        teacher_rl, teacher_ref = self._stage0_teachers()
         timings["stage0_rl"] = time.perf_counter() - t
 
         # L1：把 student 提前创建，使「离线 warmup 采样」与「Stage 2 KL 锚点」共享同一份
         # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
         student = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(self.device)
+
+        # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
+        initial_version = 0
+        if resume is not None:
+            student.load_state_dict(resume["state"])
+            initial_version = int(resume.get("version", 0))
+            logger.info(f"resume: 已加载断点学生权重，从 version={initial_version} 续跑")
 
         logger.info("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
         t = time.perf_counter()
@@ -328,7 +343,7 @@ class FullStackOPDv2:
             scheduler = AsyncBatchedScheduler(
                 student, cache, fat_prompts, fat_responses,
                 ref_dists, ref_ids, ref_logp, s2cfg, self.device,
-                rollout_engine=rollout_engine)
+                rollout_engine=rollout_engine, initial_version=initial_version)
 
         # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
         def _on_step(m):

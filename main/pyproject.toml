@@ -20,7 +20,7 @@ test = ["pytest>=7.0"]
 gpu = ["vllm", "megatron-core>=0.16", "ray"]
 
 [project.scripts]
-fullstack-opd-v2 = "fullstack_opd_v2.demo:main"
+fullstack-opd-v2 = "fullstack_opd_v2.cli:main"
 
 [tool.setuptools]
 packages = ["fullstack_opd", "fullstack_opd_v2"]
