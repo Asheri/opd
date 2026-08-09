@@ -57,3 +57,22 @@ def test_cli_unknown_command_system_exit_2():
     with pytest.raises(SystemExit) as e:
         main(["bogus"])
     assert e.value.code == 2
+
+
+def test_cli_eval_end_to_end(tmp_path, capsys):
+    cfg = _write_cfg(tmp_path)
+    run_dir = str(tmp_path / "r_eval")
+    main(["train", "--config", str(cfg), "--run-dir", run_dir, "--device", "cpu"])
+    ckpts = sorted(os.listdir(os.path.join(run_dir, "checkpoints")))
+    assert ckpts
+    ckpt = os.path.join(run_dir, "checkpoints", ckpts[-1])
+    assert main(["eval", "--config", str(cfg), "--checkpoint", ckpt, "--device", "cpu"]) == 0
+    out = capsys.readouterr().out
+    assert "step=" in out
+
+
+def test_cli_cache_end_to_end(tmp_path, capsys):
+    cfg = _write_cfg(tmp_path)
+    out = str(tmp_path / "cache.pt")
+    assert main(["cache", "--config", str(cfg), "--out", out, "--device", "cpu"]) == 0
+    assert os.path.isfile(out)

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from .exceptions import ConfigError, CheckpointError, OPDError
 
@@ -88,7 +89,7 @@ def _cmd_eval(args) -> int:
 
     device = _device_arg(args)
     cfg = _load_cfg(args.config, args.set)
-    ck = CheckpointManager(".", checkpoint_dir=args.checkpoint).load(args.checkpoint)
+    ck = CheckpointManager(os.path.dirname(args.checkpoint)).load(args.checkpoint)
     student = CausalToyLM(vocab=cfg["vocab_size"], d_model=cfg["d_model"],
                           n_layers=cfg["n_layers"]).to(device)
     student.load_state_dict(ck["state"])

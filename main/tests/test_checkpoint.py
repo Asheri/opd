@@ -51,3 +51,13 @@ def test_resume(tmp_path):
     ck = CheckpointManager(str(tmp_path), every=1).resume()
     assert ck["step"] == 15
     assert ck["cfg"] == {"seed": 7}
+
+
+def test_manager_constructed_with_dir_but_loads_file(tmp_path):
+    m = CausalToyLM(vocab=64, d_model=48, n_layers=2)
+    cm = CheckpointManager(str(tmp_path), every=1)
+    p = cm.save(3, m, version=3, cfg={}, force=True)
+    assert p is not None
+    cm2 = CheckpointManager(str(tmp_path))          # 目录构造
+    ck = cm2.load(p)                                 # 文件路径 load
+    assert ck["step"] == 3
