@@ -115,7 +115,7 @@ def test_bad_model_kind_rejected(tmp_path):
 
 
 def test_deployment_keys_seeped_at_load():
-    """顶层部署键应在 load_config 就注入 stage1/stage2（不再靠 pipeline 下渗）。"""
+    """顶层部署键应在 load_config 就按消费端分流注入 stage1/stage2（不再靠 pipeline 下渗）。"""
     cfg = load_config(overrides=[
         "dtype=bf16", "cache_mode=topk", "top_k_teacher=64",
         "top_k_student=64", "ref_topk=64", "offload_to_cpu=true"])
@@ -123,8 +123,11 @@ def test_deployment_keys_seeped_at_load():
     assert cfg["stage1"]["top_k_teacher"] == 64
     assert cfg["stage2"]["dtype"] == "bf16"
     assert cfg["stage2"]["top_k_student"] == 64
-    assert cfg["stage2"]["ref_topk"] == 64
     assert cfg["stage2"]["offload_to_cpu"] is True
+    # ref_topk 保持纯顶层（pipeline 读顶层），不下渗到任何 stage
+    assert cfg["ref_topk"] == 64
+    assert "ref_topk" not in cfg["stage1"]
+    assert "ref_topk" not in cfg["stage2"]
 
 
 def test_snapshot_config_is_effective(tmp_path):
@@ -133,6 +136,24 @@ def test_snapshot_config_is_effective(tmp_path):
     cfg = load_config(overrides=["cache_mode=topk", "top_k_teacher=64"])
     paths = RunManager(cfg, run_dir=str(tmp_path / "r")).create()
     import yaml as _yaml
-    snap = _yaml.safe_load(open(paths["config"], encoding="utf-8"))
+    with open(paths["config"], encoding="utf-8") as f:
+        snap = _yaml.safe_load(f)
     assert snap["stage1"]["cache_mode"] == "topk"
     assert snap["stage1"]["top_k_teacher"] == 64
+
+
+def test_stage2_ref_topk_not_seeped():
+    """ref_topk 是顶层键，不注入 stage2（stage2 不接受该键，extra=forbid）。"""
+    cfg = load_config(overrides=["ref_topk=128"])
+    assert cfg["ref_topk"] == 128
+    with pytest.raises(ValidationError):
+        load_config(overrides=["stage2.ref_topk=128"])
+
+
+def test_stage_subkey_priority_kept():
+    """stage 显式子键优先于顶层下渗。"""
+    cfg = load_config(overrides=["cache_mode=topk", "stage1.cache_mode=dense"])
+    assert cfg["stage1"]["cache_mode"] == "dense"
+    assert cfg["cache_mode"] == "topk"
+    # stage2 无 cache_mode 槽位（死槽位已清，下渗已分流到 stage1）
+    assert "cache_mode" not in cfg["stage2"]

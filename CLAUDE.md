@@ -117,9 +117,12 @@ pydantic `extra="forbid"` + `Literal` 使未知键/拼错键/非法枚举值显�
 
 **「顶层部署键被 stage 子字典静默忽略」是本项目踩过的 P0 bug 类型。**
 `CLOUD_CONFIG` 风格把 `dtype` / `cache_mode` / `top_k_teacher` / `top_k_student` /
-`ref_topk` / `offload_to_cpu` 放在顶层；`FullStackOPDv2.run()` 里有显式的**下渗逻辑**
-把它们注入 `stage1` / `stage2`（stage 子键优先）。新增顶层部署键时**必须同步加到下渗列表**，
-否则该开关会被静默忽略、退回默认路径。
+`offload_to_cpu` 放在顶层；`load_config()`（config.py 的 `_seep_deployment_keys`）在
+pydantic 校验前把顶层部署键**按消费端分流**下渗到 `stage1` / `stage2`（stage 子键优先）：
+stage1 ← {cache_mode, top_k_teacher}，stage2 ← {dtype, top_k_student, offload_to_cpu}。
+`ref_topk` 保持**纯顶层**（pipeline 读 `self.cfg.get("ref_topk")`），不下渗。
+新增顶层部署键时**必须同步**：在 `_STAGE1_SEEP_KEYS` / `_STAGE2_SEEP_KEYS` 分流表加键 +
+在对应 stage schema 加下渗槽位，否则该开关会被静默忽略、退回默认路径。
 
 ## 曝光偏差与 L0–L3 谱
 
