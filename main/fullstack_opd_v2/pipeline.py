@@ -243,10 +243,6 @@ class FullStackOPDv2:
         - 学生 checkpoint 每 checkpoint_every 步落盘（供 AIME 蒸馏后评估）。
         """
         torch.manual_seed(self.cfg.get("run", {}).get("seed", self.cfg.get("seed", 42)))
-        vocab = self.cfg["vocab_size"]
-        d_model = self.cfg["d_model"]
-        n_layers = self.cfg["n_layers"]
-        timings: dict = {}
 
         # ---- 工程化基础设施：run 目录 + 日志 + 指标 + checkpoint ----
         rdir = run_dir or (self.cfg.get("run") or {}).get("run_dir")
@@ -262,6 +258,27 @@ class FullStackOPDv2:
         cm = CheckpointManager(paths["run_dir"],
                                every=(self.cfg.get("run") or {}).get("checkpoint_every", 10))
         logger.info(f"run 目录: {paths['run_dir']}  (config/日志/checkpoint/metrics 已就绪)")
+
+        # A7：主体抽到 _run_body()；无论成功还是异常，finally 都释放
+        # MetricsRecorder 的 CSV 与 logging 的 FileHandler（Windows 下句柄不释放
+        # 会导致临时目录无法清理）。基础设施初始化留在 try 之外——若 setup_logging
+        # 失败则无资源可释放。
+        try:
+            return self._run_body(paths, cm, mr, logger, resume=resume)
+        finally:
+            mr.close()
+            close_logging("opd")     # 释放 train.log 句柄（Windows 下临时目录清理必需）
+
+    def _run_body(self, paths, cm, mr, logger, resume=None) -> dict:
+        """Stage 0/1/2 + 统一尾部（计时落盘/末步保存），返回结果 dict。
+
+        由 run() 用 try/finally 包住调用：成功/异常路径都会执行 mr.close() 与
+        close_logging()（A7），此处不再负责资源释放。
+        """
+        vocab = self.cfg["vocab_size"]
+        d_model = self.cfg["d_model"]
+        n_layers = self.cfg["n_layers"]
+        timings: dict = {}
 
         logger.info("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
         t = time.perf_counter()
@@ -352,9 +369,7 @@ class FullStackOPDv2:
         # 末步断点无条件存（保证最终状态可被 AIME 蒸馏后评估）
         last_ck = cm.save(metrics[-1]["step"], student, metrics[-1]["version"],
                           self.cfg, force=True) if metrics else None
-        mr.close()
         logger.info(f"训练完成: {len(metrics)} 步, 总耗时 {timings['total']:.2f}s, 断点 {last_ck or '无'}")
-        close_logging("opd")     # 释放 train.log 句柄（Windows 下临时目录清理必需）
 
         return {
             "teacher_rl": teacher_rl,

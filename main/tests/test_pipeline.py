@@ -81,6 +81,19 @@ def test_run_produces_run_dir_artifacts():
         assert any(f.startswith("step_") for f in ckpts)    # final force 保存
 
 
+def test_run_releases_resources_on_exception(tmp_path, monkeypatch):
+    """run() 异常时 MetricsRecorder 与 logging FileHandler 必须释放（A7）。"""
+    import logging
+    import fullstack_opd_v2.pipeline as P
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(P, "stage0_small_rl", boom)
+    with pytest.raises(RuntimeError):
+        FullStackOPDv2(_cfg(tmp_path), device="cpu").run()
+    lg = logging.getLogger("opd")
+    assert not any(isinstance(h, logging.FileHandler) for h in lg.handlers)
+
+
 def test_distributed_branch_no_unbound_local(tmp_path, monkeypatch):
     """分布式分支不应引用未定义的 scheduler（mock launch_distributed_scheduler）。"""
     import fullstack_opd_v2.pipeline as P
