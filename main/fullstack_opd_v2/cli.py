@@ -180,18 +180,24 @@ def _cmd_eval_aime(args) -> int:
 
     if args.model:
         model_path = args.model
+        run_eval_cfg = {}
     elif args.run_dir:
         cfg_path = os.path.join(args.run_dir, "config.yaml")
         if not os.path.isfile(cfg_path):
             raise ConfigError(f"run 目录缺 config.yaml: {args.run_dir}")
         with open(cfg_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        mp = (cfg.get("eval") or {}).get("model_path")
+            try:
+                cfg = yaml.safe_load(f) or {}
+            except yaml.YAMLError as e:
+                raise ConfigError(f"run 目录 config.yaml 解析失败：{e}") from e
+        ecfg = cfg.get("eval") or {}
+        mp = ecfg.get("model_path")
         if not mp:
             raise DataError(
                 f"run 目录 {args.run_dir!r} 未配置 eval.model_path——toy run 目录无法跑真实 AIME；"
                 "请用真实模型的 run 目录（config.yaml 的 eval.model_path 指向 HF 模型路径/id）")
         model_path = mp
+        run_eval_cfg = ecfg    # R1：run 目录的 eval.max_new_tokens/n_samples/temperature 一并生效
     else:
         raise ConfigError("eval-aime 需要 --model 或 --run-dir")
 
@@ -200,8 +206,9 @@ def _cmd_eval_aime(args) -> int:
     out_dir = args.out or (os.path.join(args.run_dir, "aime") if args.run_dir else "results/aime")
     ev = AimeEvaluator(
         model_path, device=device,
-        max_new_tokens=args.max_new_tokens, n_samples=args.n_samples,
-        temperature=args.temperature)
+        max_new_tokens=args.max_new_tokens or run_eval_cfg.get("max_new_tokens", 2048),
+        n_samples=args.n_samples or run_eval_cfg.get("n_samples", 1),
+        temperature=args.temperature if args.temperature else run_eval_cfg.get("temperature", 0.0))
     print(f"[eval-aime] model={model_path}  datasets={datasets}  device={device}")
     print(f"[eval-aime] 输出目录: {out_dir}")
     for ds in datasets:

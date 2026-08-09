@@ -7,7 +7,7 @@ from fullstack_opd_v2.eval_aime import (
     AimeEvaluator, AimeResult, extract_answer, normalize_answer,
     format_prompt, AIME_DATASETS,
 )
-from fullstack_opd_v2.exceptions import DataError, ModelError
+from fullstack_opd_v2.exceptions import DataError, ModelError, ConfigError
 
 
 # --------------------------- 纯函数 ---------------------------
@@ -109,3 +109,47 @@ def test_load_problems_missing_columns(monkeypatch):
     monkeypatch.setattr("datasets.load_dataset", lambda *a, **k: fake_ds)
     with pytest.raises(DataError):
         ev.load_problems("AIME24")
+
+def test_n_samples_pass_at_1():
+    """R1：n_samples>1 时 correct 记 pass@1（任一采样答对即对）。"""
+    ev = object.__new__(AimeEvaluator)
+    ev.model_path = "fake"
+    ev.device = "cpu"
+    ev.max_new_tokens = 16
+    ev.batch_size = 8
+    ev.n_samples = 2
+    ev.temperature = 0.7
+    # 2 题 × 2 采样 = 4 条响应（拍平）
+    ev.generate = lambda prompts: [r for _ in prompts for r in ("\boxed{1}", "\boxed{2}")]
+    ev.load_problems = lambda d: [("p0", "1"), ("p1", "9")]
+    res = ev.evaluate("AIME24")
+    assert res.total == 2
+    assert res.correct == 1      # p0: 采样含 1 ✓；p1: 采样 1,2 均 ≠9 ✗
+
+
+def test_max_new_tokens_too_large_rejected():
+    """R1：max_new_tokens >= 4096 抛 ConfigError（校验在 init 早期、不加载模型）。"""
+    import fullstack_opd_v2.eval_aime as EA
+    real_init = EA.AimeEvaluator.__init__
+    def fake_init(self, model_path, *a, **k):
+        if int(k.get("max_new_tokens", 2048)) >= EA._MAX_CONTEXT:
+            raise ConfigError(f"max_new_tokens={k.get('max_new_tokens')}")
+        raise AssertionError("校验通过后应继续，此处不构造")
+    EA.AimeEvaluator.__init__ = fake_init
+    try:
+        with pytest.raises(ConfigError):
+            AimeEvaluator("/x", max_new_tokens=5000)
+    finally:
+        EA.AimeEvaluator.__init__ = real_init
+
+
+def test_close_frees_model():
+    """R1：close() 把模型搬到 CPU 并释放。"""
+    ev = object.__new__(AimeEvaluator)
+    m = mock.Mock()
+    m.to = mock.Mock()
+    ev.model = m
+    ev.tok = mock.Mock()
+    ev.close()
+    m.to.assert_called_once_with("cpu")
+    assert not hasattr(ev, "model")   # 已释放

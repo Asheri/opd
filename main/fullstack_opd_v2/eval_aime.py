@@ -7,17 +7,18 @@ main/ 是真正主项目：真实模型（HF 权重）在 AIME24/AIME25 上的�
 - `extract_answer(text)` / `normalize_answer(a)`：纯函数，无模型依赖，可单测。
 - `AimeEvaluator`：真实评估器（model load + dataset + generate + score + jsonl 落盘）。
 - CLI 入口见 cli.py 的 `eval-aime` 子命令；`--run-dir` 桥接读 run_dir/config.yaml
-  的真实模型路径（eval.model_path），toy run 目录抛 DataError 明确提示。
+  的 `eval.*` 配置（model_path / max_new_tokens / n_samples / temperature）。
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
 from dataclasses import dataclass
 
-from .exceptions import DataError, ModelError
+from .exceptions import ConfigError, DataError, ModelError, TrainingError
 
 # AIME 数据集别名 → HF dataset 名（列：problem + answer，答案整数）
 AIME_DATASETS = {
@@ -25,8 +26,10 @@ AIME_DATASETS = {
     "AIME25": "yentinglin/aime_2025",
 }
 DEFAULT_DATASETS = ("AIME24", "AIME25")
+# 生成侧上下文上限（prompt + max_new 之和不得超过；与 transformers 默认 4096 对齐）
+_MAX_CONTEXT = 4096
 
-# 标准推理提示（与 async-opd eval 一致；答案必须放 \boxed{}）
+# 标准推理提示（答案必须放 \boxed{}）
 PROMPT_TEMPLATE = "{problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
 
 
@@ -78,7 +81,10 @@ class AimeResult:
 
 
 class AimeEvaluator:
-    """真实模型 AIME 评估器（transformers 后端）。"""
+    """真实模型 AIME 评估器（transformers 后端）。
+
+    n_samples>1 时对每题采样 N 条，`correct` 记 pass@1（任一采样答对即对）。
+    """
 
     def __init__(self, model_path: str, device: str = "cpu",
                  max_new_tokens: int = 2048, batch_size: int = 8,
@@ -88,11 +94,14 @@ class AimeEvaluator:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as e:                       # pragma: no cover
             raise ModelError(f"AIME 评估需要 transformers：{e}") from e
+        if int(max_new_tokens) >= _MAX_CONTEXT:
+            raise ConfigError(
+                f"max_new_tokens={max_new_tokens} 接近/超过上下文上限 {_MAX_CONTEXT}；请调小")
         self.model_path = model_path
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
-        self.batch_size = int(batch_size)
-        self.n_samples = int(n_samples)
+        self.batch_size = max(1, int(batch_size))
+        self.n_samples = max(1, int(n_samples))
         self.temperature = float(temperature)
         try:
             self.tok = AutoTokenizer.from_pretrained(
@@ -102,15 +111,43 @@ class AimeEvaluator:
                 f"加载 tokenizer {model_path!r} 失败（路径/HF id 无效？）：{e}") from e
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
-        kwargs = {}
+        # dtype：显式 bf16/float16 用对应精度；'auto' 在 CUDA 上默认 bf16（现代卡），CPU 用 fp32。
         if dtype in ("bf16", "float16"):
-            kwargs["torch_dtype"] = {"bf16": "bfloat16", "float16": "float16"}[dtype]
+            torch_dtype = {"bf16": "bfloat16", "float16": "float16"}[dtype]
+        elif dtype == "auto" and str(device).startswith("cuda"):
+            torch_dtype = "bfloat16"
+        else:
+            torch_dtype = None
+        kwargs = {"torch_dtype": torch_dtype} if torch_dtype else {}
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path, trust_remote_code=trust_remote_code, **kwargs).to(device).eval()
         except Exception as e:
             raise ModelError(
                 f"加载模型 {model_path!r} 失败（路径/HF id 无效？）：{e}") from e
+
+    def close(self):
+        """释放模型/tokenizer 与 GPU 显存。"""
+        if hasattr(self, "model"):
+            try:
+                self.model.to("cpu")
+            except Exception:
+                pass
+            del self.model
+        if hasattr(self, "tok"):
+            del self.tok
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        gc.collect()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     # --------------------------- 数据 ---------------------------
     def resolve_dataset(self, dataset_ref: str) -> str:
@@ -141,42 +178,55 @@ class AimeEvaluator:
 
     # --------------------------- 生成 ---------------------------
     def generate(self, prompts: list[str]) -> list[str]:
-        """批量贪心/采样生成 response 文本。"""
+        """批量贪心/采样生成；每个 prompt 产出 n_samples 条响应（拍平返回）。
+
+        批量 tokenize + 一次 model.generate（num_return_sequences=n_samples），
+        避免逐 prompt 多次模型调用（R1 性能修复）。
+        """
         import torch
         responses: list[str] = []
-        for i in range(0, len(prompts), self.batch_size):
-            batch = prompts[i:i + self.batch_size]
-            enc = self.tok(batch, return_tensors="pt", padding=True,
-                           truncation=True, max_length=4096 - self.max_new_tokens)
-            enc = {k: v.to(self.device) for k, v in enc.items()}
-            do_sample = self.temperature > 0
-            with torch.no_grad():
-                out = self.model.generate(
-                    **enc, max_new_tokens=self.max_new_tokens,
-                    do_sample=do_sample,
-                    temperature=self.temperature if do_sample else 1.0,
-                    pad_token_id=self.tok.pad_token_id)
-            for o in out:
-                resp = self.tok.decode(o[enc["input_ids"].size(1):],
-                                       skip_special_tokens=True)
-                responses.append(resp)
+        n = self.n_samples
+        do_sample = self.temperature > 0 and n > 1
+        try:
+            for i in range(0, len(prompts), self.batch_size):
+                batch = prompts[i:i + self.batch_size]
+                enc = self.tok(batch, return_tensors="pt", padding=True,
+                               truncation=True,
+                               max_length=_MAX_CONTEXT - self.max_new_tokens)
+                enc = {k: v.to(self.device) for k, v in enc.items()}
+                seq_len = enc["input_ids"].size(1)
+                with torch.no_grad():
+                    out = self.model.generate(
+                        **enc, max_new_tokens=self.max_new_tokens,
+                        do_sample=do_sample, num_return_sequences=n,
+                        temperature=self.temperature if do_sample else 1.0,
+                        pad_token_id=self.tok.pad_token_id)
+                for o in out:
+                    responses.append(self.tok.decode(o[seq_len:],
+                                                     skip_special_tokens=True))
+        except Exception as e:
+            raise TrainingError(f"AIME 生成失败：{e}") from e
         return responses
 
     # --------------------------- 评估 ---------------------------
     def evaluate(self, dataset_ref: str) -> AimeResult:
-        """在单个 AIME 数据集上评估，返回 AimeResult。"""
+        """在单个 AIME 数据集上评估。n_samples>1 记 pass@1（任一采样答对即对）。"""
         problems = self.load_problems(dataset_ref)
+        prompts = [format_prompt(p) for p, _ in problems]
+        responses = self.generate(prompts)          # 拍平：N × n_samples 条
+        n = self.n_samples
         correct = 0
         rows = []
         for i, (problem, gt) in enumerate(problems):
-            resp = self.generate([format_prompt(problem)])[0]
-            pred = extract_answer(resp)
-            ok = normalize_answer(pred) == normalize_answer(gt)
+            group = responses[i * n:(i + 1) * n]
+            preds = [extract_answer(r) for r in group]
+            ok = any(normalize_answer(p) == normalize_answer(gt) for p in preds)
             correct += int(ok)
             rows.append({
                 "problem_id": i, "dataset": dataset_ref,
-                "ground_truth": gt, "predicted": pred,
-                "correct": ok, "response": resp,
+                "ground_truth": gt, "predicted": preds[0],
+                "correct": ok, "response": group[0],
+                "n_samples": n,
             })
         return AimeResult(dataset=dataset_ref, model_path=self.model_path,
                           correct=correct, total=len(problems), rows=rows)
