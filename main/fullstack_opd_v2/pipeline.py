@@ -263,6 +263,7 @@ class FullStackOPDv2:
         logger = get_logger("opd")
         mcfg = self.cfg.get("metrics", {})
         mr = MetricsRecorder(backend=mcfg.get("backend", "csv"),
+                             append=(resume is not None),   # L1：resume 续写保留历史
                              run_dir=paths["run_dir"],
                              csv_path=mcfg.get("csv_path"),
                              wandb_project=mcfg.get("wandb_project"))

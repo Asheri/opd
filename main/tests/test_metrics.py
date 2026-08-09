@@ -66,3 +66,17 @@ def test_flush_count_throttled(tmp_path):
         mr.record({"loss": i})
     mr.close()
     assert len(flushes) == 2   # 第3条1次 + close终刷1次
+
+def test_append_mode_keeps_history(tmp_path):
+    """L1：append=True 时续写 metrics.csv 保留历史（resume 场景）。"""
+    mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path))
+    mr.record({"loss": 0.1, "version": 1})
+    mr.close()
+    mr2 = MetricsRecorder(backend="csv", run_dir=str(tmp_path), append=True)
+    mr2.record({"loss": 0.2, "version": 2})
+    mr2.close()
+    lines = open(os.path.join(str(tmp_path), "metrics.csv"), encoding="utf-8").read().splitlines()
+    assert len(lines) == 3          # 表头 + 2 行（历史保留）
+    assert lines[0].startswith("loss,version")
+    assert lines[1].endswith("0.1,1")
+    assert lines[2].endswith("0.2,2")

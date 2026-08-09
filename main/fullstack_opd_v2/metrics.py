@@ -21,7 +21,7 @@ class MetricsRecorder:
 
     def __init__(self, backend: str = "csv", run_dir: str | None = None,
                  wandb_project: str | None = None, csv_path: str | None = None,
-                 flush_every: int = 10):
+                 flush_every: int = 10, append: bool = False):
         self.backend = backend
         self.csv_path = csv_path or (os.path.join(run_dir, "metrics.csv")
                                      if run_dir else None)
@@ -30,6 +30,9 @@ class MetricsRecorder:
         self._file = None
         self._writer = None
         self._wandb = None
+        # L1：append=True 时对已存在的 metrics.csv 续写（resume 同 run_dir 保留历史），
+        # 否则 "w" 截断（首跑/新 run）。
+        self.append = bool(append)
         # C2：每 N 步才 flush 一次（默认 10），close 时终刷；避免每步一次系统调用
         self._flush_every = max(1, int(flush_every))
         self._n_records = 0
@@ -52,10 +55,20 @@ class MetricsRecorder:
     # --------------------------- CSV ---------------------------
     def _open_csv(self):
         os.makedirs(os.path.dirname(self.csv_path) or ".", exist_ok=True)
-        self._file = open(self.csv_path, "w", newline="", encoding="utf-8")
+        exists = (os.path.isfile(self.csv_path)
+                  and os.path.getsize(self.csv_path) > 0)
+        mode = "a" if (self.append and exists) else "w"
+        self._file = open(self.csv_path, mode, newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._file, fieldnames=[])
-        self._header_written = False
-        self._fields = []
+        if self.append and exists:
+            # 续写：读旧表头作为已有字段，不重复写表头（resume 保留历史）
+            with open(self.csv_path, encoding="utf-8") as _f:
+                self._fields = next(csv.reader(_f), [])
+            self._writer.fieldnames = self._fields   # DictWriter 立即对齐旧列
+            self._header_written = True
+        else:
+            self._header_written = False
+            self._fields = []
 
     def _ensure_fields(self, m: dict) -> bool:
         """把 m 中出现的新字段并入 _fields 与表头。
@@ -67,6 +80,13 @@ class MetricsRecorder:
         """
         new = [k for k in m if k not in self._fields]
         if not new:
+            return False
+        # L1：append（resume 续写）模式下不整表重写（_rewrite_csv 会截断旧历史行）——
+        # 新字段跳过 CSV 列（DictWriter 只写 fieldnames 列，多余键静默丢弃），仅警告。
+        # 正常 resume 同流水线 schema 一致，此分支不应触发。
+        if self.append and self._header_written:
+            warnings.warn(
+                f"append 模式出现新字段 {new}：跳过 CSV 列（resume 同流水线 schema 应一致）")
             return False
         self._fields.extend(new)
         if self._writer is None:
