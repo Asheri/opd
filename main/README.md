@@ -134,7 +134,7 @@ staleness age               5            5    （异步语义保持一致）
 ```
 
 ```bash
-python run_fullstack_v2.py   # 跑 v2
+python run_fullstack_v2.py train   # 跑 v2
 python benchmark.py          # v1 vs v2 对比
 ```
 
@@ -143,14 +143,14 @@ python benchmark.py          # v1 vs v2 对比
 **安装为包**（去掉 `sys.path` hack，可任意目录导入/运行）：
 ```bash
 pip install -e .                 # 见 pyproject.toml（deps: torch / pydantic / pyyaml）
-python -m fullstack_opd_v2       # 模块入口
-fullstack-opd-v2                 # console script
+python -m fullstack_opd_v2 train # 模块入口（子命令见 §7）
+fullstack-opd-v2 train           # console script
 ```
 
 **YAML 配置真加载 + schema 校验**（`fullstack_opd_v2/config.py`，pydantic `extra=forbid` 拒绝未知/拼错键）：
 ```bash
-python -m fullstack_opd_v2 --config configs/fullstack_opd.yaml
-python -m fullstack_opd_v2 --set stage2.n_steps=50 --set stage1.warmup_source=mix --set stage1.warmup_M=4
+python -m fullstack_opd_v2 train --config configs/fullstack_opd.yaml
+python -m fullstack_opd_v2 train --set stage2.n_steps=50 --set stage1.warmup_source=mix --set stage1.warmup_M=4
 ```
 任何未知键 / 非法枚举值（如 `dtype: fp16`）都会显式报错，不再静默忽略。
 

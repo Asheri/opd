@@ -90,3 +90,10 @@ def test_cli_cache_end_to_end(tmp_path, capsys):
     out = str(tmp_path / "cache.pt")
     assert main(["cache", "--config", str(cfg), "--out", out, "--device", "cpu"]) == 0
     assert os.path.isfile(out)
+
+
+def test_no_args_requires_subcommand(capsys):
+    # 无参调用：add_subparsers(required=True) 由 argparse 直接 SystemExit(2)
+    with pytest.raises(SystemExit) as e:
+        main([])
+    assert e.value.code == 2

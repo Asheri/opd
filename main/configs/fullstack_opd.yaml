@@ -1,5 +1,5 @@
 # 全栈 OPD 叠加 demo（v2）配置 —— 本文件现在会被代码真正加载（见 fullstack_opd_v2/config.py）。
-# 运行：python run_fullstack_v2.py --config configs/fullstack_opd.yaml
+# 运行：python run_fullstack_v2.py train --config configs/fullstack_opd.yaml
 # 结构对齐 DEFAULT_CONFIG_V2；未写的键自动用内置默认补全。
 # 任何未知/拼错的键都会被 pydantic schema 拒绝（不再静默忽略）。
 

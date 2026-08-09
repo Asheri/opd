@@ -37,15 +37,15 @@ python -m pytest tests/ -q
 python -m pytest tests/test_losses.py -q                      # 单文件
 python -m pytest tests/test_scheduler.py::test_ages_bounded -q # 单测试
 
-# 运行 v2（推荐入口，三者等价）
-python -m fullstack_opd_v2
-fullstack-opd-v2
-python run_fullstack_v2.py
+# 运行 v2（推荐入口，三者等价；子命令 train 见 cli.py）
+python -m fullstack_opd_v2 train
+fullstack-opd-v2 train
+python run_fullstack_v2.py train
 
 # YAML 配置 + 点分 CLI 覆盖
-python -m fullstack_opd_v2 --config configs/fullstack_opd.yaml
-python -m fullstack_opd_v2 --set stage2.n_steps=50 --set stage1.warmup_source=mix --set stage1.warmup_M=4
-python -m fullstack_opd_v2 --device cpu
+python -m fullstack_opd_v2 train --config configs/fullstack_opd.yaml
+python -m fullstack_opd_v2 train --set stage2.n_steps=50 --set stage1.warmup_source=mix --set stage1.warmup_M=4
+python -m fullstack_opd_v2 train --device cpu
 
 # v1 基线 / v1-vs-v2 基准
 python run_fullstack.py
