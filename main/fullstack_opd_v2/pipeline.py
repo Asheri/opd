@@ -21,7 +21,7 @@ import torch
 
 from .cache import TensorTeacherCache
 from .model import CausalToyLM, generate_batch, token_logprobs, response_dists
-from .scheduler import AsyncBatchedScheduler
+from .scheduler import AsyncBatchedScheduler, launch_distributed_scheduler
 from .data import build_data_loader
 from .model_factory import build_model
 from .run import RunManager
@@ -314,7 +314,7 @@ class FullStackOPDv2:
             # L5/L2 GPU 部署骨架：Ray 多 worker + NCCL 权重广播（取代线程版）。
             # ⚠️ 仅云 GPU 运行；需要 torch.distributed 已建组 + ray 已装。本地 CPU demo 默认不走。
             # L3 vLLM rollout 由各 Ray worker 从 cfg 自行构建（单独进程），learner 侧不持引擎。
-            from .scheduler import launch_distributed_scheduler
+            # 分布式骨架无 per-step 钩子：metrics 直接来自 launch_distributed_scheduler。
             metrics = launch_distributed_scheduler(
                 student, cache, fat_prompts, fat_responses,
                 ref_dists, ref_ids, ref_logp, s2cfg,
@@ -338,11 +338,11 @@ class FullStackOPDv2:
                 ref_dists, ref_ids, ref_logp, s2cfg, self.device,
                 rollout_engine=rollout_engine, initial_version=initial_version)
 
-        # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
-        def _on_step(m):
-            mr.record(m)
-            cm.save(m["step"], student, m["version"], self.cfg, metrics=[])
-        metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
+            # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
+            def _on_step(m):
+                mr.record(m)
+                cm.save(m["step"], student, m["version"], self.cfg, metrics=[])
+            metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         timings["stage2_train"] = time.perf_counter() - t
         timings["total"] = sum(timings.values())
 

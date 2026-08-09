@@ -79,3 +79,17 @@ def test_run_produces_run_dir_artifacts():
         assert set(("stage0_rl", "stage1_cache", "stage2_train", "total")) <= set(timings)
         ckpts = os.listdir(os.path.join(run_dir, "checkpoints"))
         assert any(f.startswith("step_") for f in ckpts)    # final force 保存
+
+
+def test_distributed_branch_no_unbound_local(tmp_path, monkeypatch):
+    """分布式分支不应引用未定义的 scheduler（mock launch_distributed_scheduler）。"""
+    import fullstack_opd_v2.pipeline as P
+    fake = lambda *a, **k: [{"step": 0, "version": 1, "age": 0, "batch": 4,
+                             "loss": 0.1, "pg_loss": 0.1, "kl_loss": 0.0,
+                             "adv_mean": 0.0, "reward": 0.1}]
+    monkeypatch.setattr(P, "launch_distributed_scheduler", fake)
+    cfg = _cfg(tmp_path)
+    cfg["stage2"]["distributed"] = True
+    cfg["stage2"]["n_steps"] = 1
+    out = FullStackOPDv2(cfg, device="cpu").run()
+    assert len(out["metrics"]) == 1
