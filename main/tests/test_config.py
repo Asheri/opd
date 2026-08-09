@@ -178,3 +178,11 @@ def test_seed_falls_back_to_top_level():
     cfg = load_config(overrides=["seed=7"])
     assert cfg["run"]["seed"] is None
     assert cfg["seed"] == 7
+
+
+def test_checkpoint_every_zero_rejected(tmp_path):
+    """L5：checkpoint_every <= 0 抛 ConfigError（不再静默每步保存）。"""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("run:\n  checkpoint_every: 0\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(path=str(bad))

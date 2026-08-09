@@ -89,7 +89,7 @@ class RunCfg(_Strict):
     """run 目录与断点续跑配置。"""
     seed: int | None = None   # L4：None → 回退顶层 seed（避免 run.seed 默认 42 遮蔽顶层）
     run_dir: str | None = None
-    checkpoint_every: int = 10
+    checkpoint_every: int = Field(10, ge=1)   # L5：<=0 抛校验错（否则 max(1,0) 静默每步保存）
 
 
 class LoggingCfg(_Strict):
