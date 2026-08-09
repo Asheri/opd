@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import os
 import statistics
+import threading
 import warnings
 
 from .exceptions import TrainingError
@@ -28,6 +29,8 @@ class MetricsRecorder:
         self._file = None
         self._writer = None
         self._wandb = None
+        # C1：后台消费线程与主线程可能并发 record/close，统一加锁保护
+        self._lock = threading.Lock()
 
         if backend == "wandb":
             try:
@@ -62,38 +65,41 @@ class MetricsRecorder:
 
     # --------------------------- 记录 ---------------------------
     def record(self, m: dict):
-        self._rows.append(dict(m))
-        if self.backend == "csv" and self._writer is not None:
-            self._ensure_fields(m)
-            self._writer.writerow(m)
-            self._file.flush()
-        if self._wandb is not None:
-            self._wandb.log(m)
+        with self._lock:
+            self._rows.append(dict(m))
+            if self.backend == "csv" and self._writer is not None:
+                self._ensure_fields(m)
+                self._writer.writerow(m)
+                self._file.flush()
+            if self._wandb is not None:
+                self._wandb.log(m)
 
     # --------------------------- 汇总 ---------------------------
     def summary(self) -> dict:
-        s = {"n": len(self._rows)}
-        if not self._rows:
+        with self._lock:
+            s = {"n": len(self._rows)}
+            if not self._rows:
+                return s
+            keys = self._rows[0].keys()
+            for k in keys:
+                vals = [r[k] for r in self._rows
+                        if isinstance(r.get(k), (int, float)) and not isinstance(r[k], bool)]
+                if vals:
+                    s[f"{k}_mean"] = statistics.mean(vals)
+                    s[f"{k}_last"] = vals[-1]
             return s
-        keys = self._rows[0].keys()
-        for k in keys:
-            vals = [r[k] for r in self._rows
-                    if isinstance(r.get(k), (int, float)) and not isinstance(r[k], bool)]
-            if vals:
-                s[f"{k}_mean"] = statistics.mean(vals)
-                s[f"{k}_last"] = vals[-1]
-        return s
 
     def close(self):
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-        if self._wandb is not None:
-            try:
-                self._wandb.finish()
-            except Exception:
-                pass
-            self._wandb = None
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+            if self._wandb is not None:
+                try:
+                    self._wandb.finish()
+                except Exception:
+                    pass
+                self._wandb = None
 
     def __enter__(self):
         return self

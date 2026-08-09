@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
 import time
 
 import torch
@@ -363,40 +365,78 @@ class FullStackOPDv2:
         # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage2"] 天然含
         # dtype/offload_to_cpu/top_k_student；这里直接取用。
         s2cfg = dict(self.cfg["stage2"])
-        if bool(s2cfg.get("distributed", False)):
-            # L5/L2 GPU 部署骨架：Ray 多 worker + NCCL 权重广播（取代线程版）。
-            # ⚠️ 仅云 GPU 运行；需要 torch.distributed 已建组 + ray 已装。本地 CPU demo 默认不走。
-            # L3 vLLM rollout 由各 Ray worker 从 cfg 自行构建（单独进程），learner 侧不持引擎。
-            # 分布式骨架无 per-step 钩子：metrics 直接来自 launch_distributed_scheduler。
-            metrics = launch_distributed_scheduler(
-                student, cache, fat_prompts, fat_responses,
-                ref_dists, ref_ids, ref_logp, s2cfg,
-                master_addr=s2cfg.get("master_addr", "127.0.0.1"),
-                master_port=s2cfg.get("master_port", 29500),
-                n_gpus=s2cfg.get("n_gpus", 2))
-        else:
-            # L3 vLLM rollout：单进程下在此构建引擎并注入 scheduler；"toy" 则不注入。
-            rollout_engine = None
-            if s2cfg.get("rollout_engine") == "vllm":
-                from .rollout_vllm import VLLMRolloutEngine
-                rollout_engine = VLLMRolloutEngine(
-                    model=s2cfg.get("rollout_model", "Qwen/Qwen2.5-7B"),
-                    tp_size=int(s2cfg.get("rollout_tp_size", 1)),
-                    dtype=s2cfg.get("rollout_dtype", "auto"),
-                    vocab_size=vocab,
-                    full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
-                    device=self.device)
-            scheduler = AsyncBatchedScheduler(
-                student, cache, fat_prompts, fat_responses,
-                ref_dists, ref_ids, ref_logp, s2cfg, self.device,
-                rollout_engine=rollout_engine, initial_version=initial_version)
 
-            # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
-            # A3/D4：断点随附 KL 锚点 ref（闭包捕获 Stage 2 已算好的 ref_dists/ids/logp）。
-            def _on_step(m):
-                mr.record(m)
-                cm.save(m["step"], student, m["version"], self.cfg, metrics=[], ref=ref)
-            metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
+        # ---- C1：on_step checkpoint/metrics 异步落盘（不阻塞训练线程）----
+        # 训练线程只把每步结果放入有界队列；后台 daemon 消费线程串行执行
+        # mr.record + cm.save。队列满（消费落后）时 _on_step 回退同步执行，防无限堆积。
+        # 注意：cm.save 在消费线程执行时用「落盘时刻的 student 权重」——checkpoint 语义
+        # = 落盘时刻的 student 状态（断点本就节流保存，权重以落盘时刻为准），与异步自洽。
+        _on_step_q = queue.Queue(maxsize=64)
+
+        def _consumer_loop():
+            while True:
+                m = _on_step_q.get()
+                if m is None:                       # 哨兵：训练结束，停止消费
+                    break
+                try:
+                    mr.record(m)
+                    cm.save(m["step"], student, m["version"], self.cfg,
+                            metrics=[], ref=ref)
+                except Exception:
+                    logger.exception("后台 checkpoint/metrics 落盘失败，跳过该步（step=%s）",
+                                     m.get("step"))
+
+        _consumer = threading.Thread(target=_consumer_loop, daemon=True,
+                                     name="opd-onstep-consumer")
+        _consumer.start()
+
+        try:
+            if bool(s2cfg.get("distributed", False)):
+                # L5/L2 GPU 部署骨架：Ray 多 worker + NCCL 权重广播（取代线程版）。
+                # ⚠️ 仅云 GPU 运行；需要 torch.distributed 已建组 + ray 已装。本地 CPU demo 默认不走。
+                # L3 vLLM rollout 由各 Ray worker 从 cfg 自行构建（单独进程），learner 侧不持引擎。
+                # 分布式骨架无 per-step 钩子：metrics 直接来自 launch_distributed_scheduler。
+                metrics = launch_distributed_scheduler(
+                    student, cache, fat_prompts, fat_responses,
+                    ref_dists, ref_ids, ref_logp, s2cfg,
+                    master_addr=s2cfg.get("master_addr", "127.0.0.1"),
+                    master_port=s2cfg.get("master_port", 29500),
+                    n_gpus=s2cfg.get("n_gpus", 2))
+            else:
+                # L3 vLLM rollout：单进程下在此构建引擎并注入 scheduler；"toy" 则不注入。
+                rollout_engine = None
+                if s2cfg.get("rollout_engine") == "vllm":
+                    from .rollout_vllm import VLLMRolloutEngine
+                    rollout_engine = VLLMRolloutEngine(
+                        model=s2cfg.get("rollout_model", "Qwen/Qwen2.5-7B"),
+                        tp_size=int(s2cfg.get("rollout_tp_size", 1)),
+                        dtype=s2cfg.get("rollout_dtype", "auto"),
+                        vocab_size=vocab,
+                        full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
+                        device=self.device)
+                scheduler = AsyncBatchedScheduler(
+                    student, cache, fat_prompts, fat_responses,
+                    ref_dists, ref_ids, ref_logp, s2cfg, self.device,
+                    rollout_engine=rollout_engine, initial_version=initial_version)
+
+                # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
+                # A3/D4：断点随附 KL 锚点 ref（闭包捕获 Stage 2 已算好的 ref_dists/ids/logp）。
+                # C1：_on_step 只入队（不阻塞）；队列满 → 回退同步执行（消费落后兜底）。
+                def _on_step(m):
+                    try:
+                        _on_step_q.put_nowait(m)
+                    except queue.Full:
+                        mr.record(m)
+                        cm.save(m["step"], student, m["version"], self.cfg,
+                                metrics=[], ref=ref)
+                metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
+        finally:
+            # C1：drain 后台队列（成功/异常都执行），确保 metrics/checkpoint 全部落盘
+            try:
+                _on_step_q.put(None)
+            except queue.Full:      # 防御性：理论不可达（消费者在持续取）
+                pass
+            _consumer.join()
         timings["stage2_train"] = time.perf_counter() - t
         timings["total"] = sum(timings.values())
 

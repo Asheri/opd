@@ -143,6 +143,19 @@ def test_metrics_csv_path_config_used():
         assert not os.path.isfile(os.path.join(td, "r", "metrics.csv"))
 
 
+def test_async_on_step_still_records(tmp_path):
+    """on_step 异步化后 metrics 仍完整落盘（C1）。"""
+    import os, csv, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp = type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})()
+        cfg = _cfg(tmp)
+        cfg["stage2"]["n_steps"] = 6
+        cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 2}
+        FullStackOPDv2(cfg, device="cpu").run()
+        rows = list(csv.reader(open(os.path.join(td, "r", "metrics.csv"), encoding="utf-8")))
+        assert len(rows) == 6 + 1   # 表头 + 6 行（异步队列 join 后完整）
+
+
 def test_resume_restores_kl_anchor_and_continues(tmp_path):
     """A3/D4：resume 后 KL 锚点来自断点（不变式保持），版本从断点续跑。"""
     import tempfile, os
