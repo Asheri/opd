@@ -108,6 +108,13 @@ CLOUD_CONFIG = {
     "top_k_student": 256,      # 训练时 student top-K 支撑
     "ref_topk": 256,           # KL 锚点稀疏化（避免 (N,T,V) 锚点 OOM）
     "offload_to_cpu": True,    # L6：colocated 换入换出，避免 2×96GB 同卡同时驻留
+    # L3：工程化新段显式覆盖（骨架 demo 仍 toy 模型；断点/指标按云部署调优）
+    "model_kind": "toy",       # 骨架 demo：toy 内核；真实 7B 由 async-opd 承担
+    "run": {"seed": 42, "run_dir": None, "checkpoint_every": 50},
+    "logging": {"level": "INFO", "file": "train.log"},
+    "metrics": {"backend": "csv", "csv_path": None, "wandb_project": "opd"},
+    "dataset": {"type": "toy", "path": None, "prompt_key": "prompt",
+                "response_key": "response"},
         "stage1": {           # L1：云部署默认开启暖缓存（与 L0 相比仅 Stage1 多一次离线采样）
             **DEFAULT_CONFIG_V2["stage1"],
             "warmup_M": 4,
