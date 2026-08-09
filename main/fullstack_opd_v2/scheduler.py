@@ -305,7 +305,7 @@ class AsyncBatchedScheduler:
             "reward": float(reward.item()),
         }
 
-    def _train_dispatcher(self, n_steps: int):
+    def _train_dispatcher(self, n_steps: int, on_step=None):
         done = 0
         while done < n_steps:
             try:
@@ -317,11 +317,16 @@ class AsyncBatchedScheduler:
                 self._n_dropped_consume += 1   # 消费侧因过旧丢弃
                 continue
             self.metrics.append(m)
+            if on_step is not None:            # T8：每成功一步回调（checkpoint/metrics 用）
+                try:
+                    on_step(m)
+                except Exception:
+                    pass                       # 回调异常不影响训练
             done += 1
         self.stop.set()
 
     # --------------------------- 入口 ---------------------------
-    def run(self, n_steps: int):
+    def run(self, n_steps: int, on_step=None):
         self._pq: "queue.Queue" = queue.Queue(maxsize=self.cfg.get("queue_size", 8))
         self._rq: "queue.Queue" = queue.Queue(maxsize=self.cfg.get("queue_size", 8))
 
@@ -333,7 +338,7 @@ class AsyncBatchedScheduler:
         for t in threads:
             t.start()
 
-        self._train_dispatcher(n_steps)
+        self._train_dispatcher(n_steps, on_step=on_step)
 
         for t in threads:
             t.join(timeout=5)

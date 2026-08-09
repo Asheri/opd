@@ -151,3 +151,14 @@ def test_scheduler_topk_mode_runs_end_to_end():
     for m in metrics:
         for k in ("loss", "pg_loss", "kl_loss"):
             assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"
+
+
+def test_scheduler_on_step_callback_invoked_per_step():
+    """T8：run(n_steps, on_step=cb) 每成功一步调一次 cb，次数 === n_steps。"""
+    student, cache, prompts, responses, ref_dists = _setup(seed=7)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, _cfg(n_steps=5), "cpu")
+    calls = []
+    sched.run(5, on_step=lambda m: calls.append(m["step"]))
+    assert len(calls) == 5
+    assert calls == [0, 1, 2, 3, 4]
