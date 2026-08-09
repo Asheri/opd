@@ -35,6 +35,14 @@ def test_toy_deterministic_same_stream():
     assert torch.equal(a[0], b[0])   # 同 seed 同流 → 数据一致
 
 
+def test_toy_dataloader_caches_load():
+    """C4：第二次 load 返回同一对象（缓存）。"""
+    dl = ToyDataLoader(_cfg(), "cpu")
+    a = dl.load(); b = dl.load()
+    assert a[0] is b[0]      # 同一张量对象
+    assert a[1] is b[1]
+
+
 def test_build_loader_dispatches():
     assert isinstance(build_data_loader(_cfg(), "cpu"), ToyDataLoader)
     assert isinstance(build_data_loader(_cfg(dataset={"type": "jsonl", "path": "x.jsonl"}), "cpu"),

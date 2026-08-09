@@ -38,8 +38,11 @@ class ToyDataLoader(DataLoader):
         self.prompt_len = cfg["prompt_len"]
         self.resp_len = cfg["resp_len"]
         self.device = device
+        self._cache = None   # C4：首次 load 后缓存，避免重复 randint 重建
 
     def load(self):
+        if self._cache is not None:
+            return self._cache
         rng = torch.Generator().manual_seed(0)
         prompts = torch.randint(0, self.vocab,
                                 (self.n_prompts, self.prompt_len), generator=rng)
@@ -48,8 +51,9 @@ class ToyDataLoader(DataLoader):
         lut = torch.full((self.vocab,), -0.2, dtype=torch.float32)
         lut[0::2] = 1.0
         lut = lut.to(self.device)
-        return (prompts.to(self.device), responses.to(self.device),
-                lambda r: lut[r])
+        self._cache = (prompts.to(self.device), responses.to(self.device),
+                       lambda r: lut[r])
+        return self._cache
 
 
 class JsonLinesDataLoader(DataLoader):
