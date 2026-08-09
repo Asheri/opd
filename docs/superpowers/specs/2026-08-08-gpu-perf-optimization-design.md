@@ -97,15 +97,22 @@ bf16 下 `exp(18) = 6.55e7` 安全。此单项即根治 NaN（实测场景 3 确
 
 **可选纵深防御**：`pg_loss` 新增 `log_ratio_max: float | None = None` 参数。
 默认 `None` → 逐位走原路径（**默认行为与今日完全一致**）；
-显式传 `80.0` → 对 log-ratio 施加 `clamp(max=80)`。
+显式传值 → 对 `s_old < -log_ratio_max` 的位置做**失配屏蔽**（该处贡献强制为 0）。
+调度器接线 `LOG_RATIO_MAX = 20.0`。
 
-`clamp` 上界 80 的依据：`exp(80) ≈ 5.5e34`，fp32/bf16 均不溢出；
-而真实 π_cur/π_old 比值远低于此（staleness 仅数个版本，PPO clip 又把有效 ratio 压在 `1±ε`）。
+> ⚠️ **二次审查修正（M1）**：初版设计把 `log_ratio_max` 语义定为「clamp 防溢出」，但实测表明
+> 那**不能**恢复「π_old=0 处贡献为 0」——支撑失配处 `ratio=exp(s_cur−s_old)` 放大到天文数字、
+> 与 `p_old=exp(-30)` 抵消后残留**符号相关伪梯度**（负 δ 有值 0.184、正 δ 为 0）。
+> 改为**失配屏蔽**：`s_old < -log_ratio_max` 处 `pointwise` 置 0，π_old≈0 处贡献精确为 0。
+> `masked_fill` 同时消除失配处的 `inf`（防 NaN）。
 
-等价性实测：
-- 正常 dense 输入下 `clamp=80` 与 `clamp=None` **逐位相等**（`torch.equal`，绝对差 0）
-- 支撑外场景下 `clamp=80` 的结果**精确等于**「仅在 π_old 支撑内求和」的数学真值
-  （`allclose atol=1e-6`）——即 clamp 恢复了「π_old=0 处贡献为 0」这一应有语义
+`LOG_RATIO_MAX=20` 的依据：正常 `s_old` 最小值 ≈ −ln V（V=128k 时约 −11.5），
+低于 −20 只可能是支撑外 log0 近似（`_LOG_ZERO=-30` 闭合），不误伤正常分布。
+
+等价性实测（M1 修复后）：
+- 正常 dense 输入下 `log_ratio_max=20` 与 `None` **逐位相等**（`torch.equal`，无误伤）
+- 支撑失配（s_old=-30, δ≠0）下负/正 δ 均**精确为 0**（`test_pg_loss_log_ratio_max_suppresses_support_mismatch`）
+- 支撑外 `-1e4` 场景仍有限（向后兼容）
 
 ### 明确不改：`ref_tail_logp = -1e2`
 
@@ -178,7 +185,7 @@ GPU 上这等于 vLLM 推理算力烧掉 3/4。本轮**只量化，不改行为*
 - `rollout_forwards` — rollout 实际前向次数
 - `dropped_at_put` / `dropped_at_consume` — 两道截断各自丢弃数
 - `waste_ratio` — `(rollout_forwards − trained) / rollout_forwards`
-- `age_histogram` — age 分布（现仅末步 age 可见）
+- `age_histogram` — `{age: 步数}` 计数（已实现，M7）
 - 各线程累计空转时间 — 定位真实瓶颈级
 
 `StalenessQueue` 增 `n_rejected` 计数。均为只增字段，不改控制流。
@@ -219,10 +226,10 @@ GPU 上这等于 vLLM 推理算力烧掉 3/4。本轮**只量化，不改行为*
 2. **一项一 commit** — 六项 = 六个 commit，各自带测试。`git revert <sha>` 可单撤任一项。
    顺序按依赖排：P0-2 先于 P0-1（P0-1 的稀疏返回喂给已加固的损失）。
 3. **运行时开关** — `pg_loss(log_ratio_max=None)` 为默认，即默认逐位等于今日行为；
-   出问题时显式传 `80.0` 开启加固，无需改代码即可二分定位。
-4. **数值等价测试** — 新增 `tests/test_perf_equivalence.py`（9 个）：
-   - `pg_loss(log_ratio_max=80)` vs `None` 在正常 dense 输入下 `torch.equal`
-   - `log_ratio_max=80` 在支撑外场景恢复「仅支撑内求和」真值
+   出问题时显式传 `LOG_RATIO_MAX=20` 开启失配屏蔽，无需改代码即可二分定位。
+4. **数值等价测试** — 新增 `tests/test_perf_equivalence.py`（10 个）：
+   - `pg_loss(log_ratio_max=20)` vs `None` 在正常 dense 输入下 `torch.equal`
+   - `log_ratio_max=20` 在支撑失配（s_old=-30, δ≠0）下负/正 δ 均精确=0（M1）
    - `p_old` 传入版 vs 内部计算版 `torch.equal`
    - `expected_reward(p_dists)` vs 内部 `dists.exp()` `torch.equal`
    - 全 1 mask 快路径 vs `mask=None` `torch.equal`（`pg_loss` + `low_var_kl` 两条）
@@ -234,7 +241,7 @@ GPU 上这等于 vLLM 推理算力烧掉 3/4。本轮**只量化，不改行为*
 ## 9. 验收标准
 
 **正确性（硬门槛）**：
-- 现有 42 个测试全绿（现状 52 个，净 +10 全为追加，无一改动断言）
+- 现有 42 个测试全绿（现状 56 个，净 +14 全为追加，无一改动断言）
 - **不得放宽或改写任何现有断言**。允许的唯一例外是**追加**新断言：
   `test_save_load_roundtrip_topk` 需增加 sorted 字段的 roundtrip 检查（§6.1）。
   若某项优化导致现有断言失败，视为该优化不正确 —— 回退优化，而非调整断言。
@@ -257,7 +264,11 @@ GPU 上这等于 vLLM 推理算力烧掉 3/4。本轮**只量化，不改行为*
 ## 10. 已知边界
 
 - 本设计不解决 rollout 77% 浪费的**根因**（需背压或速率匹配），只使其可测。
+  二次审查（M5）补充：`waste_ratio = (rollout − trained)/rollout` 被关停尾部与滞留
+  队列扭曲，非纯陈旧丢弃率；真实陈旧丢弃率应为 `(dropped_at_consume + 入队侧拒绝)/rollout`。
 - 稀疏 top-K 不重归一化仍是有意近似（`CLAUDE.md` 既有约束），本次不触碰。
+- **M1 失配屏蔽**：`pg_loss` 的 `log_ratio_max` 现为「支撑失配屏蔽」而非 clamp（见 §5）。
+  代价：若未来引入真实 padding，`s_old` 可能含低于 −20 的合法值而被误屏蔽——需同步调整阈值。
 - **`response_dists_topk` 未接进训练循环**。稀疏 `s_old` 会让 `pg_loss` 变成
   「仅对 student top-K 支撑加权」的**有损近似**：探针实测（K=16/V=64 随机分布）
   与 dense 相对差 77%，误差正比于「支撑外 π_old 质量 × 支撑外 Δ 加权」，**无全局上界**，
