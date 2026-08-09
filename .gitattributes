@@ -1,0 +1,5 @@
+# 强制 LF 换行：.sh / .py 在 Linux 服务器（AutoDL）上直接 run，CRLF 会让 bash 报 "\r"
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
