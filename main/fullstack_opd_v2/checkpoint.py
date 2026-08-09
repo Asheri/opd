@@ -26,8 +26,14 @@ class CheckpointManager:
 
     # --------------------------- 保存 ---------------------------
     def save(self, step: int, student, version: int, cfg: dict,
-             metrics: list | None = None, force: bool = False) -> str | None:
-        """若 step 是 every 的倍数则存断点，否则跳过（节流）。force=True 无条件存。"""
+             metrics: list | None = None, force: bool = False,
+             ref: dict | None = None) -> str | None:
+        """若 step 是 every 的倍数则存断点，否则跳过（节流）。force=True 无条件存。
+
+        ref: Stage 2 的 KL 锚点打包字典 `{"ref_dists"/"ref_ids"/"ref_logp"}`（初始 student
+             在 fat D 上的分布）。随断点落盘，resume 时直接恢复，避免用已训练 student
+             重算锚点破坏「KL 锚点 = 初始 student 分布」不变式（A3/D4）。
+        """
         if step % self.every != 0 and not force:
             return None
         path = os.path.join(self.checkpoint_dir, f"step_{step}.pt")
@@ -38,6 +44,8 @@ class CheckpointManager:
             "state": {k: v.detach().cpu() for k, v in student.state_dict().items()},
             "cfg": cfg,
             "metrics": (metrics or [])[-1:],
+            "ref": {k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                    for k, v in (ref or {}).items()},
         }, tmp)
         os.replace(tmp, path)                     # 原子替换，避免半写
         return path
@@ -57,7 +65,7 @@ class CheckpointManager:
 
     # --------------------------- 加载 ---------------------------
     def load(self, ckpt_path: str) -> dict:
-        """加载断点 → {step, version, state, cfg, metrics}。"""
+        """加载断点 → {step, version, state, cfg, metrics, ref}。ref 为 KL 锚点（旧断点无）。"""
         if not os.path.isfile(ckpt_path):
             raise CheckpointError(f"断点不存在: {ckpt_path}")
         try:

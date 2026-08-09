@@ -300,9 +300,11 @@ class FullStackOPDv2:
 
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
         initial_version = 0
+        resume_ref = None
         if resume is not None:
             student.load_state_dict(resume["state"])
             initial_version = int(resume.get("version", 0))
+            resume_ref = resume.get("ref")       # A3/D4：断点内 KL 锚点（旧断点可能为 None）
             logger.info(f"resume: 已加载断点学生权重，从 version={initial_version} 续跑")
 
         logger.info("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
@@ -321,17 +323,42 @@ class FullStackOPDv2:
         # KL 正则锚点：student 初始分布（在【胖 D】上计算，与训练上下文同源）。
         #  - ref_topk>0（GPU/真实词表）→ 只存初始分布 top-K，训练时按 student 支撑取回（L4/L6 防 OOM）
         #  - 否则 dense (N,T,V)（demo 默认，小词表无压力）
-        student.eval()
+        # A3/D4：resume 时若断点带 ref 锚点则【直接恢复】（跳过重算，保持
+        # 「KL 锚点 = 初始 student 分布」不变式）。注意此时 student 已 load 断点
+        # 权重、非初始——因此旧断点（无 ref）必须新建一个初始 student 来算锚点。
         ref_dists = ref_ids = ref_logp = None
-        with torch.no_grad():
-            full = response_dists(student, fat_prompts, fat_responses)  # (N_fat,T,V)
-        ref_topk = self.cfg.get("ref_topk", 0)
-        if ref_topk and ref_topk > 0:
-            Kr = min(ref_topk, full.size(-1))
-            topk = full.topk(Kr, dim=-1)
-            ref_ids, ref_logp = topk.indices, topk.values            # (N,T,Kr)
+        resume_anchor = (resume_ref or {}).get("ref_dists")
+        if resume_anchor is None:
+            resume_anchor = (resume_ref or {}).get("ref_ids")
+        if resume_ref and resume_anchor is not None:
+            # 断点张量 load 后在 CPU；按当前 device 搬移（与 response_dists 产出同设备）
+            ref_dists = resume_ref.get("ref_dists")
+            if ref_dists is not None:
+                ref_dists = ref_dists.to(self.device)
+            ref_ids = resume_ref.get("ref_ids")
+            if ref_ids is not None:
+                ref_ids = ref_ids.to(self.device)
+            ref_logp = resume_ref.get("ref_logp")
+            if ref_logp is not None:
+                ref_logp = ref_logp.to(self.device)
+            logger.info("resume: KL 锚点直接恢复自断点 ref（跳过重算，不变式保持）")
         else:
-            ref_dists = full
+            anchor_model = student
+            if resume is not None:                 # 旧断点无 ref：重建初始 student 算锚点
+                anchor_model = build_model(self.cfg, self.device, role="student")
+                logger.info("resume: 断点无 ref 锚点，重建初始 student 重算 KL 锚点（旧断点兼容）")
+            anchor_model.eval()
+            with torch.no_grad():
+                full = response_dists(anchor_model, fat_prompts, fat_responses)  # (N_fat,T,V)
+            ref_topk = self.cfg.get("ref_topk", 0)
+            if ref_topk and ref_topk > 0:
+                Kr = min(ref_topk, full.size(-1))
+                topk = full.topk(Kr, dim=-1)
+                ref_ids, ref_logp = topk.indices, topk.values            # (N,T,Kr)
+            else:
+                ref_dists = full
+        # 打包 KL 锚点，随每个断点落盘（供 resume 恢复不变式）
+        ref = {"ref_dists": ref_dists, "ref_ids": ref_ids, "ref_logp": ref_logp}
 
         # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage2"] 天然含
         # dtype/offload_to_cpu/top_k_student；这里直接取用。
@@ -365,9 +392,10 @@ class FullStackOPDv2:
                 rollout_engine=rollout_engine, initial_version=initial_version)
 
             # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
+            # A3/D4：断点随附 KL 锚点 ref（闭包捕获 Stage 2 已算好的 ref_dists/ids/logp）。
             def _on_step(m):
                 mr.record(m)
-                cm.save(m["step"], student, m["version"], self.cfg, metrics=[])
+                cm.save(m["step"], student, m["version"], self.cfg, metrics=[], ref=ref)
             metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         timings["stage2_train"] = time.perf_counter() - t
         timings["total"] = sum(timings.values())
@@ -375,9 +403,9 @@ class FullStackOPDv2:
         # 计时落盘（时间优化指标1的证据）
         with open(os.path.join(paths["run_dir"], "timings.json"), "w", encoding="utf-8") as f:
             json.dump({k: round(v, 4) for k, v in timings.items()}, f, indent=2)
-        # 末步断点无条件存（保证最终状态可被 AIME 蒸馏后评估）
+        # 末步断点无条件存（保证最终状态可被 AIME 蒸馏后评估），随附 KL 锚点 ref
         last_ck = cm.save(metrics[-1]["step"], student, metrics[-1]["version"],
-                          self.cfg, force=True) if metrics else None
+                          self.cfg, force=True, ref=ref) if metrics else None
         logger.info(f"训练完成: {len(metrics)} 步, 总耗时 {timings['total']:.2f}s, 断点 {last_ck or '无'}")
 
         return {

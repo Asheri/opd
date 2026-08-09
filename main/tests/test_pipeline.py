@@ -141,3 +141,22 @@ def test_metrics_csv_path_config_used():
         assert os.path.isfile(os.path.join(td, "custom.csv"))
         # run 目录默认 metrics.csv 不存在
         assert not os.path.isfile(os.path.join(td, "r", "metrics.csv"))
+
+
+def test_resume_restores_kl_anchor_and_continues(tmp_path):
+    """A3/D4：resume 后 KL 锚点来自断点（不变式保持），版本从断点续跑。"""
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as td:
+        tmp = type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})()
+        cfg = _cfg(tmp)
+        cfg["stage2"]["n_steps"] = 4
+        cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 2}
+        first = FullStackOPDv2(cfg, device="cpu").run()
+        ckpt1 = first["checkpoints"]
+        # resume 续跑
+        from fullstack_opd_v2.checkpoint import CheckpointManager
+        ck = CheckpointManager(os.path.join(td, "r")).resume()
+        assert ck is not None and "ref" in ck and "ref_dists" in ck["ref"]
+        out2 = FullStackOPDv2(cfg, device="cpu").run(run_dir=os.path.join(td, "r"), resume=ck)
+        # 版本续跑：末步 version > 断点 version
+        assert out2["metrics"][-1]["version"] > ck["version"]

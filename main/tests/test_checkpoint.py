@@ -62,3 +62,13 @@ def test_manager_constructed_with_dir_but_loads_file(tmp_path):
     cm2 = CheckpointManager(".", checkpoint_dir=os.path.dirname(p))
     ck = cm2.load(p)                                 # 文件路径 load
     assert ck["step"] == 3
+
+
+def test_save_load_ref_anchors(tmp_path):
+    """A3/D4：save 带 ref（KL 锚点）随断点落盘，load 原样返回。"""
+    m = CausalToyLM(vocab=64, d_model=48, n_layers=2)
+    cm = CheckpointManager(str(tmp_path), every=1)
+    p = cm.save(3, m, version=3, cfg={},
+                ref={"ref_dists": torch.ones(2, 3, 4)}, force=True)
+    ck = cm.load(p)
+    assert torch.equal(ck["ref"]["ref_dists"], torch.ones(2, 3, 4))
