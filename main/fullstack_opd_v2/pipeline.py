@@ -262,6 +262,7 @@ class FullStackOPDv2:
         mcfg = self.cfg.get("metrics", {})
         mr = MetricsRecorder(backend=mcfg.get("backend", "csv"),
                              run_dir=paths["run_dir"],
+                             csv_path=mcfg.get("csv_path"),
                              wandb_project=mcfg.get("wandb_project"))
         cm = CheckpointManager(paths["run_dir"],
                                every=(self.cfg.get("run") or {}).get("checkpoint_every", 10))

@@ -126,3 +126,18 @@ def test_build_model_used_for_models(monkeypatch):
     assert calls
     assert "teacher" in calls
     assert "student" in calls
+
+
+def test_metrics_csv_path_config_used():
+    """metrics.csv_path 配置键生效（B5）。"""
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        cfg = _cfg(type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})())
+        cfg["metrics"] = {"backend": "csv", "csv_path": os.path.join(td, "custom.csv"),
+                          "wandb_project": None}
+        cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 5}
+        FullStackOPDv2(cfg, device="cpu").run()
+        assert os.path.isfile(os.path.join(td, "custom.csv"))
+        # run 目录默认 metrics.csv 不存在
+        assert not os.path.isfile(os.path.join(td, "r", "metrics.csv"))
