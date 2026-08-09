@@ -27,38 +27,38 @@ source "$HERE/models.env"
 MODE=${1:-all}
 DATASETS=("$AIME24" "$AIME25")
 
-# 三组组合：<config> <学生模型id> <gpus> <tp>
-COMBO_1=("$CFG/combo1_qwen3_1p7b.yaml" "$STUDENT_COMBO1" "1" "1")
-COMBO_2=("$CFG/combo2_qwen3_4b.yaml"   "$STUDENT_COMBO2" "1" "1")
-COMBO_3=("$CFG/combo3_r1_distill_7b.yaml" "$STUDENT_COMBO3" "0,1" "2")   # 7B 用 TP=2
-
 run_eval() {
-  # $1=config $2=model(teacher|student) $3=gpus $4=tp $5=outdir $6=extra...
-  local cfg="$1" model="$2" gpus="$3" tp="$4" out="$5"; shift 5
+  # $1=config $2=model(teacher|student) $3=模型路径(覆盖) $4=gpus $5=tp $6=outdir
+  local cfg="$1" model="$2" mpath="$3" gpus="$4" tp="$5" out="$6"
   mkdir -p "$out"
   echo ""
-  echo ">>> eval  model=$model  gpus=$gpus tp=$tp  out=$out"
+  echo ">>> eval  model=$model($mpath)  gpus=$gpus tp=$tp  out=$out"
   $PY -m opd.cli.eval \
     --config "$cfg" --model "$model" --gpus "$gpus" --tp "$tp" \
     --datasets "${DATASETS[@]}" \
     --eval-n-samples "$EVAL_N_SAMPLES" --eval-temperature "$EVAL_TEMP" \
     --set teacher.path="$TEACHER_PATH" \
-    --output-dir "$out" --output-name "$model.jsonl" \
-    "$@"
+    --set "model.path=$mpath" \
+    --output-dir "$out" --output-name "$model.jsonl"
 }
 
 eval_teacher() {
   # 教师基线：JustRL-1.5B，三组共享，跑一次（用 combo1 的 config；teacher.path 均=TEACHER_PATH）
-  run_eval "$CFG/combo1_qwen3_1p7b.yaml" teacher 0 1 "$RES/teacher"
+  run_eval "$CFG/combo1_qwen3_1p7b.yaml" teacher "$TEACHER_PATH" 0 1 "$RES/teacher"
 }
 
 eval_student_baseline() {
-  local combo cfg model gpus tp
-  for combo in "$COMBO_1" "$COMBO_2" "$COMBO_3"; do
-    cfg="${combo[0]}"; model="${combo[1]}"; gpus="${combo[2]}"; tp="${combo[3]}"
-    run_eval "$cfg" student "$gpus" "$tp" "$RES/student_baseline/$(basename "$cfg" .yaml)" \
-      --set model.path="$model"
-  done
+  # 三组学生：<config> <学生模型id> <gpus> <tp>（7B 用 TP=2）
+  local cfg m gpus tp
+  while read -r cfg m gpus tp; do
+    [ -z "$cfg" ] && continue
+    run_eval "$cfg" student "$m" "$gpus" "$tp" \
+      "$RES/student_baseline/$(basename "$cfg" .yaml)"
+  done <<COMBOS
+$CFG/combo1_qwen3_1p7b.yaml      $STUDENT_COMBO1 1 1
+$CFG/combo2_qwen3_4b.yaml        $STUDENT_COMBO2 1 1
+$CFG/combo3_r1_distill_7b.yaml   $STUDENT_COMBO3 0,1 2
+COMBOS
 }
 
 case "$MODE" in

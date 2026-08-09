@@ -15,10 +15,12 @@ teacher:
   vllm:
     tensor_parallel_size: 1
     n_logprobs: 1
-    max_model_len: 8192
+    max_model_len: 16384
     gpu_memory_utilization: 0.85
 
 data:
+  # train_files 必填（OPDConfig.validate 硬校验）；eval-only 用 AIME 数据集占位即可
+  train_files: hf:Maxwell-Jia/AIME_2024
   # val_files 会被 --datasets 覆盖（AIME24 + AIME25 一次跑两套）；此处给默认防漏
   val_files: hf:Maxwell-Jia/AIME_2024
   prompt_template: '{problem}
@@ -34,10 +36,14 @@ rollout:
   n_gpus: 1
   temperature: 1.0
   vllm:
-    max_model_len: 8192
+    max_model_len: 16384
     max_num_seqs: 64
     gpu_memory_utilization: 0.85
 
 eval:
   n_samples: 1                    # 1=greedy 基线；Avg@N 用 --eval-n-samples N
   temperature: 0.0
+
+# eval-only 所需的最小 trainer 段（满足 validate() 必填校验；本 harness 不训练）
+trainer:
+  n_gpus: 1

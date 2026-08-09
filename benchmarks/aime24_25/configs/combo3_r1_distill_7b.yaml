@@ -13,10 +13,11 @@ teacher:
   vllm:
     tensor_parallel_size: 1
     n_logprobs: 1
-    max_model_len: 8192
+    max_model_len: 16384
     gpu_memory_utilization: 0.85
 
 data:
+  train_files: hf:Maxwell-Jia/AIME_2024
   val_files: hf:Maxwell-Jia/AIME_2024
   prompt_template: '{problem}
 
@@ -31,10 +32,13 @@ rollout:
   n_gpus: 1
   temperature: 1.0
   vllm:
-    max_model_len: 8192
+    max_model_len: 16384
     max_num_seqs: 64
     gpu_memory_utilization: 0.85
 
 eval:
   n_samples: 1
   temperature: 0.0
+
+trainer:
+  n_gpus: 1

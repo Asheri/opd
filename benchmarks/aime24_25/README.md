@@ -20,8 +20,14 @@ conda activate <你的 opd 训练环境>   # 含 async-opd（pip install -e ./as
 vi benchmarks/aime24_25/models.env  # TEACHER_PATH=JustRL-1.5B 的 HF 模型 ID（必填）
 ```
 
-> ⚠️ **`models.env` 里的 `TEACHER_PATH` 是占位符**，我无法联网查证 JustRL-1.5B 的准确 HF ID，
-> 请改成真实 ID（如 `org/JustRL-1.5B`）。学生 Qwen 系 ID 已按标准填写。
+> ⚠️ **`models.env` 里的 `TEACHER_PATH` 是占位符**——本开发环境对外网络被墙，无法联网确认
+> JustRL-1.5B 的准确 HF ID。候选：`JustRL/JustRL-1.5B` 或 `Killer-Relay/JustRL-1.5B`。
+> 服务器上（`source /etc/network_turbo` 后）验证：
+> ```bash
+> python -c "from huggingface_hub import model_info; print(model_info('JustRL/JustRL-1.5B'))"
+> # 或打开 https://huggingface.co/models?search=JustRL
+> ```
+> 学生 Qwen 系 ID 已按标准填写。
 
 ## 跑法
 
