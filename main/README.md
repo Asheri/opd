@@ -172,3 +172,62 @@ P0 `__init__.py` 未 import；P1 PG 损失两种错误形式（等权 mean ≠ �
 π_student 加权 k3 期望；P1 StalenessQueue 队列本体闲置 → 兼任 scored 队列；
 P2 梯度裁剪 / 播种 / dropout=0 / teacher 一致性加强 / weights_only / 导入位置 / 负索引 / REINFORCE baseline。
 修复后 E[Δ_T] −0.18 → +0.72 单调上升。
+
+---
+
+## 7. 工程化改造（demo → 真正工程项目，2026-08-09）
+
+把 v2 demo 改造成工程化项目：**算法内核一行不动**，新增可复现、可续跑、可对比的运行底座。
+
+### CLI 子命令（`python -m fullstack_opd_v2`）
+
+```bash
+# train：跑全栈流水线（Stage 0/1/2），落盘 run 目录
+python -m fullstack_opd_v2 train --config configs/fullstack_opd.yaml --run-dir runs/exp1
+python -m fullstack_opd_v2 train --config configs/fullstack_opd.yaml --run-dir runs/exp1 --resume   # 断点续跑
+# cache：只建 Lightning 离线缓存（Stage 1）
+python -m fullstack_opd_v2 cache --config configs/fullstack_opd.yaml --out /shared/cache.pt
+# eval：载入 checkpoint 学生（健康信号 / AIME 蒸馏后评估的入口）
+python -m fullstack_opd_v2 eval --checkpoint runs/exp1/checkpoints/step_30.pt --config configs/fullstack_opd.yaml
+# info：打印解析后完整配置（校验 YAML/覆盖合法）
+python -m fullstack_opd_v2 info --config configs/fullstack_opd.yaml --set stage2.n_steps=50
+```
+
+### run 目录结构（每次训练的可复现单元）
+
+```
+runs/<timestamp>/
+├── config.yaml      ← 解析后配置快照（可复现）
+├── metrics.csv      ← 每步指标（loss/pg/kl/adv/reward/age/version）
+├── timings.json     ← 逐 stage 计时（衡量「异步+预加载」的时间优化）
+├── train.log        ← 结构化日志
+└── checkpoints/     ← step_<N>.pt（断点续跑 + AIME 蒸馏后评估）
+```
+
+### 新增模块
+
+| 模块 | 职责 |
+|---|---|
+| `cli.py` | 子命令 train/cache/eval/info |
+| `logging.py` | 结构化日志（控制台+文件） |
+| `data.py` | 可插拔数据接口（Toy 默认 / JsonLines 预留） |
+| `model_factory.py` | 可插拔模型工厂（toy 默认） |
+| `run.py` | run 目录管理 |
+| `checkpoint.py` | 断点保存/加载/续跑 |
+| `metrics.py` | 指标 CSV/WandB |
+| `exceptions.py` | 类型化异常层级 |
+
+### 与实验指标对齐
+
+- **训练时间（优化指标）**：`timings.json` 记录 stage0/stage1/stage2/total，跨 run 对比异步+预加载教师的时间收益。
+- **AIME 蒸馏前后（效果指标）**：checkpoint 落 `checkpoints/step_<N>.pt`，配合 `benchmarks/aime24_25/` 评估蒸馏前后得分。
+
+### 配置新增段
+
+```yaml
+model_kind: toy                 # 可插拔模型
+run: {seed: 42, run_dir: null, checkpoint_every: 10}
+logging: {level: INFO, file: train.log}
+metrics: {backend: csv, csv_path: null, wandb_project: null}
+dataset: {type: toy, path: null, prompt_key: prompt, response_key: response}
+```
