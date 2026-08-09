@@ -69,10 +69,7 @@ def _cmd_cache(args) -> int:
     cfg = _load_cfg(args.config, args.set)
     opd = FullStackOPDv2(cfg, device=device)     # 加载数据 + Stage 0 教师
     teacher_rl, teacher_ref = opd._stage0_teachers()
-    s1cfg = dict(cfg["stage1"])
-    for _k in ("cache_mode", "top_k_teacher"):
-        if _k not in s1cfg and _k in cfg:
-            s1cfg[_k] = cfg[_k]
+    s1cfg = dict(cfg["stage1"])     # 部署键下渗已在 load_config 完成（config.py 校验前）
     if args.out:
         s1cfg["cache_path"] = args.out
     cache, _, _ = stage1_build_cache(

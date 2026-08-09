@@ -112,3 +112,27 @@ def test_bad_model_kind_rejected(tmp_path):
     bad.write_text("model_kind: nope\n", encoding="utf-8")
     with pytest.raises(ValidationError):
         load_config(path=str(bad))
+
+
+def test_deployment_keys_seeped_at_load():
+    """顶层部署键应在 load_config 就注入 stage1/stage2（不再靠 pipeline 下渗）。"""
+    cfg = load_config(overrides=[
+        "dtype=bf16", "cache_mode=topk", "top_k_teacher=64",
+        "top_k_student=64", "ref_topk=64", "offload_to_cpu=true"])
+    assert cfg["stage1"]["cache_mode"] == "topk"
+    assert cfg["stage1"]["top_k_teacher"] == 64
+    assert cfg["stage2"]["dtype"] == "bf16"
+    assert cfg["stage2"]["top_k_student"] == 64
+    assert cfg["stage2"]["ref_topk"] == 64
+    assert cfg["stage2"]["offload_to_cpu"] is True
+
+
+def test_snapshot_config_is_effective(tmp_path):
+    """config.yaml 快照应等于有效运行时配置（下渗后）。"""
+    from fullstack_opd_v2.run import RunManager
+    cfg = load_config(overrides=["cache_mode=topk", "top_k_teacher=64"])
+    paths = RunManager(cfg, run_dir=str(tmp_path / "r")).create()
+    import yaml as _yaml
+    snap = _yaml.safe_load(open(paths["config"], encoding="utf-8"))
+    assert snap["stage1"]["cache_mode"] == "topk"
+    assert snap["stage1"]["top_k_teacher"] == 64

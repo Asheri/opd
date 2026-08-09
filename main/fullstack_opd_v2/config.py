@@ -7,8 +7,8 @@
 本模块把 YAML 变成**唯一真源**：
 - pydantic schema 强校验：`extra="forbid"` 拒绝任何未知/拼错的键（静默忽略→显式报错）；
   `Literal` 限制枚举取值（dtype/cache_mode/scheduling_mode/warmup_source/...）；
-- `load_config()`：YAML → 合并到内置默认 → 应用点分 CLI 覆盖 → 校验 → 返回嵌套 dict，
-  可直接传给 `FullStackOPDv2(cfg)`。
+- `load_config()`：YAML → 合并到内置默认 → 应用点分 CLI 覆盖 → 顶层部署键下渗
+  （到 stage1/stage2）→ 校验 → 返回嵌套 dict，可直接传给 `FullStackOPDv2(cfg)`。
 """
 from __future__ import annotations
 
@@ -40,6 +40,15 @@ class Stage1Cfg(_Strict):
     warmup_M: int = 0
     warmup_source: Literal["none", "student_init", "teacher_perturbed", "mix"] = "none"
     warmup_temperature: float = 1.0
+    # ---- 顶层部署键下渗槽位（A5 解法）----
+    # load_config 在下渗后才校验，这些键须在 stage schema 有合法位置，
+    # 否则 extra="forbid" 会把下渗结果当未知键拒掉（下渗后校验↔schema 冲突）。
+    dtype: Literal["fp32", "bf16", "float32", "bfloat16"] = "fp32"
+    cache_mode: Literal["dense", "topk"] = "dense"
+    top_k_teacher: int = 0
+    top_k_student: int = 0
+    ref_topk: int = 0
+    offload_to_cpu: bool = False
 
 
 class Stage2Cfg(_Strict):
@@ -64,6 +73,15 @@ class Stage2Cfg(_Strict):
     rollout_model: str = "Qwen/Qwen2.5-7B"
     rollout_dtype: Literal["auto", "bf16", "fp8"] = "auto"
     rollout_logprobs_cap: int = 4096
+    # ---- 顶层部署键下渗槽位（A5 解法）----
+    # load_config 在下渗后才校验，这些键须在 stage schema 有合法位置，
+    # 否则 extra="forbid" 会把下渗结果当未知键拒掉（下渗后校验↔schema 冲突）。
+    dtype: Literal["fp32", "bf16", "float32", "bfloat16"] = "fp32"
+    cache_mode: Literal["dense", "topk"] = "dense"
+    top_k_teacher: int = 0
+    top_k_student: int = 0
+    ref_topk: int = 0
+    offload_to_cpu: bool = False
 
 
 # --------------------------- 工程化新增段 ---------------------------
@@ -120,7 +138,30 @@ class OPDConfig(_Strict):
     dataset: DatasetCfg = Field(default_factory=DatasetCfg)
 
 
-# --------------------------- 加载 ---------------------------
+# --------------------------- 顶层部署键下渗 ---------------------------
+# 顶层部署键（CLOUD_CONFIG 风格）会在 pydantic 校验前下渗到 stage1/stage2，
+# 使校验后的 cfg 与 config.yaml 快照天然含下渗结果（A4/A5/B4）——不再由
+# pipeline/cli 在运行时各自复制一份下渗循环（否则快照≠有效配置，且 stage
+# 子 dict 在 extra="forbid" 下没有 dtype 等键的合法位置）。
+_DEPLOYMENT_KEYS = ("dtype", "cache_mode", "top_k_teacher", "top_k_student",
+                    "ref_topk", "offload_to_cpu")
+
+
+def _seep_deployment_keys(d: dict) -> dict:
+    """顶层部署键下渗到 stage1/stage2（stage 子键优先）。
+
+    在 pydantic 校验前调用，使校验后的 cfg 与 config.yaml 快照天然含下渗结果
+    （A4/A5/B4）。只补 stage 里没有的键：stage 子键显式给出的值不会被顶掉。
+    """
+    for k in _DEPLOYMENT_KEYS:
+        if k in d:
+            for stage in ("stage1", "stage2"):
+                sd = d.setdefault(stage, {})
+                if k not in sd:
+                    sd[k] = d[k]
+    return d
+
+
 def _parse_scalar(text: str) -> Any:
     """把 CLI 字符串覆盖值解析成 bool/int/float/str。"""
     low = text.strip().lower()
@@ -160,6 +201,11 @@ def load_config(path: str | None = None,
             raise ValueError(f"覆盖项需形如 key=value，收到 {item!r}")
         k, v = item.split("=", 1)
         _set_dotted(data, k.strip(), _parse_scalar(v))
+    # 顶层部署键下渗到 stage1/stage2（stage 子键优先）。须在 pydantic 校验前做：
+    # 下渗键（如 stage2.dtype）在 extra="forbid" 的 stage schema 无合法位置，
+    # 校验后补会破坏"快照=有效配置"（A4/A5/B4）。--set 点分覆盖已在 _set_dotted
+    # 应用过，下渗只补 stage 里没有的键，覆盖值不会被顶掉。
+    data = _seep_deployment_keys(data)
     cfg = OPDConfig(**data)                      # 校验（未知键/非法值在此报错）
     # 合并到内置默认（pydantic 已用默认补全所有键，model_dump 即为完整配置）
     merged = {**DEFAULT_CONFIG_V2, **cfg.model_dump()}

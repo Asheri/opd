@@ -281,12 +281,9 @@ class FullStackOPDv2:
 
         logger.info("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
         t = time.perf_counter()
-        # 部署键（cache_mode/top_k_teacher）若在顶层（CLOUD_CONFIG 风格）则下渗到 stage1，
-        # stage1 子键优先。否则顶层 CLOUD_CONFIG 的稀疏缓存开关会被静默忽略（退回 dense）。
+        # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage1"] 天然含
+        # cache_mode/top_k_teacher（顶层 CLOUD_CONFIG 风格也生效）；这里直接取用。
         s1cfg = dict(self.cfg["stage1"])
-        for _k in ("cache_mode", "top_k_teacher"):
-            if _k not in s1cfg and _k in self.cfg:
-                s1cfg[_k] = self.cfg[_k]
         # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
         cache, fat_prompts, fat_responses = stage1_build_cache(
             self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
@@ -310,13 +307,9 @@ class FullStackOPDv2:
         else:
             ref_dists = full
 
-        # 部署键（dtype/offload_to_cpu/top_k_student）若在顶层（CLOUD_CONFIG 风格）则下渗到
-        # stage2，stage2 子键优先。否则云部署的 bf16 / colocated offload / student top-K 会被
-        # 静默忽略（退回 fp32 / 无 offload / dense）。
+        # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage2"] 天然含
+        # dtype/offload_to_cpu/top_k_student；这里直接取用。
         s2cfg = dict(self.cfg["stage2"])
-        for _k in ("dtype", "offload_to_cpu", "top_k_student"):
-            if _k not in s2cfg and _k in self.cfg:
-                s2cfg[_k] = self.cfg[_k]
         if bool(s2cfg.get("distributed", False)):
             # L5/L2 GPU 部署骨架：Ray 多 worker + NCCL 权重广播（取代线程版）。
             # ⚠️ 仅云 GPU 运行；需要 torch.distributed 已建组 + ray 已装。本地 CPU demo 默认不走。
