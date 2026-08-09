@@ -59,3 +59,23 @@ def test_reward_trends_up(tmp_path):
     first = sum(r[:3]) / 3
     last = sum(r[-3:]) / 3
     assert last > first, f"E[Δ_T] 未上升: first3={first:.3f} last3={last:.3f}"
+
+
+def test_run_produces_run_dir_artifacts():
+    """T10：run() 落盘完整 run 目录（config/日志/checkpoint/metrics/计时）。"""
+    import json
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        cfg = _cfg(type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})())
+        cfg["run"] = {"run_dir": os.path.join(td, "exp"), "checkpoint_every": 2}
+        out = FullStackOPDv2(cfg, device="cpu").run()
+        run_dir = out["run_dir"]
+        assert os.path.isfile(os.path.join(run_dir, "config.yaml"))
+        assert os.path.isfile(os.path.join(run_dir, "metrics.csv"))
+        assert os.path.isfile(os.path.join(run_dir, "logs", "train.log"))
+        assert os.path.isfile(os.path.join(run_dir, "timings.json"))
+        timings = json.load(open(os.path.join(run_dir, "timings.json"), encoding="utf-8"))
+        assert set(("stage0_rl", "stage1_cache", "stage2_train", "total")) <= set(timings)
+        ckpts = os.listdir(os.path.join(run_dir, "checkpoints"))
+        assert any(f.startswith("step_") for f in ckpts)    # final force 保存

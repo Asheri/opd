@@ -50,4 +50,13 @@ def get_logger(name: str = "opd") -> logging.Logger:
     return logging.getLogger(name)
 
 
-__all__ = ["setup_logging", "get_logger"]
+def close_logging(name: str = "opd") -> None:
+    """关闭并移除该 logger 的文件 handler（Windows 下释放 train.log 句柄）。"""
+    logger = logging.getLogger(name)
+    for h in list(logger.handlers):
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            logger.removeHandler(h)
+
+
+__all__ = ["setup_logging", "get_logger", "close_logging"]

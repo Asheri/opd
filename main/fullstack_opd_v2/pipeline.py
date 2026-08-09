@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 
 import torch
@@ -20,6 +22,13 @@ import torch
 from .cache import TensorTeacherCache
 from .model import CausalToyLM, generate_batch, token_logprobs, response_dists
 from .scheduler import AsyncBatchedScheduler
+from .data import build_data_loader
+from .model_factory import build_model
+from .run import RunManager
+from .checkpoint import CheckpointManager
+from .metrics import MetricsRecorder
+from .logging import setup_logging, get_logger, close_logging
+from .exceptions import TrainingError
 
 DEFAULT_CONFIG_V2 = {
     "vocab_size": 64,
@@ -118,9 +127,12 @@ CLOUD_CONFIG = {
 
 
 # ----------------------------- Stage 0 -----------------------------
-def stage0_small_rl(prompts, reward_lookup, cfg: dict, device,
+def stage0_small_rl(prompts, reward_fn, cfg: dict, device,
                     vocab: int, d_model: int, n_layers: int):
-    """批量 REINFORCE：产生 post-RL weak teacher；pre-RL reference 为其训练前副本。"""
+    """批量 REINFORCE：产生 post-RL weak teacher；pre-RL reference 为其训练前副本。
+
+    reward_fn: `(B,T) token` -> `(B,T) 奖励` 的可调用对象（来自 DataLoader，toy 为查找表）。
+    """
     weak = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(device)
     ref = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(device)
     ref.load_state_dict(weak.state_dict())
@@ -135,7 +147,7 @@ def stage0_small_rl(prompts, reward_lookup, cfg: dict, device,
         r = generate_batch(weak, p_b, cfg.get("max_new_tokens", 8))   # (B, T)
         weak.train()
         logp = token_logprobs(weak, p_b, r)                   # (B, T) 保留梯度
-        reward = reward_lookup[r]                             # (B, T) 向量化查找
+        reward = reward_fn(r)                                 # (B, T) 奖励（可插拔）
         loss = -(logp * (reward - reward.mean())).mean()      # REINFORCE + 均值基线
         opt.zero_grad()
         loss.backward()
@@ -209,34 +221,42 @@ class FullStackOPDv2:
     def __init__(self, cfg: dict | None = None, device: str = "cpu"):
         self.cfg = {**DEFAULT_CONFIG_V2, **(cfg or {})}
         self.device = device
-        self._make_toy_data()
+        # 可插拔数据加载（data.py）：toy 默认，与旧 _make_toy_data 同源
+        self.prompts, self.responses, self.reward_fn = build_data_loader(
+            self.cfg, self.device).load()
 
-    def _make_toy_data(self):
-        vocab = self.cfg["vocab_size"]
-        # 与 v1 相同的生成顺序（randint 按行主序消耗同一流），保证数据完全一致
-        rng = torch.Generator().manual_seed(0)
-        self.prompts = torch.randint(
-            0, vocab, (self.cfg["n_prompts"], self.cfg["prompt_len"]),
-            generator=rng).to(self.device)                     # (N, P) 设备常驻
-        self.responses = torch.randint(
-            0, vocab, (self.cfg["n_prompts"], self.cfg["resp_len"]),
-            generator=rng).to(self.device)                     # (N, T) 设备常驻
-        # 奖励查找表：偶数 token = 好 action（+1），其余 -0.2
-        lut = torch.full((vocab,), -0.2, dtype=torch.float32)
-        lut[0::2] = 1.0
-        self.reward_lookup = lut.to(self.device)               # (V,)
+    def run(self, run_dir: str | None = None) -> dict:
+        """跑全栈流水线（Stage 0/1/2），落盘 run 目录（config/日志/checkpoint/metrics）。
 
-    def run(self) -> dict:
-        torch.manual_seed(self.cfg.get("seed", 42))
+        - run_dir: 显式指定则复用（如 --resume）；None 时自动时间戳。
+        - 计时落 run_dir/timings.json（衡量异步+预加载的时间优化）。
+        - 学生 checkpoint 每 checkpoint_every 步落盘（供 AIME 蒸馏后评估）。
+        """
+        torch.manual_seed(self.cfg.get("run", {}).get("seed", self.cfg.get("seed", 42)))
         vocab = self.cfg["vocab_size"]
         d_model = self.cfg["d_model"]
         n_layers = self.cfg["n_layers"]
         timings: dict = {}
 
-        print("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
+        # ---- 工程化基础设施：run 目录 + 日志 + 指标 + checkpoint ----
+        rdir = run_dir or (self.cfg.get("run") or {}).get("run_dir")
+        rm = RunManager(self.cfg, run_dir=rdir)
+        paths = rm.create()
+        lcfg = self.cfg.get("logging", {})
+        setup_logging(level=lcfg.get("level", "INFO"), log_file=paths["log_file"])
+        logger = get_logger("opd")
+        mcfg = self.cfg.get("metrics", {})
+        mr = MetricsRecorder(backend=mcfg.get("backend", "csv"),
+                             run_dir=paths["run_dir"],
+                             wandb_project=mcfg.get("wandb_project"))
+        cm = CheckpointManager(paths["run_dir"],
+                               every=(self.cfg.get("run") or {}).get("checkpoint_every", 10))
+        logger.info(f"run 目录: {paths['run_dir']}  (config/日志/checkpoint/metrics 已就绪)")
+
+        logger.info("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
         t = time.perf_counter()
         teacher_rl, teacher_ref = stage0_small_rl(
-            self.prompts, self.reward_lookup, self.cfg["stage0"],
+            self.prompts, self.reward_fn, self.cfg["stage0"],
             self.device, vocab, d_model, n_layers)
         timings["stage0_rl"] = time.perf_counter() - t
 
@@ -244,7 +264,7 @@ class FullStackOPDv2:
         # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
         student = CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers).to(self.device)
 
-        print("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
+        logger.info("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
         t = time.perf_counter()
         # 部署键（cache_mode/top_k_teacher）若在顶层（CLOUD_CONFIG 风格）则下渗到 stage1，
         # stage1 子键优先。否则顶层 CLOUD_CONFIG 的稀疏缓存开关会被静默忽略（退回 dense）。
@@ -258,7 +278,7 @@ class FullStackOPDv2:
             warmup_student=student)
         timings["stage1_cache"] = time.perf_counter() - t
 
-        print("[Stage 2] Direct-OPD 训练跑在 AsyncOPD 批量调度器上")
+        logger.info("[Stage 2] Direct-OPD 训练跑在 AsyncOPD 批量调度器上")
         t = time.perf_counter()
         # KL 正则锚点：student 初始分布（在【胖 D】上计算，与训练上下文同源）。
         #  - ref_topk>0（GPU/真实词表）→ 只存初始分布 top-K，训练时按 student 支撑取回（L4/L6 防 OOM）
@@ -309,9 +329,24 @@ class FullStackOPDv2:
                 student, cache, fat_prompts, fat_responses,
                 ref_dists, ref_ids, ref_logp, s2cfg, self.device,
                 rollout_engine=rollout_engine)
-            metrics = scheduler.run(s2cfg.get("n_steps", 30))
+
+        # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
+        def _on_step(m):
+            mr.record(m)
+            cm.save(m["step"], student, m["version"], self.cfg, metrics=[])
+        metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         timings["stage2_train"] = time.perf_counter() - t
         timings["total"] = sum(timings.values())
+
+        # 计时落盘（时间优化指标1的证据）
+        with open(os.path.join(paths["run_dir"], "timings.json"), "w", encoding="utf-8") as f:
+            json.dump({k: round(v, 4) for k, v in timings.items()}, f, indent=2)
+        # 末步断点无条件存（保证最终状态可被 AIME 蒸馏后评估）
+        last_ck = cm.save(metrics[-1]["step"], student, metrics[-1]["version"],
+                          self.cfg, force=True) if metrics else None
+        mr.close()
+        logger.info(f"训练完成: {len(metrics)} 步, 总耗时 {timings['total']:.2f}s, 断点 {last_ck or '无'}")
+        close_logging("opd")     # 释放 train.log 句柄（Windows 下临时目录清理必需）
 
         return {
             "teacher_rl": teacher_rl,
@@ -320,4 +355,7 @@ class FullStackOPDv2:
             "student": student,
             "metrics": metrics,
             "timings": timings,
+            "run_dir": paths["run_dir"],
+            "checkpoints": paths["checkpoint_dir"],
+            "metrics_csv": paths["metrics_csv"],
         }

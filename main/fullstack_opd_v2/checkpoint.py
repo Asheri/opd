@@ -26,9 +26,9 @@ class CheckpointManager:
 
     # --------------------------- 保存 ---------------------------
     def save(self, step: int, student, version: int, cfg: dict,
-             metrics: list | None = None) -> str | None:
-        """若 step 是 every 的倍数则存断点，否则跳过（节流）。"""
-        if step % self.every != 0:
+             metrics: list | None = None, force: bool = False) -> str | None:
+        """若 step 是 every 的倍数则存断点，否则跳过（节流）。force=True 无条件存。"""
+        if step % self.every != 0 and not force:
             return None
         path = os.path.join(self.checkpoint_dir, f"step_{step}.pt")
         tmp = path + ".tmp"
