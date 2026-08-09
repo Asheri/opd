@@ -105,7 +105,10 @@ def test_scheduler_summary_reports_waste():
     assert s["rollout_forwards"] >= 6
     assert 0.0 <= s["waste_ratio"] <= 1.0
     assert set(("rollout_forwards", "dropped_at_put", "dropped_at_consume",
-                "trained_steps", "waste_ratio", "rollout_idle_s", "scorer_idle_s")) <= set(s)
+                "trained_steps", "waste_ratio", "rollout_idle_s", "scorer_idle_s",
+                "age_histogram")) <= set(s)
+    assert isinstance(s["age_histogram"], dict)
+    assert sum(s["age_histogram"].values()) == 6   # 每步一个 age
 
 
 def test_scheduler_topk_mode_runs_end_to_end():

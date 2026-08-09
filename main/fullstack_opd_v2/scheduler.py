@@ -329,6 +329,8 @@ class AsyncBatchedScheduler:
             t.join(timeout=5)
         rollouts = self._n_rollout
         trained = len(self.metrics)
+        from collections import Counter
+        ages = Counter(m["age"] for m in self.metrics)
         self.summary = {
             "rollout_forwards": rollouts,
             "dropped_at_put": self.staleness_q.n_rejected,
@@ -337,6 +339,7 @@ class AsyncBatchedScheduler:
             "waste_ratio": (rollouts - trained) / max(rollouts, 1),
             "rollout_idle_s": round(self._rollout_idle, 2),
             "scorer_idle_s": round(self._scorer_idle, 2),
+            "age_histogram": dict(sorted(ages.items())),   # {age: 步数}，兑现设计 §7.1
         }
         return self.metrics
 
