@@ -1,9 +1,11 @@
 """checkpoint.py 单测：断点保存/加载/续跑。"""
 import os
 
+import pytest
 import torch
 
 from fullstack_opd_v2.checkpoint import CheckpointManager
+from fullstack_opd_v2.exceptions import CheckpointError
 from fullstack_opd_v2.model import CausalToyLM
 
 
@@ -72,3 +74,22 @@ def test_save_load_ref_anchors(tmp_path):
                 ref={"ref_dists": torch.ones(2, 3, 4)}, force=True)
     ck = cm.load(p)
     assert torch.equal(ck["ref"]["ref_dists"], torch.ones(2, 3, 4))
+
+
+def test_force_save_ignores_throttle(tmp_path):
+    """D3：force=True 时即使 step 不满足 every 节流也必须落盘。"""
+    m = CausalToyLM(vocab=64, d_model=48, n_layers=2)
+    cm = CheckpointManager(str(tmp_path), every=10)
+    p = cm.save(3, m, version=3, cfg={}, force=True)
+    assert p is not None
+
+
+def test_resume_empty_returns_none(tmp_path):
+    """D3：空 run 目录（无任何断点）resume 返回 None 而非抛错。"""
+    assert CheckpointManager(str(tmp_path), every=1).resume() is None
+
+
+def test_load_missing_raises(tmp_path):
+    """D3：加载不存在的断点文件抛 CheckpointError（精确类型可捕获）。"""
+    with pytest.raises(CheckpointError):
+        CheckpointManager(str(tmp_path)).load(str(tmp_path / "nope.pt"))

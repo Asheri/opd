@@ -50,3 +50,28 @@ def test_flush_throttled_close_flushes(tmp_path):
     mr.close()
     lines = open(os.path.join(str(tmp_path), "metrics.csv"), encoding="utf-8").read().splitlines()
     assert len(lines) == 6   # 表头 + 5 行
+
+
+def test_metrics_content_correct(tmp_path):
+    """D2：表头必须包含全部已出现字段（含后到的 age），行内容逐字段正确。"""
+    mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path))
+    mr.record({"loss": 0.1, "version": 1})
+    mr.record({"loss": 0.2, "version": 2, "age": 5})
+    mr.close()
+    lines = open(os.path.join(str(tmp_path), "metrics.csv"), encoding="utf-8").read().splitlines()
+    hdr = lines[0].split(",")
+    assert {"loss", "version", "age"} <= set(hdr)
+    row2 = dict(zip(hdr, lines[2].split(",")))
+    assert row2["loss"] == "0.2" and row2["age"] == "5"
+
+
+def test_flush_count_throttled(tmp_path):
+    """C2 spy：flush_every=3 时 5 条记录只触发 2 次 flush（第3条 + close 终刷）。"""
+    mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path), flush_every=3)
+    flushes = []
+    orig = mr._file.flush
+    mr._file.flush = lambda: (flushes.append(1), orig())[1]
+    for i in range(5):
+        mr.record({"loss": i})
+    mr.close()
+    assert len(flushes) == 2   # 第3条1次 + close终刷1次

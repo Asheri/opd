@@ -197,7 +197,7 @@ def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
         # 因此「warmup 上下文分布」与「KL 锚点分布」同源，曝光偏差缓解自洽。
         if source in ("student_init", "mix"):
             if warmup_student is None:
-                raise ValueError(
+                raise DataError(
                     "stage1 warmup_source='student_init'/'mix' 需要 warmup_student "
                     "(请在上游把初始 student 传入 stage1_build_cache)。")
             for _ in range(warmup_M):

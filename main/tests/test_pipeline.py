@@ -173,3 +173,32 @@ def test_resume_restores_kl_anchor_and_continues(tmp_path):
         out2 = FullStackOPDv2(cfg, device="cpu").run(run_dir=os.path.join(td, "r"), resume=ck)
         # 版本续跑：末步 version > 断点 version
         assert out2["metrics"][-1]["version"] > ck["version"]
+
+
+def test_backend_none_no_metrics_file():
+    """D5：metrics.backend=none 时不写任何 metrics.csv（不生成空壳文件）。"""
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp = type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})()
+        cfg = _cfg(tmp)
+        cfg["metrics"] = {"backend": "none", "csv_path": None, "wandb_project": None}
+        cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 5}
+        FullStackOPDv2(cfg, device="cpu").run()
+        assert not os.path.isfile(os.path.join(td, "r", "metrics.csv"))
+
+
+def test_resume_keeps_kl_anchor_invariant():
+    """A3 强断言：resume 续跑末步断点 ref 与原断点 ref 逐元素相等（KL 不变式锁死）。"""
+    import os, tempfile, torch
+    from fullstack_opd_v2.checkpoint import CheckpointManager
+    with tempfile.TemporaryDirectory() as td:
+        tmp = type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})()
+        cfg = _cfg(tmp)
+        cfg["stage2"]["n_steps"] = 4
+        cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 2}
+        FullStackOPDv2(cfg, device="cpu").run()
+        ck = CheckpointManager(os.path.join(td, "r")).resume()
+        assert ck is not None and "ref" in ck
+        FullStackOPDv2(cfg, device="cpu").run(run_dir=os.path.join(td, "r"), resume=ck)
+        ck2 = CheckpointManager(os.path.join(td, "r")).resume()
+        assert torch.allclose(ck2["ref"]["ref_dists"], ck["ref"]["ref_dists"])

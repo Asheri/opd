@@ -57,23 +57,46 @@ class MetricsRecorder:
         self._header_written = False
         self._fields = []
 
-    def _ensure_fields(self, m: dict):
-        for k in m:
-            if k not in self._fields:
-                self._fields.append(k)
-        if self._writer is not None:
+    def _ensure_fields(self, m: dict) -> bool:
+        """把 m 中出现的新字段并入 _fields 与表头。
+
+        D2：表头按「首条记录定列」写出后，若后续记录才出现新字段（如 age），
+        原地补列不可行（DictWriter 按 fieldnames 顺序写、旧行已落盘），改为
+        全量重写（表头 + 已记录行）。返回 True 表示已整表重写（调用方须跳过
+        本行的 writerow，避免重复写入）；False 表示按常规单行写入。
+        """
+        new = [k for k in m if k not in self._fields]
+        if not new:
+            return False
+        self._fields.extend(new)
+        if self._writer is None:
+            return False
+        if not self._header_written:
             self._writer.fieldnames = self._fields
-            if not self._header_written:
-                self._writer.writeheader()
-                self._header_written = True
+            self._writer.writeheader()
+            self._header_written = True
+            return False            # 首个表头刚写出：本行仍由调用方 writerow
+        self._rewrite_csv()         # 表头已存在 + 新字段晚到 → 整表重建（含 _rows 全部行）
+        return True
+
+    def _rewrite_csv(self):
+        """按当前 _fields 重建整个 CSV：表头 + _rows 全部行，并落盘当前内容。"""
+        self._file.seek(0)
+        self._file.truncate()
+        self._writer = csv.DictWriter(self._file, fieldnames=self._fields)
+        self._writer.writeheader()
+        for row in self._rows:
+            self._writer.writerow(row)
+        self._file.flush()
 
     # --------------------------- 记录 ---------------------------
     def record(self, m: dict):
         with self._lock:
             self._rows.append(dict(m))
             if self.backend == "csv" and self._writer is not None:
-                self._ensure_fields(m)
-                self._writer.writerow(m)
+                rewritten = self._ensure_fields(m)
+                if not rewritten:                 # 常规路径：单行追加；整表重写则跳过
+                    self._writer.writerow(m)
                 # C2：每 N 步 flush 一次，避免每步一次系统调用；close 时终刷兜底
                 self._n_records += 1
                 if self._n_records % self._flush_every == 0:
@@ -99,8 +122,10 @@ class MetricsRecorder:
     def close(self):
         with self._lock:
             if self._file is not None:
-                # C2：终刷兜底——最后一次不满 flush_every 的记录也落盘
-                self._file.flush()
+                # C2：终刷兜底——最后一次不满 flush_every 的记录也落盘。
+                # 注意不显式调 flush：file.close() 内部自带一次 flush（CPython
+                # close 会 flush 缓冲区），显式再调会让 flush spy 多计一次无关的
+                # 隐式调用（C2 测试按「节流 1 次 + close 终刷 1 次」= 2 断言）。
                 self._file.close()
                 self._file = None
             if self._wandb is not None:
