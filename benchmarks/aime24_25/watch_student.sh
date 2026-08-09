@@ -1,44 +1,44 @@
 #!/bin/bash
 # watch 蒸馏产出的学生 checkpoint 并评估 AIME24/25（学生「蒸馏后」得分）
 #
-# async-opd 蒸馏训练边训边存 checkpoint（run-dir/checkpoints/step_NNN/），本脚本
-# 用 opd.cli.eval --watch 自动发现新 checkpoint 并逐个在 AIME24/25 上评分，
-# 结果写到 results/student_post/<combo>/。
+# main/ 自包含（opd eval-aime，无 async-opd 依赖）。真实蒸馏训练产出的学生
+# checkpoint（HF 格式模型目录）用 --model 直评；run 目录桥接（config.yaml 配了
+# eval.model_path）用 --run-dir。
 #
 # 用法:
-#   bash watch_student.sh <combo:1|2|3> <蒸馏训练run-dir> [watch-timeout分钟]
-#   bash watch_student.sh 1 /root/autodl-tmp/opd-run-combo1 120
+#   bash watch_student.sh <combo:1|2|3> <checkpoint 模型路径或 run-dir>
+#   bash watch_student.sh 1 /root/autodl-tmp/outputs/combo1/step_100
+#   bash watch_student.sh 1 /root/autodl-tmp/runs/combo1      # 读 config.yaml 的 eval.model_path
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-source "$HERE/models.env"
-cd "$(dirname "$HERE")/../async-opd"          # → async-opd/（eval CLI 所在）
+RES="$HERE/results"
+MAIN="$(dirname "$HERE")/main"
+PY=${PYTHON:-python}
 
+source "$HERE/models.env"
 COMBO=${1:?需要 combo:1|2|3}
-RUNDIR=${2:?需要蒸馏训练 run-dir（含 checkpoints/step_*/）}
-TIMEOUT=${3:-120}
+TARGET=${2:?需要 checkpoint 模型路径 或 run-dir}
 
 case "$COMBO" in
-  1) CFG="$HERE/configs/combo1_qwen3_1p7b.yaml";     MODEL="$STUDENT_COMBO1"; GPUS="1";  TP="1";;
-  2) CFG="$HERE/configs/combo2_qwen3_4b.yaml";       MODEL="$STUDENT_COMBO2"; GPUS="1";  TP="1";;
-  3) CFG="$HERE/configs/combo3_r1_distill_7b.yaml";  MODEL="$STUDENT_COMBO3"; GPUS="0,1"; TP="2";;
+  1) OUT="$RES/student_post/combo1_qwen3_1p7b";;
+  2) OUT="$RES/student_post/combo2_qwen3_4b";;
+  3) OUT="$RES/student_post/combo3_r1_distill_7b";;
   *) echo "combo 需 1|2|3"; exit 1;;
 esac
 
-OUT="$HERE/results/student_post/$(basename "$CFG" .yaml)"
 mkdir -p "$OUT"
-echo "=== watch 学生蒸馏后 checkpoint（combo$COMBO · $MODEL）==="
-echo "  run-dir: $RUNDIR"
-echo "  输出  : $OUT"
-echo "  TP    : $TP  gpus=$GPUS"
+echo "=== 学生蒸馏后 AIME24/25 评估（combo$COMBO · $TARGET）==="
 
-python -m opd.cli.eval --watch \
-  --config "$CFG" --model student \
-  --gpus "$GPUS" --tp "$TP" \
-  --datasets "$AIME24" "$AIME25" \
-  --eval-n-samples "$EVAL_N_SAMPLES" --eval-temperature "$EVAL_TEMP" \
-  --set teacher.path="$TEACHER_PATH" --set model.path="$MODEL" \
-  --run-dir "$RUNDIR" --output-dir "$OUT" --watch-timeout "$TIMEOUT"
+if [[ -f "$TARGET/config.yaml" ]]; then
+  # run 目录桥接：读 config.yaml 的 eval.model_path
+  (cd "$MAIN" && $PY -m fullstack_opd_v2 eval-aime --run-dir "$TARGET" \
+    --datasets AIME24 AIME25 --out "$OUT")
+else
+  # 直接评 checkpoint 模型目录（HF 格式）
+  (cd "$MAIN" && $PY -m fullstack_opd_v2 eval-aime --model "$TARGET" \
+    --datasets AIME24 AIME25 --out "$OUT")
+fi
 
 echo ""
 echo "=== 汇总（含学生 post）==="
-python "$HERE/aggregate.py" "$HERE/results"
+$PY "$HERE/aggregate.py" "$RES"

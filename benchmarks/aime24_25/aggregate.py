@@ -15,8 +15,13 @@ import os
 import sys
 
 # 文件名 → 年份（AIME24 / AIME25）
+# 兼容两种命名：旧 benchmark（Maxwell-Jia_AIME_2024.jsonl）与 eval-aime（AIME24.jsonl / AIME25.jsonl）
 def _year(filename: str) -> str:
-    return "AIME24" if "2024" in filename else ("AIME25" if "2025" in filename else "?")
+    if "2024" in filename or "AIME24" in filename or "aime_2024" in filename:
+        return "AIME24"
+    if "2025" in filename or "AIME25" in filename or "aime_2025" in filename:
+        return "AIME25"
+    return "?"
 
 
 def _accuracy(path: str) -> float:

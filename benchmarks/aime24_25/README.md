@@ -1,75 +1,57 @@
 # AIME24/25 蒸馏效果基准（异步 + 预加载教师 + 弱到强蒸馏）
 
-验证三组「弱教师 → 强学生」蒸馏在 AIME24/AIME25 上的效果，测三个量：
-**教师自身起点**、**学生蒸馏前**、**学生蒸馏后**。
+验证三组「弱教师 → 强学生」蒸馏在 AIME24/AIME25 上的效果：**教师自身起点**、
+**学生蒸馏前**、**学生蒸馏后**。**main/ 自包含**（`opd eval-aime`），不依赖 async-opd。
 
 | 组 | 教师（弱） | 学生（强，被蒸馏） |
 |---|---|---|
-| 1 | JustRL-1.5B | Qwen3-1.7B |
-| 2 | JustRL-1.5B | Qwen3-4B |
-| 3 | JustRL-1.5B | R1-Distill-7B |
+| 1 | JustRL-1.5B（π_RL） | Qwen3-1.7B |
+| 2 | JustRL-1.5B（π_RL） | Qwen3-4B |
+| 3 | JustRL-1.5B（π_RL） | R1-Distill-7B |
 
-## 前置（一次性）
+## 评估后端
 
-在 AutoDL 服务器上：
-
-```bash
-source /etc/network_turbo          # 学术加速（HF 下载快）
-conda activate <你的 opd 训练环境>   # 含 async-opd（pip install -e ./async-opd）
-# 填一次模型 ID：
-vi benchmarks/aime24_25/models.env  # TEACHER_PATH=JustRL-1.5B 的 HF 模型 ID（必填）
-```
-
-> ⚠️ **`models.env` 里的 `TEACHER_PATH` 是占位符**——本开发环境对外网络被墙，无法联网确认
-> JustRL-1.5B 的准确 HF ID。候选：`JustRL/JustRL-1.5B` 或 `Killer-Relay/JustRL-1.5B`。
-> 服务器上（`source /etc/network_turbo` 后）验证：
-> ```bash
-> python -c "from huggingface_hub import model_info; print(model_info('JustRL/JustRL-1.5B'))"
-> # 或打开 https://huggingface.co/models?search=JustRL
-> ```
-> 学生 Qwen 系 ID 已按标准填写。
+`python -m fullstack_opd_v2 eval-aime`（`main/fullstack_opd_v2/eval_aime.py`）：
+- 模型：transformers（本地路径 / HF id）
+- 数据：`AIME24`=`Maxwell-Jia/AIME_2024`、`AIME25`=`yentinglin/aime_2025`
+- 提示：`{problem}\n...answer within \boxed{}.`；答案提取 `\boxed{}` → 整数；精确匹配
 
 ## 跑法
 
 ```bash
 cd benchmarks/aime24_25
+vi models.env                      # 填/覆写模型路径（服务器上指向 /root/autodl-tmp/models/）
 
-bash run_benchmark.sh teacher          # (1) 教师 JustRL-1.5B 的 AIME24/25 起点（跑一次）
+bash run_benchmark.sh teacher          # (1) 教师 JustRL-1.5B 的 AIME24/25 起点
 bash run_benchmark.sh student_baseline # (2) 三组学生蒸馏前 AIME24/25
 bash run_benchmark.sh all              # (1)+(2)+汇总表
 bash run_benchmark.sh aggregate        # 只汇总已有结果
 
-# 蒸馏进行中/完成后，watch 学生 checkpoint 逐个评 AIME24/25：
-bash watch_student.sh <1|2|3> <蒸馏训练run-dir> [watch-timeout分钟]
+# 蒸馏后学生（HF checkpoint 或 run 目录）：
+bash watch_student.sh <1|2|3> <checkpoint模型目录或run-dir>
 ```
 
 ## 输出
 
-- 每样本 jsonl：`results/teacher/`、`results/student_baseline/<combo>/`、`results/student_post/<combo>/`
-- 汇总表（`aggregate.py`）：
+- 每样本 jsonl：`results/teacher/`、`results/student_baseline/<combo>/`、`results/student_post/<combo>/`（`AIME24.jsonl` / `AIME25.jsonl`）
+- 汇总表（`aggregate.py`，含 Δ = 蒸馏后 − 蒸馏前）：
 
 ```
 阶段          模型             AIME24            AIME25            ΔAIME24   ΔAIME25
 教师基线      JustRL-1.5B      12.50% (3/24)     8.33% (2/24)
 学生 蒸馏前   组1 Qwen3-1.7B   20.83% (5/24)     16.67% (4/24)
-学生 蒸馏后   组1 Qwen3-1.7B@step_100  25.00% (6/24)     20.83% (5/24)   +4.17    +4.16
+学生 蒸馏后   组1 Qwen3-1.7B@step_100  25.00% (6/24)  20.83% (5/24)  +4.17    +4.16
 ```
 
-## 关键参数（`models.env`）
+## run 目录桥接
 
-| 变量 | 意义 | 默认 |
-|---|---|---|
-| `TEACHER_PATH` | 教师 HF ID（**必填**） | 占位符 |
-| `STUDENT_COMBO1/2/3` | 学生 HF ID | Qwen3-1.7B/4B/R1-Distill-7B |
-| `AIME24` / `AIME25` | 数据集 | `hf:Maxwell-Jia/AIME_2024` / `hf:yentinglin/aime_2025` |
-| `EVAL_N_SAMPLES` | 1=greedy；Avg@32 更稳但慢 | 1 |
-| `EVAL_TEMP` | 采样温度 | 0.0 |
+真实蒸馏训练产出的 run 目录若在 `config.yaml` 配了 `eval.model_path`（真实 HF 模型路径），
+`opd eval-aime --run-dir <dir>` 会读它评估——toy run 目录（main/ v2 无 model_path）会报
+`DataError` 明确提示。
 
 ## 说明
 
-- **7B 学生（组3）** 用 `--gpus 0,1 --tp 2`（2 卡），1.7B/4B 用单卡。
-- **推理模型**（R1-Distill）若需 `thinking` 标签，加 `--enable-thinking` 或改 `models.env` 外的
-  `run_benchmark.sh` 里 eval 调用。
-- **蒸馏后 checkpoint** 由 async-opd 蒸馏训练产出（`<run-dir>/checkpoints/step_NNN/`），
-  `watch_student.sh` 用 `--watch` 自动发现；`--output-dir` 指向本目录便于汇总。
-- AIME 答案提取用 eval CLI 内置的 `\boxed{}` 级联 + 数值匹配（`opd.utils.eval`），无需自写。
+- **组3 学生基座** = `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`（论文的 "R1-Distill-7B"）；
+  `models.env` 默认给的是论文参考 post 模型 `JustRL-R1-7B`，服务器上请改为基座。
+- AIME 数据走 huggingface datasets（服务器 `source /etc/network_turbo` 加速）。
+- 答案提取/评分在 `main/fullstack_opd_v2/eval_aime.py`（纯函数可单测）。
