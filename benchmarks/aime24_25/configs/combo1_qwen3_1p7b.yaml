@@ -1,0 +1,43 @@
+# 组合 1 · 教师 JustRL-1.5B → 学生 Qwen3-1.7B · AIME24/25 评估配置
+#
+# 供 async-opd 的 opd.cli.eval 使用（--model teacher 评 teacher.path，--model student 评 model.path）。
+# ⚠️ 学生的「蒸馏后」checkpoint 由训练产出，用 --run-dir / --watch 自动发现，见 run_benchmark.sh。
+#
+# 模型路径可用 --set teacher.path=... / --set model.path=... 覆盖（run_benchmark.sh 统一注入）。
+
+model:
+  path: Qwen/Qwen3-1.7B          # ← 学生（组1）
+  trust_remote_code: false
+
+teacher:
+  path: PLAZCEHOLDER_JUSTRL_1_5B  # ← 教师 JustRL-1.5B（HF ID，见 README；三组共享）
+  gpu_ids: '0'
+  vllm:
+    tensor_parallel_size: 1
+    n_logprobs: 1
+    max_model_len: 8192
+    gpu_memory_utilization: 0.85
+
+data:
+  # val_files 会被 --datasets 覆盖（AIME24 + AIME25 一次跑两套）；此处给默认防漏
+  val_files: hf:Maxwell-Jia/AIME_2024
+  prompt_template: '{problem}
+
+    Please reason step by step, and put your final answer within \boxed{}.'
+  answer_key: answer
+  prompt_key: problem
+  enable_thinking: false          # 推理模型可 --set data.enable_thinking=true 或 --enable-thinking
+  max_prompt_length: 2048
+  max_response_length: 8192
+
+rollout:
+  n_gpus: 1
+  temperature: 1.0
+  vllm:
+    max_model_len: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+
+eval:
+  n_samples: 1                    # 1=greedy 基线；Avg@N 用 --eval-n-samples N
+  temperature: 0.0

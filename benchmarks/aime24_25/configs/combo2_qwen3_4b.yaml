@@ -1,0 +1,39 @@
+# 组合 2 · 教师 JustRL-1.5B → 学生 Qwen3-4B · AIME24/25 评估配置
+# 结构同 combo1，仅 model.path（学生）不同。教师 JustRL-1.5B 三组共享。
+# 用法见 run_benchmark.sh / README.md。
+
+model:
+  path: Qwen/Qwen3-4B            # ← 学生（组2）
+  trust_remote_code: false
+
+teacher:
+  path: PLAZCEHOLDER_JUSTRL_1_5B  # ← 教师 JustRL-1.5B（HF ID，见 README）
+  gpu_ids: '0'
+  vllm:
+    tensor_parallel_size: 1
+    n_logprobs: 1
+    max_model_len: 8192
+    gpu_memory_utilization: 0.85
+
+data:
+  val_files: hf:Maxwell-Jia/AIME_2024
+  prompt_template: '{problem}
+
+    Please reason step by step, and put your final answer within \boxed{}.'
+  answer_key: answer
+  prompt_key: problem
+  enable_thinking: false
+  max_prompt_length: 2048
+  max_response_length: 8192
+
+rollout:
+  n_gpus: 1
+  temperature: 1.0
+  vllm:
+    max_model_len: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+
+eval:
+  n_samples: 1
+  temperature: 0.0

@@ -1,0 +1,40 @@
+# 组合 3 · 教师 JustRL-1.5B → 学生 R1-Distill-7B · AIME24/25 评估配置
+# 结构同 combo1，仅 model.path（学生）不同。
+# ⚠️ 7B 学生：2 卡下建议 --tp 2（--gpus 0,1 --tp 2），否则单卡 bf16 紧。
+#    run_benchmark.sh 已按组合给好 GPU 布局。
+
+model:
+  path: Qwen/Qwen3-R1-Distill-7B  # ← 学生（组3）；确认为 Qwen3-R1-Distill-7B 或 DeepSeek-R1-Distill-Qwen-7B
+  trust_remote_code: false
+
+teacher:
+  path: PLAZCEHOLDER_JUSTRL_1_5B  # ← 教师 JustRL-1.5B（HF ID，见 README）
+  gpu_ids: '0'
+  vllm:
+    tensor_parallel_size: 1
+    n_logprobs: 1
+    max_model_len: 8192
+    gpu_memory_utilization: 0.85
+
+data:
+  val_files: hf:Maxwell-Jia/AIME_2024
+  prompt_template: '{problem}
+
+    Please reason step by step, and put your final answer within \boxed{}.'
+  answer_key: answer
+  prompt_key: problem
+  enable_thinking: false          # R1-Distill 是推理模型，可能需 --enable-thinking
+  max_prompt_length: 2048
+  max_response_length: 8192
+
+rollout:
+  n_gpus: 1
+  temperature: 1.0
+  vllm:
+    max_model_len: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+
+eval:
+  n_samples: 1
+  temperature: 0.0
