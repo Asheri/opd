@@ -50,7 +50,7 @@ DEFAULT_CONFIG_V2 = {
     "offload_to_cpu": False,  # colocated 换入换出（L6）
     "model_kind": "toy",      # 可插拔模型工厂（model_factory.py）：toy 默认
     # ---- 工程化新增段（run 目录 / 日志 / 指标 / 数据）----
-    "run": {"seed": 42, "run_dir": None, "checkpoint_every": 10},
+    "run": {"seed": None, "run_dir": None, "checkpoint_every": 10},
     "logging": {"level": "INFO", "file": "train.log"},
     "metrics": {"backend": "csv", "csv_path": None, "wandb_project": None},
     "dataset": {"type": "toy", "path": None, "prompt_key": "prompt",
@@ -110,7 +110,7 @@ CLOUD_CONFIG = {
     "offload_to_cpu": True,    # L6：colocated 换入换出，避免 2×96GB 同卡同时驻留
     # L3：工程化新段显式覆盖（骨架 demo 仍 toy 模型；断点/指标按云部署调优）
     "model_kind": "toy",       # 骨架 demo：toy 内核；真实 7B 由 async-opd 承担
-    "run": {"seed": 42, "run_dir": None, "checkpoint_every": 50},
+    "run": {"seed": None, "run_dir": None, "checkpoint_every": 50},
     "logging": {"level": "INFO", "file": "train.log"},
     "metrics": {"backend": "csv", "csv_path": None, "wandb_project": "opd"},
     "dataset": {"type": "toy", "path": None, "prompt_key": "prompt",
@@ -259,7 +259,7 @@ class FullStackOPDv2:
         - 计时落 run_dir/timings.json（衡量异步+预加载的时间优化）。
         - 学生 checkpoint 每 checkpoint_every 步落盘（供 AIME 蒸馏后评估）。
         """
-        torch.manual_seed(self.cfg.get("run", {}).get("seed", self.cfg.get("seed", 42)))
+        torch.manual_seed(self.cfg.get("run", {}).get("seed") or self.cfg.get("seed", 42))
 
         # ---- 工程化基础设施：run 目录 + 日志 + 指标 + checkpoint ----
         rdir = run_dir or (self.cfg.get("run") or {}).get("run_dir")

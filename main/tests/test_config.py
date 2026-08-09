@@ -171,3 +171,10 @@ def test_validation_error_wrapped_as_config_error(tmp_path):
     bad.write_text("stage2:\n  bogus: 1\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(path=str(bad))
+
+
+def test_seed_falls_back_to_top_level():
+    """L4：run.seed 缺省时回退顶层 seed（不再被默认 42 遮蔽）。"""
+    cfg = load_config(overrides=["seed=7"])
+    assert cfg["run"]["seed"] is None
+    assert cfg["seed"] == 7
