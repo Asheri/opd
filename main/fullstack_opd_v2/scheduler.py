@@ -22,6 +22,10 @@ from .buffer import StalenessQueue, WeightStore
 from .losses import pg_loss, low_var_kl, low_var_kl_support, expected_reward
 from .model import CausalToyLM, response_dists
 
+# pg_loss 失配屏蔽阈值（log 空间）：s_old < -20 视为支撑外 log0 近似（π_old≈0），贡献=0。
+# 正常 s_old 最小值 ≈ -ln V（V=128k 时约 -11.5），10 以内的余量不误伤；_LOG_ZERO=-30 闭合。
+LOG_RATIO_MAX = 20.0
+
 # ---- 分布式 / 高性能推理（GPU 部署骨架）：ray / megatron-core / vllm 可选 ----
 # L5 用 Ray 把 rollout 拆到多卡进程；L2 用 megatron 把 learner 切 TP=2+SP；
 # L3 用 vLLM TP=2 取代朴素前向做 rollout（response_dists 接口包一层）。
@@ -252,7 +256,8 @@ class AsyncBatchedScheduler:
                 s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
                 delta_d = self.cache.delta_for_student_topk(
                     idxs_dev, s_topk.indices)                   # (B,T,V) 支撑外=0
-                loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old)
+                loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
+                                  log_ratio_max=LOG_RATIO_MAX)
                 # 稀疏 KL 锚点
                 if self.kl_mode == "topk":
                     ref_at = self._ref_logp_at_student_topk(
@@ -263,7 +268,8 @@ class AsyncBatchedScheduler:
             else:
                 # dense 模式（demo 默认）：delta 已是完整 (B,T,V)
                 delta_d = delta
-                loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old)
+                loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
+                                  log_ratio_max=LOG_RATIO_MAX)
                 loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], None)
 
             loss = loss_pg + self.kl_coef * loss_kl

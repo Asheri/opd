@@ -71,6 +71,27 @@ def test_expected_reward_p_dists_equals_internal_exp():
     assert torch.equal(a, b)
 
 
+def test_pg_loss_log_ratio_max_suppresses_support_mismatch():
+    """失配屏蔽：s_old 是 log0 近似（-30）且 delta≠0 时，贡献必须=0（M1 伪梯度修复）。
+
+    回归：之前 clamp 语义下，负 delta 支撑失配产生符号相关伪梯度（0.184，应为 0）。
+    """
+    B, T, V = 1, 1, 64
+    s_old = torch.full((B, T, V), -30.0)          # 支撑外填充 _LOG_ZERO
+    s_old[..., :5] = _logp(B, T, 5, seed=1)
+    s_cur = torch.full((B, T, V), -30.0)
+    s_cur[..., :5] = _logp(B, T, 5, seed=0)
+    s_cur[..., 5] = -1.0                          # student 在支撑外高概率
+    for sign in (-0.5, 0.5):
+        delta = torch.zeros(B, T, V)
+        delta[..., 5] = sign
+        out = pg_loss(s_cur, s_old, delta, torch.ones(B, T), log_ratio_max=20.0)
+        assert out.item() == 0.0, f"sign={sign} 失配屏蔽应=0，实际 {out.item()}"
+    # 不屏蔽时确实有伪梯度（证明 bug 曾在）
+    no_mask = pg_loss(s_cur, s_old, delta, torch.ones(B, T))
+    assert no_mask.item() != 0.0
+
+
 def test_pg_loss_mask_ones_equals_none():
     """全 1 mask 分支必须逐位等于 mask=None 快路径（P2-2 去冗余的前提）。"""
     s_cur = _logp(3, 5, 32, seed=0)
