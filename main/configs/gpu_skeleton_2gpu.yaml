@@ -1,0 +1,66 @@
+# main/ v2 GPU 骨架 demo 配置（2×GPU · AutoDL / 任意云端）
+#
+# 基于 pipeline.CLOUD_CONFIG：真实词表 + 稀疏 topk 缓存 + bf16 + colocated offload。
+# ⚠️ 这是「骨架 demo」：模型仍是 CausalToyLM（toy），目标是验证 GPU 上的
+#    bf16 / 稀疏缓存 / 异步调度 / 分布式权重同步 路径跑通，**不是真实 7B 训练**
+#    （真实尺度走 async-opd 医疗 OPD，见 RUNBOOK_2xPRO6000.md 与 async-opd/scripts）。
+#
+# 用法：
+#   单卡：  python -m fullstack_opd_v2 --device cuda:0 --config configs/gpu_skeleton_2gpu.yaml
+#   分布式：bash scripts/04_distributed_2gpu.sh   （内部走 scripts/launch_v2_distributed.py）
+
+vocab_size: 128000        # 真实词表（Qwen/Llama 系）；dense 缓存会因 (N,T,V) 撑爆 → 必须 topk
+d_model: 48               # toy decoder；仅骨架，真实尺度由 async-opd 接管
+n_layers: 2
+prompt_len: 6
+resp_len: 8
+n_prompts: 16
+seed: 42
+batch_size: 16
+
+# ---- 部署键（顶层，FullStackOPDv2.run 会下渗到 stage1/stage2；stage 子键优先）----
+dtype: bf16               # L1：Blackwell 原生 bf16 tensor core（仅 cuda 生效）
+cache_mode: topk          # L4：稀疏缓存，避免 (N,T,V=128k) 撑爆
+top_k_teacher: 256        # 教师每位置 top-K
+top_k_student: 256        # 训练时 student top-K 支撑
+ref_topk: 256             # KL 锚点稀疏化（避免 (N,T,V) 锚点 OOM）
+offload_to_cpu: true      # L6：colocated 换入换出（单卡线程版生效；分布式走 NCCL 广播）
+
+stage0:                   # 小模型 RL → post-RL weak teacher
+  lr: 1.0e-3
+  n_rl_steps: 20
+  max_new_tokens: 8
+  batch_size: 16
+  grad_clip: 1.0
+
+stage1:                   # Lightning-OPD 离线缓存教师对 Δ_T
+  enforce_teacher_consistency: true
+  cache_path: fullstack_opd_cache_v2_gpu.pt
+  build_batch_size: 16
+  warmup_M: 2             # L1：暖缓存（缓解曝光偏差）；关闭则 0 + warmup_source: none
+  warmup_source: mix      # none | student_init | teacher_perturbed | mix
+  warmup_temperature: 1.0
+
+stage2:                   # Direct-OPD + AsyncOPD 调度器
+  scheduling_mode: fully_async
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 0.05
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 1.0e-3
+  n_steps: 30
+  batch_size: 16
+  # ---- GPU 部署骨架（L5/L2）----
+  distributed: false      # true → DistAsyncScheduler（Ray worker + NCCL 广播）；04 脚本会置 true
+  n_gpus: 2
+  prefetch: 4
+  master_addr: 127.0.0.1
+  master_port: 29500
+  tp_size: 1              # ⚠️ 必须 1：learner 若 TP=2 会与并发 rollout worker 死锁（骨架护栏）
+  sequence_parallel: true
+  rollout_engine: toy     # toy | vllm；骨架 demo 用 toy（vLLM 需真实模型，数值与 toy 缓存不对齐）
+  rollout_tp_size: 2
+  rollout_model: Qwen/Qwen2.5-7B
+  rollout_dtype: auto
+  rollout_logprobs_cap: 4096
