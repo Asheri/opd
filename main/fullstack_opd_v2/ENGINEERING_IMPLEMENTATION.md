@@ -203,7 +203,7 @@ $$
 
 **各方案需要的代码改动（已对照当前实现）：**
 
-- **L1（推荐先做）**：只动 `pipeline.py` 的 `stage1_build_cache` —— 在 `cache.build` 前，对每个 prompt 用**初始学生**或**温度扰动的教师** `generate_batch` 出 $M$ 条响应，拼成 $(N\cdot M, T)$ 的"胖 $D$"，再统一 `cache.build`。`AsyncBatchedScheduler` 完全不变，因为它只读 `cache` + `prompts/responses` 索引。KL 锚 `ref_dists` 在 Stage 2 入口对所有胖 $D$ 上下文重算一次即可（仍是一次性、离线）。
+- **L1（已实现，默认开启）**：只动 `pipeline.py` 的 `stage1_build_cache` —— 在 `cache.build` 前，对每个 prompt 用**初始学生**或**温度扰动的教师** `generate_batch` 出 $M$ 条响应，拼成 $(N\cdot M, T)$ 的"胖 $D$"，再统一 `cache.build`。`AsyncBatchedScheduler` 完全不变，因为它只读 `cache` + `prompts/responses` 索引。KL 锚 `ref_dists` 在 Stage 2 入口对所有胖 $D$ 上下文重算一次即可（仍是一次性、离线）。
   - ⚠️ 注意：L1 的胖 $D$ 用的是 **Stage 1 时的学生**（初始/随机）和教师分布，训练期学生还会继续漂；所以 L1 把曝光偏差降一个量级，但**不保证**训练全程上下文都在学生当前支撑内——仍需 L2 收尾。
 
 - **L2（真正流式适应）**：需在 `scheduler.py` 加一个**动态数据集 + 动态缓存**：
@@ -222,7 +222,8 @@ $$
   2. 拼成**胖 $D$**：`fat_prompts=(N·(1+K),P)`、`fat_responses=(N·(1+K),T)`，其中 $K=M$（student_init/teacher_perturbed）或 $K=2M$（mix）；
   3. `cache.build(fat_prompts, fat_responses, teacher_rl, teacher_ref, …)` → `self.delta=(N·(1+K),T,V)`；
   4. `stage1_build_cache` **返回 `(cache, fat_prompts, fat_responses)`**；`run()` 把 `student` **提前到 Stage 1 前创建**并传入（使 warmup 分布与 KL 锚点同源），Stage 2 入口 `ref_dists = response_dists(student, fat_prompts, fat_responses)` 与调度器均改用 `fat_*`。
-- **代码改动（已实现）**：**只动 `pipeline.py`**——`stage1_build_cache` 增加 warmup 采样循环 + `cat` 拼胖 D、返回值增为三元组；`run()` 提前创建 `student` 并传入、Stage 2 入口与调度器改用返回的 `fat_*` 张量。`AsyncBatchedScheduler` / `_train_step` / `cache.py` **内核不动**（仍只读 `cache`+索引，`n_prompts` 自动随胖 N 变大）。新增配置 `stage1.warmup_M`(默认 0=关闭)、`stage1.warmup_source∈{none, student_init, teacher_perturbed, mix}`、`stage1.warmup_temperature`。`warmup_M=0` 时完全退化为 L0（fat=原 D，行为零变化）。
+- **代码改动（已实现）**：**只动 `pipeline.py`**——`stage1_build_cache` 增加 warmup 采样循环 + `cat` 拼胖 D、返回值增为三元组；`run()` 提前创建 `student` 并传入、Stage 2 入口与调度器改用返回的 `fat_*` 张量。`AsyncBatchedScheduler` / `_train_step` / `cache.py` **内核不动**（仍只读 `cache`+索引，`n_prompts` 自动随胖 N 变大）。新增配置 `stage1.warmup_M`(**默认 4=开启，与 DEFAULT_CONFIG_V2/Stage1Cfg 一致**)、`stage1.warmup_source∈{none, student_init, teacher_perturbed, mix}`（**默认 student_init**）、`stage1.warmup_temperature`。`warmup_M=0` + `warmup_source=none` 时完全退化为 L0（fat=原 D，行为零变化）。
+  - ⚠️ **resume 与 warmup 的同源不变式（P1-4 修复）**：warmup 采样分布必须与 KL 锚点（初始 student 分布）同源。resume 会把断点权重 load 进 `student`，因此 `_run_body` 用**独立新建的 `warmup_student`**（不被 `load_state_dict` 覆盖）传给 `stage1_build_cache`——即使断点续跑，warmup 上下文仍是初始分布，与从断点恢复的 `ref` 锚点一致。
 - **代价**：教师推理开销**仍只在 Stage 1 一次**（`1+M` 倍于 L0，但离线、可批处理）；训练期零教师开销。内存：`delta`/`ref_dists` 张量 $\times(1+M)$，demo 词表 64 下可忽略，真实词表须配 topk 缓存。
 - **残余缺口**：胖 $D$ 用的是 **Stage 1 时刻**的策略（初始学生 / 扰动教师）。训练期学生还在漂，所以 L1 **不保证**训练全程上下文都在学生当前支撑内——它把曝光偏差降一个量级（从"单点固定"到"分布覆盖"），但未消除。要消除需 L2。
 
