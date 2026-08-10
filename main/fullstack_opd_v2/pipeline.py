@@ -66,8 +66,8 @@ DEFAULT_CONFIG_V2 = {
         "cache_path": "fullstack_opd_cache_v2.pt",
         "build_batch_size": 16,
         # ---- L1 离线 rollout 暖缓存（缓解曝光偏差）----
-        "warmup_M": 0,            # >0 → 每 prompt 额外采样 M 条响应拼「胖 D」(默认 0 = 关闭 = L0)
-        "warmup_source": "none",  # "none" | "student_init" | "teacher_perturbed" | "mix"
+        "warmup_M": 4,            # L1 默认：学生 ref 一次性 rollout 拼「胖 D」N×(1+M)（消曝光偏差）
+        "warmup_source": "student_init",  # none | student_init | teacher_perturbed | mix
         "warmup_temperature": 1.0,
     },
     "stage2": {              # Direct-OPD + AsyncOPD
@@ -120,7 +120,7 @@ CLOUD_CONFIG = {
         "stage1": {           # L1：云部署默认开启暖缓存（与 L0 相比仅 Stage1 多一次离线采样）
             **DEFAULT_CONFIG_V2["stage1"],
             "warmup_M": 4,
-            "warmup_source": "mix",
+            "warmup_source": "student_init",   # L1：与默认一致，学生 ref rollout
             "warmup_temperature": 1.0,
         },
         "stage2": {

@@ -38,7 +38,7 @@ stage1:                   # Lightning-OPD 离线缓存教师对 Δ_T
   cache_path: fullstack_opd_cache_v2_gpu.pt
   build_batch_size: 16
   warmup_M: 2             # L1：暖缓存（缓解曝光偏差）；关闭则 0 + warmup_source: none
-  warmup_source: mix      # none | student_init | teacher_perturbed | mix
+  warmup_source: student_init   # L1：学生 ref rollout；none | student_init | teacher_perturbed | mix
   warmup_temperature: 1.0
 
 stage2:                   # Direct-OPD + AsyncOPD 调度器

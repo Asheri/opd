@@ -131,7 +131,8 @@ stage1 ← {cache_mode, top_k_teacher}，stage2 ← {dtype, top_k_student, offlo
 - **L0** 固定 `D` 永久固定（偏差最大）
 - **L1 已实现**：Stage 1 用初始 student / 教师分布额外采样 M 条拼「胖 D」再 `cache.build`。
   由 `stage1.warmup_M` / `warmup_source`（`none` | `student_init` | `teacher_perturbed` | `mix`）
-  / `warmup_temperature` 控制，默认关闭（= L0）。调度器与缓存内核**零改动**。
+  / `warmup_temperature` 控制，**默认开启（= L1：学生 ref 一次性 rollout 拼胖 D）**，
+  关闭则 `warmup_M=0`+`warmup_source=none`。调度器与缓存内核**零改动**。
   `stage1_build_cache` 返回 `(cache, fat_prompts, fat_responses)`，Stage 2 的 KL 锚点与调度器
   都用 `fat_*`——warmup 分布与 KL 锚点必须同源（`student` 因此提前到 Stage 1 前创建）。
   计数：`student_init` M → `N×(1+M)`；`mix` M → `N×(1+2M)`。

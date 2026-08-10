@@ -25,7 +25,7 @@ def test_end_to_end_smoke(tmp_path):
     metrics = out["metrics"]
     assert len(metrics) == 10
     assert "reward" in metrics[-1]
-    assert out["cache"].delta.shape[0] == 12        # L0：fat_N == n_prompts
+    assert out["cache"].delta.shape[0] == 12 * 5    # L1 默认：n_prompts×(1+warmup_M=4)
 
 
 def test_warmup_off_backward_compatible(tmp_path):
