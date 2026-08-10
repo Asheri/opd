@@ -120,6 +120,46 @@ teacher 的 top-K `(token_id, logp)`，训练期用 `searchsorted` 二分匹配�
   保证「warmup 上下文分布 = KL 锚点分布」恒成立（详见 §3.3 与 `pipeline.py:_run_body`）。
 - 计数：默认 N=16、M=4 → `delta=(80,T,V)`（×5）；`mix` → `(144,T,V)`（×9）。
 
+#### 胖 D 的具体组成（`stage1_build_cache` 的拼接顺序，逐行对齐代码）
+
+`fat_prompts` 与 `fat_responses` 都是**块结构拼接**（`torch.cat` 沿 dim 0）：
+
+```
+fat_prompts   = cat([ prompts, prompts, …, prompts ])          # 同一份 prompts 重复 (1+K) 次
+fat_responses = cat([ responses, rp₁ … rp_M(, rt₁ … rt_M) ])   # 块 0 = 原固定 D
+```
+
+- 每个块 = 一个 `(N,T)` 响应集；**prompt 行在所有块里逐行相同**（第 i 行永远是同一个 x_i），
+  各块的差异全在响应 y 上——即「**同一 prompt x_i 的 1+M 条不同上下文 y**」。
+- `rp_m = generate_batch(warmup_student, prompts, max_new=T, temperature=warmup_temperature)`
+  ——初始 student 分布采样（`warmup_temperature=1.0` 即原分布）；
+- `rt_m = generate_batch(teacher_rl, prompts, max_new=T, temperature=…)`
+  ——**post-RL 教师** `teacher_rl` 加温度扰动采样（注意不是 `teacher_ref`）；
+- 顺序：`student_init`/`teacher_perturbed` → 只有对应一组 M 块；`mix` → **先 student×M 块、再 teacher×M 块**；
+- `generate_batch` 始终是采样（`softmax(logits/temperature)` + `multinomial`），非贪心。
+
+**示例（student_init，N=2，M=2，P=6，T=8，V=64）**：
+
+```
+原 D：    prompts=[x₁,x₂] (2,6)   responses=[y₁,y₂] (2,8)
+2 轮采样：rp₁=[y₁'₁,y₂'₁] (2,8)   rp₂=[y₁'₂,y₂'₂] (2,8)     # 每轮对全部 2 个 prompt 各采一条
+
+fat_prompts   = [x₁,x₂,  x₁,x₂,  x₁,x₂]        (6,6)
+fat_responses = [y₁,y₂,  y₁'₁,y₂'₁,  y₁'₂,y₂'₂]  (6,8)
+```
+
+| 行区间 | 块 | prompt | response | 来源 |
+|---|---|---|---|---|
+| 0–1 | 块 0 | x₁, x₂ | y₁, y₂ | 原固定 D |
+| 2–3 | 块 1 | x₁, x₂ | y₁'₁, y₂'₁ | 初始学生第 1 轮采样 |
+| 4–5 | 块 2 | x₁, x₂ | y₁'₂, y₂'₂ | 初始学生第 2 轮采样 |
+
+→ `cache.delta=(6,8,64)`：第 i 行 = 该行响应在对应 prompt 下的 Δ_T；每个 prompt 从 1 条
+上下文扩成 1+M=3 条。`mix` 则在块 2 后追加 `rt₁, rt₂` 两块（教师采样），`delta=(10,8,64)`。
+`fat_prompts` 的 prompt 逐块重复是**有意的冗余**（保持「行号 = (块, prompt) 双索引」最简单、
+`cache` 按行索引即可），代价是 prompt 张量 ×(1+K) 常驻；`delta`/`ref_dists` 同理随块结构
+放大（真实词表须配 topk 缓存）。
+
 **Δ_T 的语义**：`Δ_T(y|x) > 0` ⇔ RL 使教师更可能产生 y（RL 学到的改进方向）；
 `< 0` ⇔ RL 抑制了 y。相减丢弃了教师 RL 前已有的偏好，只保留 RL 诱导的偏移。
 
