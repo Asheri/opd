@@ -66,6 +66,15 @@ class MetricsRecorder:
                 self._fields = next(csv.reader(_f), [])
             self._writer.fieldnames = self._fields   # DictWriter 立即对齐旧列
             self._header_written = True
+            # P3（R2 审查）：上次崩溃若在 flush 前留下无换行的半行，append 会接在
+            # 半行后继续写、首行畸形。补一个换行把损坏行终止（旧半行数据保留不
+            # 截断；csv 默认行终止符为 \r\n，故按 \r 或 \n 判定行是否完整）。
+            with open(self.csv_path, "rb") as _f:
+                _f.seek(0, 2)
+                if _f.tell() > 0:
+                    _f.seek(-1, 1)
+                    if _f.read(1) not in (b"\n", b"\r"):
+                        self._file.write("\n")
         else:
             self._header_written = False
             self._fields = []

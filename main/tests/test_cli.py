@@ -118,6 +118,10 @@ def test_cli_eval_aime_run_dir_bridge(tmp_path, capsys, monkeypatch):
     class FakeAimeEvaluator:
         def __init__(self, *a, **k):
             pass
+        def __enter__(self):
+            return self          # R1：eval-aime 用 with AimeEvaluator(...) as ev 确保 close
+        def __exit__(self, *exc):
+            return False
         def evaluate_to_jsonl(self, ds, out_path):
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:

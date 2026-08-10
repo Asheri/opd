@@ -90,19 +90,27 @@ class AimeEvaluator:
                  max_new_tokens: int = 2048, batch_size: int = 8,
                  n_samples: int = 1, temperature: float = 0.0,
                  trust_remote_code: bool = False, dtype: str = "auto"):
+        # P2：参数校验前置（transformers 导入/模型加载之前），配置错快速失败、零副作用。
+        if int(max_new_tokens) >= _MAX_CONTEXT:
+            raise ConfigError(
+                f"max_new_tokens={max_new_tokens} 接近/超过上下文上限 {_MAX_CONTEXT}；请调小")
+        self.n_samples = max(1, int(n_samples))
+        self.temperature = float(temperature)
+        # P2（R2 审查）：greedy + 多采样会退化为 num_return_sequences>1 的重复/崩溃
+        # （temperature<=0 → do_sample=False → 同种子多序列逐字重复，pass@1 被污染）。
+        # 采样模式由温度驱动：n>1 且 T>0 才合法；要么 T>0（真采样），要么 n==1（贪心）。
+        if self.n_samples > 1 and self.temperature <= 0:
+            raise ConfigError(
+                f"n_samples={self.n_samples}>1 但 temperature={self.temperature}<=0："
+                "贪心解码下多序列逐字重复，pass@1 无意义。请设 temperature>0 或 n_samples=1")
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as e:                       # pragma: no cover
             raise ModelError(f"AIME 评估需要 transformers：{e}") from e
-        if int(max_new_tokens) >= _MAX_CONTEXT:
-            raise ConfigError(
-                f"max_new_tokens={max_new_tokens} 接近/超过上下文上限 {_MAX_CONTEXT}；请调小")
         self.model_path = model_path
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
         self.batch_size = max(1, int(batch_size))
-        self.n_samples = max(1, int(n_samples))
-        self.temperature = float(temperature)
         try:
             self.tok = AutoTokenizer.from_pretrained(
                 model_path, trust_remote_code=trust_remote_code)
@@ -187,9 +195,13 @@ class AimeEvaluator:
         responses: list[str] = []
         n = self.n_samples
         do_sample = self.temperature > 0 and n > 1
+        # P2（R2 审查）：num_return_sequences=n 把每批序列数放大 n 倍，峰值 KV/显存
+        # 随 batch×n 线性涨。按 n 收缩批内 prompt 数，把每批生成序列数压回 batch_size
+        # 量级（n 感知批缩放；batch_size<n 时退化为逐 prompt，仍受 n 保护）。
+        step = self.batch_size if n <= 1 else max(1, self.batch_size // n)
         try:
-            for i in range(0, len(prompts), self.batch_size):
-                batch = prompts[i:i + self.batch_size]
+            for i in range(0, len(prompts), step):
+                batch = prompts[i:i + step]
                 enc = self.tok(batch, return_tensors="pt", padding=True,
                                truncation=True,
                                max_length=_MAX_CONTEXT - self.max_new_tokens)

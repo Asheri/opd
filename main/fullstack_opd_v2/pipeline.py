@@ -309,6 +309,11 @@ class FullStackOPDv2:
         # L1：把 student 提前创建，使「离线 warmup 采样」与「Stage 2 KL 锚点」共享同一份
         # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
         student = build_model(self.cfg, self.device, role="student")
+        # P1-4：warmup 专用独立初始 student——resume 会把断点权重 load 进 student，
+        # 若 warmup 复用 student 则采样分布变成「续跑后的学生」，与 KL 锚点（初始
+        # 分布，resume 从断点 ref 恢复）不同源，曝光偏差不变式被打破。此实例永不
+        # 被 load_state_dict 覆盖，始终代表初始分布。
+        warmup_student = build_model(self.cfg, self.device, role="student")
 
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
         initial_version = 0
@@ -327,7 +332,7 @@ class FullStackOPDv2:
         # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
         cache, fat_prompts, fat_responses = stage1_build_cache(
             self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
-            warmup_student=student)
+            warmup_student=warmup_student)
         timings["stage1_cache"] = time.perf_counter() - t
 
         logger.info("[Stage 2] Direct-OPD 训练跑在 AsyncOPD 批量调度器上")

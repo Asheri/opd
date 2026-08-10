@@ -16,8 +16,13 @@ YAML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 def test_load_defaults_no_args():
     cfg = load_config()
     assert cfg["stage2"]["lr"] == DEFAULT_CONFIG_V2["stage2"]["lr"]
-    assert cfg["stage1"]["warmup_source"] == "none"
     assert cfg["vocab_size"] == 64
+    # L1 默认翻转：学生 ref 一次性 rollout 拼胖 D（消曝光偏差）。schema 默认必须与
+    # pipeline.DEFAULT_CONFIG_V2 同源，否则「schema 默认吞掉翻转」回归（P1-1）。
+    assert cfg["stage1"]["warmup_source"] == "student_init"
+    assert cfg["stage1"]["warmup_M"] == 4
+    assert DEFAULT_CONFIG_V2["stage1"]["warmup_source"] == "student_init"
+    assert DEFAULT_CONFIG_V2["stage1"]["warmup_M"] == 4
 
 
 def test_load_real_yaml():

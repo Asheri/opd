@@ -10,6 +10,33 @@ from fullstack_opd_v2.eval_aime import (
 from fullstack_opd_v2.exceptions import DataError, ModelError, ConfigError
 
 
+# --------------------------- 构造参数校验 ---------------------------
+def test_guard_n_samples_gt1_requires_temp_gt0(monkeypatch):
+    """P2：n_samples>1 且 temperature<=0 → ConfigError（贪心多序列逐字重复）。
+
+    参数校验已前置到 transformers 导入之前（配置错快速失败），非法组合不触模型。
+    合法组合用 monkeypatch 挡掉 transformers 模块属性（`from transformers import X`
+    在函数内执行时才解析，patch 后即生效），避免真实模型加载。
+    """
+    import transformers
+    fake_tok = mock.Mock()
+    fake_tok.pad_token = None
+    fake_tok.eos_token = "<eos>"
+    fake_model = mock.Mock()
+    monkeypatch.setattr(transformers, "AutoTokenizer",
+                        mock.Mock(from_pretrained=mock.Mock(return_value=fake_tok)))
+    monkeypatch.setattr(transformers, "AutoModelForCausalLM",
+                        mock.Mock(from_pretrained=mock.Mock(return_value=fake_model)))
+
+    with pytest.raises(ConfigError):
+        AimeEvaluator("fake-model", n_samples=2, temperature=0.0)
+    with pytest.raises(ConfigError):
+        AimeEvaluator("fake-model", n_samples=4, temperature=-0.5)
+    # 合法组合不抛：n==1 贪心 / n>1 且 T>0
+    AimeEvaluator("fake-model", n_samples=1, temperature=0.0)
+    AimeEvaluator("fake-model", n_samples=3, temperature=0.7)
+
+
 # --------------------------- 纯函数 ---------------------------
 def test_format_prompt_contains_boxed():
     p = format_prompt("What is 2+2?")
@@ -128,19 +155,84 @@ def test_n_samples_pass_at_1():
 
 
 def test_max_new_tokens_too_large_rejected():
-    """R1：max_new_tokens >= 4096 抛 ConfigError（校验在 init 早期、不加载模型）。"""
+    """R1 + P2：max_new_tokens >= 4096 抛 ConfigError（校验前置、不加载模型）。
+
+    P2 修复后参数校验在 transformers 导入之前：max_new_tokens 过大用不存在的模型
+    路径也直接抛 ConfigError（不触碰模型加载）；4095 通过校验、进入 tokenizer
+    加载才抛 ModelError——证明该校验真实生效于 __init__，而非测试自复制的逻辑。
+    """
     import fullstack_opd_v2.eval_aime as EA
-    real_init = EA.AimeEvaluator.__init__
-    def fake_init(self, model_path, *a, **k):
-        if int(k.get("max_new_tokens", 2048)) >= EA._MAX_CONTEXT:
-            raise ConfigError(f"max_new_tokens={k.get('max_new_tokens')}")
-        raise AssertionError("校验通过后应继续，此处不构造")
-    EA.AimeEvaluator.__init__ = fake_init
-    try:
-        with pytest.raises(ConfigError):
-            AimeEvaluator("/x", max_new_tokens=5000)
-    finally:
-        EA.AimeEvaluator.__init__ = real_init
+    with pytest.raises(ConfigError):
+        AimeEvaluator("/nonexistent/path", max_new_tokens=EA._MAX_CONTEXT + 10)
+    with pytest.raises(ConfigError):                      # 边界：==4096 抛错
+        AimeEvaluator("/nonexistent/path", max_new_tokens=EA._MAX_CONTEXT)
+    with pytest.raises(ModelError):                       # 边界：4095 通过校验 → 路径不存在
+        AimeEvaluator("/nonexistent/path", max_new_tokens=EA._MAX_CONTEXT - 1)
+
+
+def test_generate_direct_batch_n_samples(monkeypatch):
+    """P2：直接测真实 generate()——批量 + num_return_sequences=n + do_sample 组合。
+
+    用 mock tok/model 构造实例（绕过 from_pretrained），验证 R1 核心修复：
+    - n_samples>1 + 温度>0 → do_sample=True、num_return_sequences=n；
+    - n=1 贪心 → do_sample=False、temperature=1.0（采样温度不传给贪心）；
+    - n 感知批缩放：n>1 时每批 prompt 数 = batch_size//n，峰值序列数被压回 batch_size；
+    - 返回拍平列表长度 = N×n，顺序 = 逐 prompt × 逐采样。
+    """
+    import torch
+    import fullstack_opd_v2.eval_aime as EA
+
+    def make_ev(n_samples, temperature, batch_size):
+        ev = object.__new__(AimeEvaluator)
+        ev.device = "cpu"
+        ev.n_samples = n_samples
+        ev.temperature = temperature
+        ev.batch_size = batch_size
+        ev.max_new_tokens = 8
+        tok = mock.Mock()
+        tok.pad_token_id = 0
+        tok.decode = mock.Mock(return_value="\\boxed{1}")
+        def encode(batch, **k):
+            return {"input_ids": torch.zeros(len(batch), 4, dtype=torch.long),
+                    "attention_mask": torch.ones(len(batch), 4, dtype=torch.long)}
+        tok.side_effect = encode                       # self.tok(batch, ...) 调用
+        ev.tok = tok
+        model = mock.Mock()
+        calls = []
+        def fake_generate(**kwargs):
+            calls.append(kwargs)
+            B = kwargs["input_ids"].size(0)
+            n = kwargs["num_return_sequences"]
+            return torch.zeros(B * n, 4 + ev.max_new_tokens, dtype=torch.long)
+        model.generate.side_effect = fake_generate
+        ev.model = model
+        return ev, calls
+
+    # 采样路径：3 prompt、n=2、batch_size=2 → step=1 → 3 次 generate，各 2 序列
+    ev, calls = make_ev(n_samples=2, temperature=0.7, batch_size=2)
+    out = ev.generate(["p0", "p1", "p2"])
+    assert len(out) == 6                                # N×n = 3×2
+    assert len(calls) == 3                              # ceil(3/1)
+    for c in calls:
+        assert c["num_return_sequences"] == 2
+        assert c["do_sample"] is True
+        assert c["temperature"] == 0.7
+        assert c["input_ids"].size(0) == 1              # n 感知批缩放：step=1
+
+    # 贪心路径：n=1、温度>0 → do_sample 仍 False，温度传 1.0
+    ev, calls = make_ev(n_samples=1, temperature=0.5, batch_size=2)
+    out = ev.generate(["p0", "p1", "p2"])
+    assert len(out) == 3
+    assert len(calls) == 2                              # ceil(3/2)，无 n 缩放
+    for c in calls:
+        assert c["num_return_sequences"] == 1
+        assert c["do_sample"] is False
+        assert c["temperature"] == 1.0
+
+    # n > batch_size 退化保护：batch_size=2, n=4 → step=max(1,0)=1
+    ev, calls = make_ev(n_samples=4, temperature=0.7, batch_size=2)
+    ev.generate(["p0", "p1"])
+    assert all(c["input_ids"].size(0) == 1 for c in calls)
 
 
 def test_close_frees_model():

@@ -80,3 +80,41 @@ def test_append_mode_keeps_history(tmp_path):
     assert lines[0].startswith("loss,version")
     assert lines[1].endswith("0.1,1")
     assert lines[2].endswith("0.2,2")
+
+
+def test_append_heals_half_line(tmp_path):
+    """P3（R2 审查）：上次崩溃留下无换行的半行 → append 先补换行再续写，首行不畸形。
+
+    模拟：旧文件以『表头 + 完整行 + 半行』结束（半行无 \n），append 续写后
+    半行被换行终止、新行独立成行；splitlines 不应出现表头被污染的行。
+    """
+    path = os.path.join(str(tmp_path), "metrics.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write("loss,version\r\n0.1,1\r\n0.2,2")     # 末行无终止符（模拟崩溃半行）
+    mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path), append=True)
+    mr.record({"loss": 0.3, "version": 3})
+    mr.close()
+    raw = open(path, encoding="utf-8").read()
+    # 半行被终止：完整行数 = 表头 + 2 旧行 + 1 新行
+    lines = [l for l in raw.replace("\r\n", "\n").split("\n") if l]
+    assert len(lines) == 4
+    assert lines[2] == "0.2,2"        # 半行内容保留、未被后续拼接
+    assert lines[3] == "0.3,3"        # 新行独立成行
+    assert not lines[0].startswith("0.2,2,")   # 表头未被半行污染
+
+
+def test_append_new_field_keeps_history_warns(tmp_path):
+    """P3（R2 审查）：append 续写时晚到新列 → 旧行留空、新行带新列、不整表重写、告警。"""
+    path = os.path.join(str(tmp_path), "metrics.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write("loss,version\r\n0.1,1\r\n")
+    mr = MetricsRecorder(backend="csv", run_dir=str(tmp_path), append=True)
+    with pytest.warns(UserWarning, match="新字段"):
+        mr.record({"loss": 0.2, "version": 2, "age": 5})
+    mr.close()
+    raw = open(path, encoding="utf-8").read()
+    lines = [l for l in raw.replace("\r\n", "\n").split("\n") if l]
+    assert lines[0].startswith("loss,version")   # 旧表头不变（不截断）
+    assert "0.1,1" in lines                      # 历史保留
+    # 新行带新列（DictWriter 按扩展后的 fieldnames 写，age 有值）
+    assert any("0.2,2" in l and ",5" in l for l in lines)

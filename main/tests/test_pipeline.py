@@ -205,6 +205,73 @@ def test_resume_keeps_kl_anchor_invariant():
         assert torch.allclose(ck2["ref"]["ref_dists"], ck["ref"]["ref_dists"])
 
 
+def test_resume_warmup_uses_fresh_initial_student(tmp_path, monkeypatch):
+    """P1-4：resume 时 warmup_student 是独立初始 student（非续跑学生权重）。
+
+    run() 开头 torch.manual_seed(seed) → 两次 run 的 RNG 同流；warmup_student 在
+    resume load_state_dict 之前创建 → 首跑与 resume 的 warmup 权重逐元素相等。
+    且 resume 的 warmup 权重 ≠ 断点学生权重（未被续跑分布污染，否则曝光偏差不变式破）。
+    """
+    import os, tempfile, torch
+    import fullstack_opd_v2.pipeline as PL
+    from fullstack_opd_v2.checkpoint import CheckpointManager
+
+    captured = []
+    real = PL.stage1_build_cache
+    def spy(*args, **kwargs):
+        captured.append(kwargs.get("warmup_student"))
+        return real(*args, **kwargs)
+    monkeypatch.setattr(PL, "stage1_build_cache", spy)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})()
+        cfg = _cfg(tmp)
+        cfg["stage2"]["n_steps"] = 4
+        cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 2}
+        FullStackOPDv2(cfg, device="cpu").run()
+        ck = CheckpointManager(os.path.join(td, "r")).resume()
+        assert ck is not None
+        FullStackOPDv2(cfg, device="cpu").run(run_dir=os.path.join(td, "r"), resume=ck)
+
+    w_first, w_resume = captured[0], captured[1]
+    assert w_first is not None and w_resume is not None
+    # 1) warmup 分布跨 resume 不变（同一初始 student 源）
+    for k in w_first.state_dict():
+        assert torch.allclose(w_first.state_dict()[k], w_resume.state_dict()[k]), k
+    # 2) resume 的 warmup ≠ 断点学生权重（未被续跑分布污染）
+    diffs = [k for k in ck["state"]
+             if not torch.allclose(w_resume.state_dict()[k], ck["state"][k])]
+    assert diffs, "warmup 权重与断点学生权重逐项相等——warmup 被续跑分布污染（P1-4 回归）"
+
+
+def test_cloud_config_l1_and_seepage():
+    """L2P3：CLOUD_CONFIG 结构性 L1 默认 + 顶层部署键下渗后 schema 合法。
+
+    CLOUD_CONFIG 是脚本直传的云预设 dict（不经 load_config），两条防线：
+    1) 自带 L1 翻转（warmup_M=4/student_init），否则云部署退回 L0 曝光偏差最大档；
+    2) 顶层部署键（dtype/cache_mode/top_k_*/offload_to_cpu）经 _seep_deployment_keys
+       分流后必须通过 OPDConfig 校验且落进 stage 子 dict——新增顶层键未同步分流表
+       的 P0 bug 类型在此显式报错而非静默忽略。
+    """
+    from fullstack_opd_v2.config import OPDConfig, _seep_deployment_keys
+    from fullstack_opd_v2.pipeline import CLOUD_CONFIG
+
+    # 1) L1 结构性默认
+    assert CLOUD_CONFIG["stage1"]["warmup_M"] == 4
+    assert CLOUD_CONFIG["stage1"]["warmup_source"] == "student_init"
+
+    # 2) 下渗 + 校验（extra="forbid" 下非法键会炸）
+    seeped = _seep_deployment_keys(dict(CLOUD_CONFIG))
+    OPDConfig(**seeped)                 # 不抛 = 云预设 schema 合法
+    for k in ("cache_mode", "top_k_teacher"):
+        assert seeped["stage1"][k] == CLOUD_CONFIG[k], k
+    for k in ("dtype", "top_k_student", "offload_to_cpu"):
+        assert seeped["stage2"][k] == CLOUD_CONFIG[k], k
+    # ref_topk 保持纯顶层（不下渗、stage 无槽位）
+    assert seeped["ref_topk"] == CLOUD_CONFIG["ref_topk"]
+    assert "ref_topk" not in seeped["stage1"] and "ref_topk" not in seeped["stage2"]
+
+
 def test_warmup_requires_student_raises_dataerror():
     """B1 收尾：warmup_source=student_init 但未传 warmup_student 时抛 DataError（非裸 ValueError）。"""
     import pytest

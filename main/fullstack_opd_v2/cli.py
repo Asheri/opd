@@ -65,6 +65,7 @@ def _cmd_train(args) -> int:
 
 
 def _cmd_cache(args) -> int:
+    from .model_factory import build_model
     from .pipeline import FullStackOPDv2, stage1_build_cache
 
     device = _device_arg(args)
@@ -74,8 +75,11 @@ def _cmd_cache(args) -> int:
     s1cfg = dict(cfg["stage1"])     # 部署键下渗已在 load_config 完成（config.py 校验前）
     if args.out:
         s1cfg["cache_path"] = args.out
+    # L1：warmup 需要初始 student（student_init 采样）；toy 下即初始 CausalToyLM
+    warmup_student = build_model(cfg, device, role="student")
     cache, _, _ = stage1_build_cache(
-        opd.prompts, opd.responses, teacher_rl, teacher_ref, s1cfg)
+        opd.prompts, opd.responses, teacher_rl, teacher_ref, s1cfg,
+        warmup_student=warmup_student)
     print(f"[cache] Δ_T 缓存已构建: {s1cfg['cache_path']} "
           f"mode={cfg['cache_mode']} top_k={cfg['top_k_teacher']}")
     return 0
@@ -139,9 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", default=None, help="（预留）checkpoint 路径")
     p.add_argument("--datasets", nargs="+", default=None, help="如 AIME24 AIME25（默认两者）")
     p.add_argument("--out", default=None, help="输出目录（默认 run-dir/aime 或 results/aime）")
-    p.add_argument("--max-new-tokens", type=int, default=2048)
-    p.add_argument("--n-samples", type=int, default=1)
-    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--max-new-tokens", type=int, default=None)  # None → 回退 run-eval cfg（P1）
+    p.add_argument("--n-samples", type=int, default=None)          # None → 回退 run-eval cfg（P1）
+    p.add_argument("--temperature", type=float, default=None)      # None → 回退 run-eval cfg（P2）
+    p.add_argument("--dtype", default=None, help="fp32 | bf16 | float16 | auto（默认 auto）")
     p.add_argument("--device", default=None)
     return ap
 
@@ -204,17 +209,22 @@ def _cmd_eval_aime(args) -> int:
     datasets = args.datasets or list(DEFAULT_DATASETS)
     device = _device_arg(args)
     out_dir = args.out or (os.path.join(args.run_dir, "aime") if args.run_dir else "results/aime")
-    ev = AimeEvaluator(
-        model_path, device=device,
-        max_new_tokens=args.max_new_tokens or run_eval_cfg.get("max_new_tokens", 2048),
-        n_samples=args.n_samples or run_eval_cfg.get("n_samples", 1),
-        temperature=args.temperature if args.temperature else run_eval_cfg.get("temperature", 0.0))
-    print(f"[eval-aime] model={model_path}  datasets={datasets}  device={device}")
-    print(f"[eval-aime] 输出目录: {out_dir}")
-    for ds in datasets:
-        out_path = os.path.join(out_dir, f"{ds}.jsonl")
-        res = ev.evaluate_to_jsonl(ds, out_path)
-        print(f"[eval-aime] {ds}: {res.correct}/{res.total} = {res.accuracy * 100:.2f}%  "
-              f"→ {out_path}")
+    with AimeEvaluator(
+            model_path, device=device,
+            max_new_tokens=(args.max_new_tokens if args.max_new_tokens is not None
+                            else run_eval_cfg.get("max_new_tokens", 2048)),
+            n_samples=(args.n_samples if args.n_samples is not None
+                       else run_eval_cfg.get("n_samples", 1)),
+            temperature=(args.temperature if args.temperature is not None
+                         else run_eval_cfg.get("temperature", 0.0)),
+            dtype=(args.dtype if args.dtype is not None
+                   else run_eval_cfg.get("dtype", "auto"))) as ev:
+        print(f"[eval-aime] model={model_path}  datasets={datasets}  device={device}")
+        print(f"[eval-aime] 输出目录: {out_dir}")
+        for ds in datasets:
+            out_path = os.path.join(out_dir, f"{ds}.jsonl")
+            res = ev.evaluate_to_jsonl(ds, out_path)
+            print(f"[eval-aime] {ds}: {res.correct}/{res.total} = {res.accuracy * 100:.2f}%  "
+                  f"→ {out_path}")
     print("[eval-aime] 汇总：teacher 基线 / 学生蒸馏前后对比见 benchmarks/aime24_25/aggregate.py")
     return 0

@@ -38,8 +38,8 @@ class Stage1Cfg(_Strict):
     enforce_teacher_consistency: bool = True
     cache_path: str = "fullstack_opd_cache_v2.pt"
     build_batch_size: int = 16
-    warmup_M: int = 0
-    warmup_source: Literal["none", "student_init", "teacher_perturbed", "mix"] = "none"
+    warmup_M: int = 4                    # L1 默认（与 DEFAULT_CONFIG_V2 对齐，避免 schema 默认吞掉翻转）
+    warmup_source: Literal["none", "student_init", "teacher_perturbed", "mix"] = "student_init"
     warmup_temperature: float = 1.0
     # ---- 顶层部署键下渗槽位（A5 解法 + T2 死槽位清理）----
     # load_config 在下渗后才校验，这些键须在 stage schema 有合法位置，否则
