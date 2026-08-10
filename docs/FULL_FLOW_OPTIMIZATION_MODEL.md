@@ -115,6 +115,13 @@ teacher 的 top-K `(token_id, logp)`，训练期用 `searchsorted` 二分匹配�
   用**初始 student**（`student_init`）或温度扰动教师（`teacher_perturbed`）或两者（`mix`）
   `generate_batch` 各 ×M 条响应，拼成胖 D：`fat_prompts=(N·(1+K),P)`、`fat_responses=(N·(1+K),T)`，
   K=M 或 2M。调度器内核零改动（仍只读 `cache` + 索引）。
+- **为什么保留原 D（块 0）**：L1 是「扩 D」不是「弃 D」。曝光偏差的病灶是**上下文覆盖太窄**
+  （固定 D 覆盖不了推理时学生自回归生成的上下文），不是"D 的响应坏了"——解法是加宽覆盖，
+  不是换掉任务数据。块 0 = 原 D 是**任务锚**：prompt 永远来自 D（`fat_prompts` 逐块重复），
+  原 responses 是任务参考/规范上下文，Δ_T 在这些位置上的信用信号最强；而 `student_init`
+  采样的初始学生是**未训练随机模型**，其采样是低信号探索串，只承担「覆盖学生生成分布」的职责
+  （`teacher_perturbed` 则介于两者之间）。只留 warmup 会在任务方向丢锚、训练上下文退化为随机串；
+  只留 D（L0）覆盖不了生成分布。两条覆盖方向都要，D 永远是基座，L2/L3 也是在其上加刷新。
 - **同源不变式（P1-4 修复）**：warmup 采样必须与 KL 锚点同分布——两者都是**初始 student 分布**。
   resume 时 `warmup_student` 用**独立新建的初始 student**（不被断点 `load_state_dict` 覆盖），
   保证「warmup 上下文分布 = KL 锚点分布」恒成立（详见 §3.3 与 `pipeline.py:_run_body`）。
