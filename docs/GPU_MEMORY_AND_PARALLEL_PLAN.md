@@ -117,13 +117,15 @@ rank0 · learner（训练）                     rank1 · rollout scorer（算 s
  8-bit Adam + 梯度检查点 ≈80GB/96GB          权重 15GB ≈20GB/96GB
 ──────────────────────────────             ──────────────────────────────
 每步：s_cur 前向+反传+8-bit Adam 更新         每步：acquire_if_newer 收最新快照
-     → publish → NCCL 广播（非阻塞 isend）      → response_dists 算 s_old（topk）
+     → publish → NCCL 非阻塞 P2P（isend）     → response_dists 算 s_old（topk）
      → 消费 (idxs, s_old) 算 loss              → (idxs, s_old, ver) 推给 learner（异步队列）
 ```
 - **两个 GPU 同时满负荷**：rank0 在训练、rank1 在打分——正是 CPU 版四线程流水线的 GPU 形态，
   把"算 s_old"与"训练更新"两个重活解耦到两张卡（`staleness` 双截断原样保留）。
-- **权重同步 = NCCL 非阻塞 P2P/broadcast**（NVLink）：`WeightStore.acquire_if_newer` 的 NCCL 版，
-  learner 每步 publish、scorer 按版本拉取；**双缓冲**让广播与下一步训练重叠。
+- **权重同步 = NCCL 非阻塞 P2P（isend/irecv）**（NVLink）：`WeightBroadcaster`（scheduler.py）按
+  `WeightStore.acquire_if_newer` 语义，learner 每步 `push_async` isend、scorer 按版本 irecv 拉取；
+  **双缓冲**让传输与下一步训练重叠。⚠️ 不用集体 broadcast——异步步数天然不对齐，collective 会死锁
+  （ENGINEERING §1.7 明示）。
 - **缓存不常驻**：Δ_T / ref 锚点 mmap，训练期按 idx 切片 `non_blocking` H2D，与计算重叠。
 - **scorer 无大 KV**：它做 teacher-forcing 前向（算 logprob），不是自回归解码；若将来 L2 要
   学生自回归 refresh 才需给 scorer 配 vLLM + KV（7B 也仅 ~15-20GB）。
@@ -147,7 +149,9 @@ TP=2 + "colocated 交替相位"（未实现，L2 增量）。
 | **1.7B** | **选项 C：DP=2**（两卡都训练，梯度 all-reduce 同步；scorer 每卡一份前向副本） | 27.8GB×2 | 模型小 → 打分太便宜，单 scorer 喂不饱两卡；DP 翻吞吐 |
 
 > 选项 C（DP=2）实现代价：`WeightStore`/`_publish` 改为梯度 all-reduce + 每卡 scorer 副本；
-> 1.7B 打分（~15GB bf16 前向）可与训练同卡共存，无需第三份显存。属吞吐最大化的增量，非默认。
+> 1.7B 打分（~3.5GB bf16 前向）可与训练同卡共存，无需第三份显存。属吞吐最大化的增量，非默认。
+> **多学生并发（1.7B/4B/7B 同时训 + 训练期评估）见 §7**——那是把三个学生都装下的打包方案，
+> 比单学生 DP 更能利用 §7.1 的 scorer 卡闲置算力。
 
 ### 5.4 最大化利用的杠杆清单（按 ROI）
 
@@ -157,7 +161,7 @@ TP=2 + "colocated 交替相位"（未实现，L2 增量）。
 | **8-bit Adam（7B）** | 把 OOM 变可行 + 空出 rank1 | `adamw_8bit`，见 5.1 |
 | **梯度检查点** | 激活从 ~6GB 压到 <1GB → 加 batch | 7B 训练必开 |
 | **大 micro-batch / 梯度累积** | 激活头寸 96GB 下喂饱 tensor core | 4B/1.7B 档主杠杆 |
-| **双缓冲 NCCL 广播** | 权重同步与训练重叠 | `WeightBroadcaster` 已就绪 |
+| **双缓冲 NCCL P2P** | 权重同步（isend/irecv）与训练重叠 | `WeightBroadcaster` 已就绪 |
 | **缓存 mmap + 预取** | 不占 96GB 常驻、H2D 与计算重叠 | §4，L1 胖 D 后必选 |
 | **torch.compile + CUDA Graph** | 固定 shape 的 response_dists 提速 | `dynamic=False` 谨慎 |
 | **Stage 1 用 vLLM TP=2** | 一次性 cache build 吃满两卡 | 教师仅 1.5B，快 |
@@ -168,14 +172,18 @@ TP=2 + "colocated 交替相位"（未实现，L2 增量）。
 # Stage 2 启动（7B，5.1 异步流水线）
 torchrun --nproc_per_node=2 python -m fullstack_opd_v2 \
     --device cuda:0 --set stage2.distributed=true --set stage2.n_gpus=2 \
-    --set stage2.rollout_engine=vllm --set stage2.rollout_model=<student_path> \
-    --set stage2.tp_size=1 --set stage2.rollout_tp_size=2 \
+    --set stage2.rollout_engine=toy --set stage2.rollout_model=<student_path> \
+    --set stage2.tp_size=1 --set stage2.rollout_tp_size=1 \
     --set stage2.cache_mode=topk --set stage2.top_k_teacher=64 \
     --set stage2.top_k_student=64 --set stage2.ref_topk=64 \
     --set stage2.offload_to_cpu=true \
     --set stage1.warmup_M=4 --set stage1.warmup_source=student_init
 ```
-> `tp_size=1` 是有意的（learner 单卡，见 5.2）；`rollout_tp_size=2` 是 scorer 侧的 vLLM。
+> `tp_size=1` 是有意的（learner 单卡，见 5.2）。**scorer 用单卡前向（`rollout_tp_size=1` 或
+> `rollout_engine=toy` 的朴素前向）**：scorer 角色是 `response_dists`（teacher-forcing 前向），
+> 不需要 vLLM TP=2——TP=2 横跨双卡会与 rank0 learner colocated 冲突（与 `tp_size>1` 护栏同类的
+> 互斥，scheduler.py:630-637）。vLLM 只在需要学生**自回归生成**时才用（L1 学生采样 / L2 refresh），
+> 且那时也只能单卡 TP=1 或走未实现的交替相位。
 > 8-bit Adam 与 mmap 缓存是代码层待接的骨架（见 §6 风险）。
 
 ---
@@ -191,3 +199,71 @@ torchrun --nproc_per_node=2 python -m fullstack_opd_v2 \
 - **🟡 TP=2 learner 与并发 scorer 死锁**——护栏已挡（`tp_size=1`），走 5.1 不用碰。
 - **激活账未标死**：随 batch/seq 变化，7B 梯度检查点后 <1GB 是保守估算，实测微调 batch。
 - **正确性回归**：三档放大对照 v2 `E[Δ_T]` 单调上升 + `staleness age>0`，训练循环无教师前向。
+
+---
+
+## 7. 进阶：三学生并发训练 + 训练期评估（多学生调度，定稿）
+
+> 本节回答「能否让 1.7B/4B/7B 三个学生**同时**训练、并在训练阶段并行跑 AIME 测评」。
+> ⚠️ 本节对初稿做了二次审阅修正（含上一轮的「缓存共享」错误与本节「scorer 卡闲置算力」洞察）。
+
+### 7.0 先纠正：Δ_T 缓存「不共享」（默认 student_init 下）
+
+胖 D = 原 D + **各学生初始分布采样块** + （教师采样块）。`warmup_source=student_init` 时，
+三个学生的初始分布不同 → 采样响应不同 → 胖 D 不同 → **Δ_T 缓存各建各的**。
+共享的只有：**教师权重**（Stage 0 跑一次）+ **原 D 块 0**。若想真共享缓存 → `teacher_perturbed`
+或 `warmup_M=0`（L0），代价是放弃「按学生覆盖生成分布」的曝光偏差缓解。
+
+### 7.1 并发为什么真的有用：scorer 卡有 ~2/3 闲置算力（关键洞察）
+
+单学生 2 卡异步里两卡并不均衡：
+- learner 卡每步 = fwd(s_cur) + bwd + 优化器 ≈ **3 单位算力**（满载）；
+- scorer 卡每步 = fwd(s_old) ≈ **1 单位算力** → **~33% 利用率、~67% 卡闲置**。
+
+→ **真正最大化利用 = 把 4B/1.7B 学生（或 AIME 评估）塞进 scorer 卡的闲置算力**，
+不是平分 3 张卡（也没有第 3 张卡）。机器利用率从 ~66%（单学生异步）升到 ~95%+。
+
+### 7.2 内存打包（每学生 = 一个线程版 scheduler 实例，同卡 colocate learner∥scorer）
+
+v2 的线程版 `AsyncBatchedScheduler`（CPU demo 架构）本就是**单设备内 learner∥scorer 线程异步**——
+把 toy 模型换成 CUDA 真实模型，每个学生就是一个独立进程、一个 `--device`，**不占对侧卡**：
+
+| 卡 | 学生 | learner（8-bit-Adam） | scorer（bf16 前向） | 小计 |
+|---|---|---|---|---|
+| rank0 | 7B | 76.0GB | 15.2GB | **91.2GB** / 96GB |
+| rank1 | 4B | 38.6GB | 7.7GB | 46.3GB |
+| rank1 | 1.7B（fp32-Adam） | 27.8GB | 3.5GB | 31.3GB |
+| **rank1 合计** | | | | **77.6GB** / 96GB ✓ |
+
+- 4B 必须 8-bit-Adam（fp32 会 100.8GB 超卡）；1.7B fp32 即可。
+- **墙钟**：顺序 3×满卡 = T₇+T₄+T₁.₇；打包并发 ≈ **max(T₇, T₄+T₁.₇)**（7B 占一卡的同时
+  两个小学生在另一卡跑完）→ 约砍一半实验墙钟（外加 Stage 0 只跑一次）。
+- **诚实边界**：同卡多 learner 是 SM 时间分片，不产生免费算力；收益 = scorer 卡闲置再利用
+  + Stage 0 摊销 + 机器不空。
+
+### 7.3 训练期 AIME 评估并行
+
+AIME 极小（2 年 ~60 题、贪心 2048 token、7B 也仅 1~3 分钟）→ **checkpoint 快照 + 后台评估**：
+- 4B/1.7B 快照：随时在 rank1 气泡（~18GB）后台 `opd eval-aime --checkpoint`（进程隔离，零扰动）；
+- 7B 快照：rank0 只剩 ~5GB 塞不下 → 在 `checkpoint_every` 节奏的 checkpoint 边界开几分钟评估窗，
+  或临时把 7B scorer 挪去 rank1 腾 rank0。评估不碰训练权重。
+
+### 7.4 架构选项与落地差距
+
+| 选项 | 改动 | 说明 |
+|---|---|---|
+| **A（推荐）** | 3 个独立进程 + 共享 mmap 缓存文件 | 每进程一线程版 scheduler + 一 device；eval 独立进程。最小改动 |
+| B（最干净） | 多学生共享调度器 | 一个进程、N 个 WeightStore/optimizer、共享 batch 流与 cache——改动最大 |
+| C（最省事） | 三学生顺序、各自满 2 卡异步 | 改动零，但墙钟≈并发的一半（无 §7.1 的打包重叠） |
+
+**落地差距（A 需要补的骨架）**：
+1. `model_factory` 对 hf/megatron/vllm 现抛 `ModelError`（真实 HF 模型路径未接）；
+2. 训练运行需支持「**载入预建缓存**」（现每次 run 重建 Stage 0/1）；
+3. 缓存 dense→**mmap**（多进程并发只读共享）；
+4. 同卡多进程要 `torch.cuda.set_device` + 显存碎片管理（必要时 CUDA MPS）。
+
+### 7.5 风险
+- 同卡多 learner = 时间分片，总吞吐≈机器算力上限，别期待"免费"；
+- 多进程同卡：显存碎片 / CUDA 上下文开销，实测微调 batch 与 prefetch；
+- 8-bit-Adam 数值：对照 demo `E[Δ_T]↑ + age>0` 回归；
+- 每学生缓存各建（Stage 1 三次，但教师仅 1.5B，三份并行 build 便宜）。
