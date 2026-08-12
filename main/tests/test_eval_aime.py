@@ -44,6 +44,23 @@ def test_format_prompt_contains_boxed():
     assert "\\boxed{}" in p
 
 
+def test_format_prompt_dapo():
+    """Direct-OPD 论文附录 A 模板：要求 "Answer:" 结尾行。"""
+    p = format_prompt("What is 2+2?", style="dapo")
+    assert "What is 2+2?" in p
+    assert "Answer:" in p
+    assert "without quotes" in p
+
+
+def test_extract_answer_dapo_line():
+    """DAPO 风格：取 "Answer:" 行后的数字（论文模板的答案落点）。"""
+    assert extract_answer("step by step...\nAnswer:\n42", style="dapo") == "42"
+    assert extract_answer("...\nAnswer: 7\n", style="dapo") == "7"
+    # 无 Answer 行 → 回退最后一个数字
+    assert extract_answer("最终 3", style="dapo") == "3"
+    assert extract_answer("无答案", style="dapo") == ""
+
+
 def test_extract_answer_boxed():
     assert extract_answer("Answer: \\boxed{42}") == "42"
     assert extract_answer("思考...\\boxed{005}\\n") == "005"
@@ -73,7 +90,7 @@ def test_aime_dataset_aliases():
 
 
 # --------------------------- 评估器（mock 后端） ---------------------------
-def _fake_evaluator(responses, problems):
+def _fake_evaluator(responses, problems, **over):
     """构造不加载真实模型的 AimeEvaluator（只 stub 生成/数据）。"""
     ev = object.__new__(AimeEvaluator)
     ev.model_path = "fake"
@@ -82,8 +99,13 @@ def _fake_evaluator(responses, problems):
     ev.batch_size = 8
     ev.n_samples = 1
     ev.temperature = 0.0
+    ev.top_p = None
+    ev.metric = "pass1"
+    ev.prompt_style = "boxed"
     ev.tok = mock.Mock()
     ev.model = mock.Mock()
+    for k, v in over.items():
+        setattr(ev, k, v)
     it = iter(responses)
     ev.generate = lambda prompts: [next(it) for _ in prompts]
     return ev
@@ -137,6 +159,82 @@ def test_load_problems_missing_columns(monkeypatch):
     with pytest.raises(DataError):
         ev.load_problems("AIME24")
 
+def test_evaluate_ave_metric_returns_per_problem_fraction():
+    """metric=ave（对齐论文 ave@32）：accuracy = 每题 n 采样中答对比例的均值。
+
+    3 题 × 2 采样：p0 全对(1.0)、p1 半对(0.5)、p2 全错(0.0) → ave = 0.5。
+    pass@1 语义（correct）仍各自记录：p0✓ p1✓(任一) p2✗ → 2/3。
+    """
+    ev = object.__new__(AimeEvaluator)
+    ev.model_path = "fake"
+    ev.device = "cpu"
+    ev.max_new_tokens = 16
+    ev.batch_size = 8
+    ev.n_samples = 2
+    ev.temperature = 0.7
+    ev.top_p = 0.95
+    ev.metric = "ave"
+    ev.prompt_style = "dapo"
+    ev.generate = lambda prompts: [r for _ in prompts for r in (
+        "Answer:\n1", "Answer:\n1",     # p0：2/2 对
+        "Answer:\n5", "Answer:\n9",     # p1：1/2 对
+        "Answer:\n3", "Answer:\n4")]    # p2：0/2 对
+    ev.load_problems = lambda d: [("p0", "1"), ("p1", "9"), ("p2", "7")]
+    res = ev.evaluate("AIME24")
+    assert res.total == 3
+    assert res.correct == 2                # pass@1：p0✓ p1✓(任一9) p2✗
+    assert abs(res.ave_accuracy - 0.5) < 1e-9   # (1.0+0.5+0.0)/3
+    assert abs(res.accuracy - 0.5) < 1e-9       # ave 时 accuracy 用 ave_accuracy
+    assert res.rows[1]["correct"] is True       # pass@1 行级语义保留
+
+
+def test_metric_invalid_raises():
+    with pytest.raises(ConfigError):
+        AimeEvaluator("fake", n_samples=1, temperature=0.0, metric="bad")
+
+
+def test_prompt_style_invalid_raises():
+    with pytest.raises(ConfigError):
+        AimeEvaluator("fake", n_samples=1, temperature=0.0, prompt_style="bad")
+
+
+def test_generate_passes_top_p_when_sampling(monkeypatch):
+    """论文评估协议：采样（do_sample=True）时 top_p 穿透到 model.generate。"""
+    import torch
+    ev = object.__new__(AimeEvaluator)
+    ev.device = "cpu"
+    ev.n_samples = 2
+    ev.temperature = 0.7
+    ev.top_p = 0.95
+    ev.batch_size = 8
+    ev.max_new_tokens = 8
+    tok = mock.Mock()
+    tok.pad_token_id = 0
+    tok.decode = mock.Mock(return_value="\\boxed{1}")
+    def encode(batch, **k):
+        return {"input_ids": torch.zeros(len(batch), 4, dtype=torch.long),
+                "attention_mask": torch.ones(len(batch), 4, dtype=torch.long)}
+    tok.side_effect = encode
+    ev.tok = tok
+    calls = []
+    model = mock.Mock()
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        B = kwargs["input_ids"].size(0)
+        n = kwargs["num_return_sequences"]
+        return torch.zeros(B * n, 4 + ev.max_new_tokens, dtype=torch.long)
+    model.generate.side_effect = fake_generate
+    ev.model = model
+    ev.generate(["p0"])
+    assert calls[0]["do_sample"] is True
+    assert calls[0]["top_p"] == 0.95
+    # 贪心（n=1, T=0）不传 top_p
+    ev.n_samples = 1
+    ev.temperature = 0.0
+    ev.generate(["p0"])
+    assert "top_p" not in calls[1]
+
+
 def test_n_samples_pass_at_1():
     """R1：n_samples>1 时 correct 记 pass@1（任一采样答对即对）。"""
     ev = object.__new__(AimeEvaluator)
@@ -146,6 +244,9 @@ def test_n_samples_pass_at_1():
     ev.batch_size = 8
     ev.n_samples = 2
     ev.temperature = 0.7
+    ev.top_p = None
+    ev.metric = "pass1"
+    ev.prompt_style = "boxed"
     # 2 题 × 2 采样 = 4 条响应（拍平）
     ev.generate = lambda prompts: [r for _ in prompts for r in ("\boxed{1}", "\boxed{2}")]
     ev.load_problems = lambda d: [("p0", "1"), ("p1", "9")]
@@ -182,11 +283,14 @@ def test_generate_direct_batch_n_samples(monkeypatch):
     import torch
     import fullstack_opd_v2.eval_aime as EA
 
-    def make_ev(n_samples, temperature, batch_size):
+    def make_ev(n_samples, temperature, batch_size, top_p=None):
         ev = object.__new__(AimeEvaluator)
         ev.device = "cpu"
         ev.n_samples = n_samples
         ev.temperature = temperature
+        ev.top_p = top_p
+        ev.metric = "pass1"
+        ev.prompt_style = "boxed"
         ev.batch_size = batch_size
         ev.max_new_tokens = 8
         tok = mock.Mock()

@@ -31,20 +31,42 @@ _MAX_CONTEXT = 4096
 
 # 标准推理提示（答案必须放 \boxed{}）
 PROMPT_TEMPLATE = "{problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+# DAPO 风格模板（Direct-OPD 论文附录 A：训练 rollouts 与评估 prompts 同用）——
+# 要求最后一行 "Answer: <数字>"。对齐论文评估协议时用 prompt_style="dapo"。
+PROMPT_TEMPLATE_DAPO = (
+    "Solve the following math problem step by step.\n"
+    "The last line of your response should be of the form\n"
+    "Answer:\n"
+    "$Answer (without quotes) where $Answer is the answer to the problem.\n"
+    "{problem}\n"
+    "Remember to put your answer on its own line after \"Answer:\"."
+)
 
 
 # --------------------------- 纯函数（可单测） ---------------------------
-def format_prompt(problem: str) -> str:
-    """把 AIME 题目格式化为推理 prompt。"""
-    return PROMPT_TEMPLATE.format(problem=str(problem).strip())
+def format_prompt(problem: str, style: str = "boxed") -> str:
+    """把 AIME 题目格式化为推理 prompt。
+
+    style="boxed"（默认）→ \boxed{} 模板；style="dapo" → Direct-OPD 论文附录 A 的
+    DAPO 模板（"Answer:" 结尾行），对齐论文评估协议。
+    """
+    tpl = PROMPT_TEMPLATE_DAPO if style == "dapo" else PROMPT_TEMPLATE
+    return tpl.format(problem=str(problem).strip())
 
 
-def extract_answer(text: str) -> str:
+def extract_answer(text: str, style: str = "boxed") -> str:
     """从模型输出提取数值答案。
 
-    级联：\boxed{...}（支持嵌套括号）→ 其中第一个数字；否则回退最后一个数字。
+    style="dapo"：优先取 "Answer:" 行后的数字（论文 DAPO 模板的落点）；
+    否则级联 \boxed{...} → 其中第一个数字；再回退最后一个数字。
     返回原始字符串（含可能的负号/千分位），未找到返回 ""。
     """
+    if style == "dapo":
+        m = re.search(r"[Aa]nswer\s*:\s*([^\n]+)", text)
+        if m:
+            mm = re.search(r"-?\d[\d,]*", m.group(1))
+            if mm:
+                return mm.group(0)
     boxed = re.findall(r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", text)
     if boxed:
         for cand in reversed(boxed):
@@ -74,9 +96,14 @@ class AimeResult:
     correct: int
     total: int
     rows: list[dict]
+    # metric=ave 时：每题 n 采样中答对比例的均值（对齐论文 ave@32 口径）。
+    # None → pass@1 口径（correct/total）。
+    ave_accuracy: float | None = None
 
     @property
     def accuracy(self) -> float:
+        if self.ave_accuracy is not None:
+            return self.ave_accuracy
         return self.correct / self.total if self.total else 0.0
 
 
@@ -89,13 +116,23 @@ class AimeEvaluator:
     def __init__(self, model_path: str, device: str = "cpu",
                  max_new_tokens: int = 2048, batch_size: int = 8,
                  n_samples: int = 1, temperature: float = 0.0,
-                 trust_remote_code: bool = False, dtype: str = "auto"):
+                 trust_remote_code: bool = False, dtype: str = "auto",
+                 top_p: float | None = None,
+                 metric: str = "pass1",
+                 prompt_style: str = "boxed"):
         # P2：参数校验前置（transformers 导入/模型加载之前），配置错快速失败、零副作用。
         if int(max_new_tokens) >= _MAX_CONTEXT:
             raise ConfigError(
                 f"max_new_tokens={max_new_tokens} 接近/超过上下文上限 {_MAX_CONTEXT}；请调小")
         self.n_samples = max(1, int(n_samples))
         self.temperature = float(temperature)
+        self.top_p = float(top_p) if top_p is not None else None
+        if metric not in ("pass1", "ave"):
+            raise ConfigError(f"metric={metric!r} 非法：须 pass1 | ave（ave=论文 ave@32 平均正确率）")
+        self.metric = metric
+        if prompt_style not in ("boxed", "dapo"):
+            raise ConfigError(f"prompt_style={prompt_style!r} 非法：须 boxed | dapo（论文模板）")
+        self.prompt_style = prompt_style
         # P2（R2 审查）：greedy + 多采样会退化为 num_return_sequences>1 的重复/崩溃
         # （temperature<=0 → do_sample=False → 同种子多序列逐字重复，pass@1 被污染）。
         # 采样模式由温度驱动：n>1 且 T>0 才合法；要么 T>0（真采样），要么 n==1（贪心）。
@@ -213,11 +250,14 @@ class AimeEvaluator:
                 enc = {k: v.to(self.device) for k, v in enc.items()}
                 seq_len = enc["input_ids"].size(1)
                 with torch.no_grad():
-                    out = self.model.generate(
-                        **enc, max_new_tokens=self.max_new_tokens,
+                    gen_kwargs = dict(
+                        max_new_tokens=self.max_new_tokens,
                         do_sample=do_sample, num_return_sequences=n,
                         temperature=self.temperature if do_sample else 1.0,
                         pad_token_id=self.tok.pad_token_id)
+                    if do_sample and self.top_p is not None:
+                        gen_kwargs["top_p"] = self.top_p
+                    out = self.model.generate(**enc, **gen_kwargs)
                 for o in out:
                     responses.append(self.tok.decode(o[seq_len:],
                                                      skip_special_tokens=True))
@@ -227,26 +267,37 @@ class AimeEvaluator:
 
     # --------------------------- 评估 ---------------------------
     def evaluate(self, dataset_ref: str) -> AimeResult:
-        """在单个 AIME 数据集上评估。n_samples>1 记 pass@1（任一采样答对即对）。"""
+        """在单个 AIME 数据集上评估。
+
+        - metric="pass1"（默认）：n_samples>1 记 pass@1（任一采样答对即对）。
+        - metric="ave"（对齐论文 ave@32）：accuracy = 每题 n 采样中答对比例的均值。
+        """
         problems = self.load_problems(dataset_ref)
-        prompts = [format_prompt(p) for p, _ in problems]
+        prompts = [format_prompt(p, self.prompt_style) for p, _ in problems]
         responses = self.generate(prompts)          # 拍平：N × n_samples 条
         n = self.n_samples
         correct = 0
+        fracs: list[float] = []
         rows = []
         for i, (problem, gt) in enumerate(problems):
             group = responses[i * n:(i + 1) * n]
-            preds = [extract_answer(r) for r in group]
-            ok = any(normalize_answer(p) == normalize_answer(gt) for p in preds)
+            preds = [extract_answer(r, self.prompt_style) for r in group]
+            gt_n = normalize_answer(gt)
+            per = [normalize_answer(p) == gt_n for p in preds]
+            ok = any(per)
             correct += int(ok)
+            if self.metric == "ave" and n:
+                fracs.append(sum(per) / n)
             rows.append({
                 "problem_id": i, "dataset": dataset_ref,
                 "ground_truth": gt, "predicted": preds[0],
                 "correct": ok, "response": group[0],
                 "n_samples": n,
             })
+        ave = (sum(fracs) / len(fracs)) if fracs else None
         return AimeResult(dataset=dataset_ref, model_path=self.model_path,
-                          correct=correct, total=len(problems), rows=rows)
+                          correct=correct, total=len(problems), rows=rows,
+                          ave_accuracy=ave)
 
     def evaluate_to_jsonl(self, dataset_ref: str, out_path: str) -> AimeResult:
         """评估并落盘每样本 jsonl，返回结果。"""
@@ -259,4 +310,5 @@ class AimeEvaluator:
 
 
 __all__ = ["AimeEvaluator", "AimeResult", "extract_answer", "normalize_answer",
-           "format_prompt", "AIME_DATASETS", "DEFAULT_DATASETS"]
+           "format_prompt", "AIME_DATASETS", "DEFAULT_DATASETS",
+           "PROMPT_TEMPLATE", "PROMPT_TEMPLATE_DAPO"]

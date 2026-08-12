@@ -146,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-new-tokens", type=int, default=None)  # None → 回退 run-eval cfg（P1）
     p.add_argument("--n-samples", type=int, default=None)          # None → 回退 run-eval cfg（P1）
     p.add_argument("--temperature", type=float, default=None)      # None → 回退 run-eval cfg（P2）
+    p.add_argument("--top-p", type=float, default=None)            # 论文评估协议 0.95
+    p.add_argument("--metric", default=None, help="pass1（默认）| ave（论文 ave@32 平均正确率）")
+    p.add_argument("--prompt-style", default=None, help="boxed（默认）| dapo（论文 DAPO 模板）")
     p.add_argument("--dtype", default=None, help="fp32 | bf16 | float16 | auto（默认 auto）")
     p.add_argument("--device", default=None)
     return ap
@@ -217,6 +220,12 @@ def _cmd_eval_aime(args) -> int:
                        else run_eval_cfg.get("n_samples", 1)),
             temperature=(args.temperature if args.temperature is not None
                          else run_eval_cfg.get("temperature", 0.0)),
+            top_p=(args.top_p if args.top_p is not None
+                   else run_eval_cfg.get("top_p")),
+            metric=(args.metric if args.metric is not None
+                    else run_eval_cfg.get("metric", "pass1")),
+            prompt_style=(args.prompt_style if args.prompt_style is not None
+                          else run_eval_cfg.get("prompt_style", "boxed")),
             dtype=(args.dtype if args.dtype is not None
                    else run_eval_cfg.get("dtype", "auto"))) as ev:
         print(f"[eval-aime] model={model_path}  datasets={datasets}  device={device}")
