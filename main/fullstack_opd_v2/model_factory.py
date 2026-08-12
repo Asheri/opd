@@ -103,13 +103,13 @@ class HFCausalLM:
         # P2（二次审查）：HF tie_word_embeddings 时 lm_head.weight 与 embed_tokens.weight
         # 是同一 Parameter 对象，parameters() 产出两次 → Adam / clip_grad_norm 对绑定权重
         # 双更新（等效步长 ≈2×，确定性静默语义错误）。按对象 id 去重。
+        # ⚠️ 返回【生成器】而非 list——cache.py build 用 next(teacher.parameters()) 取 device，
+        #     list 不可迭代（P3 实测 TypeError）。生成器每次调用重新迭代，可被多次消费。
         seen = set()
-        out = []
         for p in self.model.parameters(*a, **k):
             if id(p) not in seen:
                 seen.add(id(p))
-                out.append(p)
-        return out
+                yield p
 
     def named_parameters(self, *a, **k):
         seen = set()
