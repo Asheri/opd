@@ -4,12 +4,15 @@
   - prompts/responses: (N,P)/(N,T) 设备常驻张量（与 v2 其余部分一致）。
   - reward_fn: `(B,T) token` -> `(B,T) 奖励` 的可调用对象（Stage 0 REINFORCE 用）。
 - `ToyDataLoader`：默认实现，与旧 `_make_toy_data` 数值完全同源（randint 同流 + 查找表）。
-- `JsonLinesDataLoader`：预留真实数据接口（需 tokenizer 文本→token，见类注释）。
+- `JsonLinesDataLoader`：真实数据接口——读 jsonl（prompt/response 文本）→ tokenizer
+  编码成定长 id 张量（供 model_kind='hf' 真实训练）。
 - `build_data_loader`：按 `cfg["dataset"]["type"]` 分发，未知类型抛 `DataError`。
 """
 
 from __future__ import annotations
 
+import json
+import os
 from abc import ABC, abstractmethod
 
 import torch
@@ -57,10 +60,18 @@ class ToyDataLoader(DataLoader):
 
 
 class JsonLinesDataLoader(DataLoader):
-    """真实数据接口（占位）：从 jsonl 读 `prompt`/`response` 文本。
+    """真实数据接口：从 jsonl 读 `prompt`/`response` 文本 → tokenizer 编码定长 id 张量。
 
-    ⚠️ 文本→token 需要 tokenizer（与模型词表对齐），当前范围不实现——
-    加载时抛 `DataError` 明确提示。接入真实数据时补 tokenize 即可。
+    供 model_kind='hf' 真实训练（Stage 0 跳过，teacher 为预下载对，见 pipeline.
+    _stage0_teachers）。实现文本→token：
+    - tokenizer 来自 `dataset.tokenizer_path`（默认回退顶层 `student_path`——
+      学生与数据需同词表，与 teacher 一致性语义一致）；
+    - prompt 截断/右 pad 到 `max_prompt_len`，response 截断/右 pad 到 `max_response_len`；
+    - reward_fn：HF 路径不用（Stage 0 跳过），占位返回 0。
+
+    ⚠️ 已知简化（v2 scheduler 假设 responses 等长、mask=None 恒全 1）：右 pad 的
+    pad token 位置会计入损失——Δ_T 在 pad token 上近似中性、且数学数据多数接近定长，
+    影响小；严格做法需回传 padding mask（scheduler._train_step 注释已提示）。
     """
 
     def __init__(self, cfg: dict, device: str = "cpu"):
@@ -68,12 +79,60 @@ class JsonLinesDataLoader(DataLoader):
         self.path = ds.get("path")
         self.prompt_key = ds.get("prompt_key", "prompt")
         self.response_key = ds.get("response_key", "response")
+        self.max_prompt_len = int(ds.get("max_prompt_len", 256))
+        self.max_response_len = int(ds.get("max_response_len", 384))
+        self.tokenizer_path = ds.get("tokenizer_path") or cfg.get("student_path")
         self.device = device
+        self._cache = None
 
     def load(self):
-        raise DataError(
-            "JsonLinesDataLoader 需 tokenizer 实现文本→token（与模型词表对齐），"
-            "当前为预留接口。请接入真实 tokenizer 后使用，或先用 dataset.type='toy'。")
+        if self._cache is not None:
+            return self._cache
+        if not self.path or not os.path.isfile(self.path):
+            raise DataError(f"dataset.path 不存在或未配置: {self.path!r}")
+        try:
+            from transformers import AutoTokenizer
+        except Exception as e:                       # pragma: no cover
+            raise DataError(f"jsonl 数据加载需要 transformers：{e}") from e
+        if not self.tokenizer_path:
+            raise DataError(
+                "dataset.tokenizer_path 或顶层 student_path 未配置（tokenizer 需与词表对齐）")
+        tok = AutoTokenizer.from_pretrained(self.tokenizer_path)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        if tok.pad_token_id is None:
+            raise DataError("tokenizer 无 pad_token，无法定长 pad")
+        P, T = self.max_prompt_len, self.max_response_len
+        prompts_ids: list[list[int]] = []
+        responses_ids: list[list[int]] = []
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue                      # 跳过损坏行
+                p_text = str(row.get(self.prompt_key, ""))
+                r_text = str(row.get(self.response_key, ""))
+                if not p_text or not r_text:
+                    continue
+                p_ids = tok.encode(p_text, add_special_tokens=False, truncation=True,
+                                   max_length=P)
+                r_ids = tok.encode(r_text, add_special_tokens=False, truncation=True,
+                                   max_length=T)
+                p_ids = p_ids + [tok.pad_token_id] * max(0, P - len(p_ids))
+                r_ids = r_ids + [tok.pad_token_id] * max(0, T - len(r_ids))
+                prompts_ids.append(p_ids[:P])
+                responses_ids.append(r_ids[:T])
+        if not prompts_ids:
+            raise DataError(f"dataset.path 无有效行: {self.path!r}")
+        prompts = torch.tensor(prompts_ids, dtype=torch.long).to(self.device)
+        responses = torch.tensor(responses_ids, dtype=torch.long).to(self.device)
+        self._cache = (prompts, responses,
+                       lambda r: torch.zeros_like(r, dtype=torch.float32))
+        return self._cache
 
 
 def build_data_loader(cfg: dict, device: str = "cpu") -> DataLoader:

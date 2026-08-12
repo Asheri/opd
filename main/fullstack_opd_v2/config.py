@@ -118,6 +118,11 @@ class DatasetCfg(_Strict):
     path: str | None = None
     prompt_key: str = "prompt"
     response_key: str = "response"
+    # jsonl 真实数据（model_kind='hf'）：prompt/response 截断+右 pad 到定长；
+    # tokenizer_path 默认回退顶层 student_path（数据与词表对齐）。
+    max_prompt_len: int = 256
+    max_response_len: int = 384
+    tokenizer_path: str | None = None
 
 
 class EvalCfg(_Strict):

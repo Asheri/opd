@@ -58,7 +58,9 @@ DEFAULT_CONFIG_V2 = {
     "logging": {"level": "INFO", "file": "train.log"},
     "metrics": {"backend": "csv", "csv_path": None, "wandb_project": None},
     "dataset": {"type": "toy", "path": None, "prompt_key": "prompt",
-                "response_key": "response"},
+                "response_key": "response",
+                "max_prompt_len": 256, "max_response_len": 384,
+                "tokenizer_path": None},
     "eval": {"model_path": None, "datasets": ["AIME24", "AIME25"],
              "max_new_tokens": 2048, "n_samples": 1, "temperature": 0.0},
     "stage0": {              # 小模型 RL（产生 post-RL weak teacher）
@@ -124,7 +126,9 @@ CLOUD_CONFIG = {
     "logging": {"level": "INFO", "file": "train.log"},
     "metrics": {"backend": "csv", "csv_path": None, "wandb_project": "opd"},
     "dataset": {"type": "toy", "path": None, "prompt_key": "prompt",
-                "response_key": "response"},
+                "response_key": "response",
+                "max_prompt_len": 256, "max_response_len": 384,
+                "tokenizer_path": None},
         "stage1": {           # L1：云部署默认开启暖缓存（与 L0 相比仅 Stage1 多一次离线采样）
             **DEFAULT_CONFIG_V2["stage1"],
             "warmup_M": 4,
