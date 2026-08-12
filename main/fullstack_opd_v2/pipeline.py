@@ -357,10 +357,14 @@ class FullStackOPDv2:
         # P1-4：warmup 专用独立初始 student——resume 会把断点权重 load 进 student，
         # 若 warmup 复用 student 则采样分布变成「续跑后的学生」，与 KL 锚点（初始
         # 分布，resume 从断点 ref 恢复）不同源，曝光偏差不变式被打破。此实例永不
-        # 被 load_state_dict 覆盖，始终代表初始分布。载入预建缓存时不需要 warmup
-        # （缓存已含胖 D），不建以免 HF 路径重复加载大模型。
+        # 被 load_state_dict 覆盖，始终代表初始分布。
+        # ⚠️ 多学生显存（部署实测）：build 路径还建 worker（旧快照），HF 下 student+
+        # warmup_student+worker = 3 份模型——7B 档 + 教师对 + 优化器 > 96GB 必 OOM。
+        # 故 warmup_student 仅在 warmup_M>0（真需要采样胖 D）时才建；L0（warmup_M=0）
+        # 或载入预建缓存时都不建。
         warmup_student = (build_model(self.cfg, self.device, role="student")
-                          if not use_prebuilt else None)
+                          if (not use_prebuilt
+                              and int(s1cfg.get("warmup_M", 0) or 0) > 0) else None)
 
         teacher_rl = teacher_ref = None
         if use_prebuilt:
