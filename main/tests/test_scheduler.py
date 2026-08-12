@@ -205,6 +205,46 @@ def test_scheduler_topk_renormalize_wires_through(monkeypatch):
         assert math.isfinite(m["loss"])
 
 
+def test_scheduler_adamw_8bit_optimizer(monkeypatch):
+    """多学生并发：optimizer=adamw_8bit → 用 bnb AdamW8bit（mock，CPU 无法真跑 bnb）。"""
+    import unittest.mock as mock
+    import fullstack_opd_v2.scheduler as SCH
+
+    fake_opt = mock.Mock()
+    monkeypatch.setattr(SCH, "AdamW8bit", mock.Mock(return_value=fake_opt))
+    # bnb 在 scheduler._build_optimizer 内 from bitsandbytes.optim import AdamW8bit——
+    # 本地测试 CPU 无法真装 bnb，改为 monkeypatch bitsandbytes 模块模拟可用。
+    import types
+    bnb = types.ModuleType("bitsandbytes")
+    bnb_optim = types.ModuleType("bitsandbytes.optim")
+    bnb_optim.AdamW8bit = mock.Mock(return_value=fake_opt)
+    bnb.optim = bnb_optim
+    monkeypatch.setitem(sys.modules, "bitsandbytes", bnb)
+    monkeypatch.setitem(sys.modules, "bitsandbytes.optim", bnb_optim)
+
+    student, cache, prompts, responses, ref_dists = _setup(seed=11)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses, ref_dists,
+                                  None, None, _cfg(optimizer="adamw_8bit"), "cpu")
+    assert sched.opt is fake_opt
+
+
+def test_scheduler_adamw_8bit_without_bnb_raises(monkeypatch):
+    """adamw_8bit 但 bnb 缺失 → 显式报错（不静默回退 fp32 导致 OOM）。"""
+    import unittest.mock as mock
+    import fullstack_opd_v2.scheduler as SCH
+    import builtins
+    real_import = builtins.__import__
+    def fake_import(name, *a, **k):
+        if name == "bitsandbytes.optim":
+            raise ImportError("no bnb")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    student, cache, prompts, responses, ref_dists = _setup(seed=12)
+    with pytest.raises(RuntimeError):
+        AsyncBatchedScheduler(student, cache, prompts, responses, ref_dists,
+                              None, None, _cfg(optimizer="adamw_8bit"), "cpu")
+
+
 def test_scheduler_topk_mode_runs_end_to_end():
     """稀疏 topk 训练分支真实端到端跑通（M6）。
 

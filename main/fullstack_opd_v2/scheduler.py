@@ -129,7 +129,7 @@ class AsyncBatchedScheduler:
         self.clip_eps = cfg.get("clip_eps", 0.2)
         self.grad_clip = cfg.get("grad_clip", 1.0)
         self.use_topk = (self.top_k_student > 0) and (cache.mode == "topk")
-        self.opt = torch.optim.Adam(student.parameters(), lr=cfg.get("lr", 1e-3))
+        self.opt = self._build_optimizer(student, cfg)
 
         # 初始化权重快照（首版 = student 当前权重），供 rollout worker 加载版本 0。
         # 注意：不调用 self._publish() —— 分布式版的 _publish 已被 NCCL 广播覆盖，
@@ -143,6 +143,27 @@ class AsyncBatchedScheduler:
         if initial_version > 0:
             self.staleness_q._cur_version = initial_version
             self.weight_store._version = initial_version
+
+    # --------------------------- 优化器 ---------------------------
+    def _build_optimizer(self, student, cfg):
+        """按 cfg['optimizer'] 构造优化器：adam（默认 fp32）/ adamw_8bit（bnb，7B 单卡）。
+
+        多学生并发（GPU_MEMORY_AND_PARALLEL_PLAN §7）：4B/7B 的 fp32-Adam 超单卡
+        （4B 61.8GB / 7B 121.6GB > 96GB），8-bit Adam（bnb AdamW8bit）把优化器状态压到
+        int8（7B 总 ~60GB GPU）→ 单卡可训。⚠️ bnb 缺省时显式报错（不静默回退 fp32 导致 OOM）。
+        """
+        opt_type = cfg.get("optimizer", "adam")
+        lr = cfg.get("lr", 1e-3)
+        if opt_type == "adamw_8bit":
+            try:
+                from bitsandbytes.optim import AdamW8bit
+            except Exception as e:                     # pragma: no cover
+                raise RuntimeError(
+                    f"optimizer='adamw_8bit' 需要 bitsandbytes（pip install bitsandbytes）：{e}")
+            return AdamW8bit(student.parameters(), lr=lr)
+        if opt_type == "adam":
+            return torch.optim.Adam(student.parameters(), lr=lr)
+        raise RuntimeError(f"未知 optimizer={opt_type!r}（adam | adamw_8bit）")
 
         # L3 · vLLM rollout 引擎（可选）：包成 response_dists 的 drop-in 替换。
         # 提供时，rollout 阶段用 vLLM TP=2 推理取代 self.worker 的朴素前向；

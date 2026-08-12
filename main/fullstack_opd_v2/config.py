@@ -92,6 +92,8 @@ class Stage2Cfg(_Strict):
     # Δ_T 数值护栏（部署实测 P1）：真实教师对 log-ratio 差可达 ±10 → PG 无界爆炸、学生
     # 坍缩。非 None 时 pg_loss 先 clamp Δ_T 到 ±delta_clip（toy 小 Δ_T 无需，默认 None）。
     delta_clip: float | None = None
+    # 优化器：adam（默认 fp32）/ adamw_8bit（bnb，4B/7B 单卡必需——fp32-Adam 超 96GB）。
+    optimizer: Literal["adam", "adamw_8bit"] = "adam"
 
 
 # --------------------------- 工程化新增段 ---------------------------

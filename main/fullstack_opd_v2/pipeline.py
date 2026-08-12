@@ -104,6 +104,8 @@ DEFAULT_CONFIG_V2 = {
         # 稀疏支撑重归一化（对齐原始 Direct-OPD）：默认关=非归一有界近似；
         # GPU 稀疏预设（CLOUD_CONFIG / gpu_skeleton）置 true。PG 与 KL 同步开关。
         "renormalize_topk_support": False,
+        # 优化器（多学生并发：4B/7B 用 adamw_8bit 压优化器内存，单卡可训）
+        "optimizer": "adam",
     },
 }
 
