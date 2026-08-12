@@ -447,15 +447,29 @@ class FullStackOPDv2:
                 anchor_model = build_model(self.cfg, self.device, role="student")
                 logger.info("resume: 断点无 ref 锚点，重建初始 student 重算 KL 锚点（旧断点兼容）")
             anchor_model.eval()
-            with torch.no_grad():
-                full = response_dists(anchor_model, fat_prompts, fat_responses)  # (N_fat,T,V)
             ref_topk = self.cfg.get("ref_topk", 0)
             if ref_topk and ref_topk > 0:
-                Kr = min(ref_topk, full.size(-1))
-                topk = full.topk(Kr, dim=-1)
-                ref_ids, ref_logp = topk.indices, topk.values            # (N,T,Kr)
+                # 真实词表（V≈152k）：KL 锚点必须【逐 chunk topk】，绝不先 cat 出完整
+                # (N_fat,T,V) dense——N=2000,T=384,V=151936 时 = 233GB 必 OOM（部署实测）。
+                # 每 chunk 前向 → topk 截断 → 释放，峰值 = (B,T,V) 单 chunk。
+                ids_l, logp_l = [], []
+                bs = s1cfg.get("build_batch_size", 16)
+                with torch.no_grad():
+                    for i in range(0, fat_prompts.size(0), bs):
+                        sl = slice(i, min(i + bs, fat_prompts.size(0)))
+                        chunk = response_dists(anchor_model, fat_prompts[sl],
+                                               fat_responses[sl])     # (c,T,V)
+                        Kr = min(int(ref_topk), chunk.size(-1))
+                        tk = chunk.topk(Kr, dim=-1)
+                        ids_l.append(tk.indices)
+                        logp_l.append(tk.values)
+                        del chunk
+                ref_ids = torch.cat(ids_l)                             # (N,T,Kr)
+                ref_logp = torch.cat(logp_l)
             else:
-                ref_dists = full
+                with torch.no_grad():
+                    ref_dists = response_dists(anchor_model, fat_prompts,
+                                               fat_responses)          # (N_fat,T,V) 小词表
         # 打包 KL 锚点，随每个断点落盘（供 resume 恢复不变式）
         ref = {"ref_dists": ref_dists, "ref_ids": ref_ids, "ref_logp": ref_logp}
 
