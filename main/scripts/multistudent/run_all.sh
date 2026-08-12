@@ -43,16 +43,26 @@ for s in $STUDENTS; do
              --set teacher_rl_path="$TEACHER_RL_PATH"
              --set teacher_ref_path="$TEACHER_REF_PATH")
     fi
-    cd "$MAIN" && $PY -m fullstack_opd_v2 cache --config "$CONFIG" \
+    if ! cd "$MAIN" && $PY -m fullstack_opd_v2 cache --config "$CONFIG" \
         --out "${S_CACHE[$s]}" --device "$DEV" \
         --set stage1.cache_path="${S_CACHE[$s]}" \
         --set stage2.batch_size="${S_BATCH[$s]}" \
-        "${EXTRA[@]}" > "$WORK_ROOT/cache_$s.log" 2>&1
+        "${EXTRA[@]}" > "$WORK_ROOT/cache_$s.log" 2>&1; then
+      echo "  [cache] $s 失败（见 $WORK_ROOT/cache_$s.log）" >&2
+      exit 1
+    fi
     echo "  [cache] $s -> ${S_CACHE[$s]}"
   ) &
   pids+=($!)
 done
-for p in "${pids[@]}"; do wait "$p"; done
+# P2（二次审查）：wait 单失败即被 set -e abort 会留下孤儿进程（GPU 上占显存）。
+# 逐 p 收集失败码；任一失败 → 报错退出（子进程已各自结束或由 trap 清理）。
+FAIL=0
+for p in "${pids[@]}"; do wait "$p" || FAIL=1; done
+if [ "$FAIL" -ne 0 ]; then
+  echo "ERROR: 缓存构建失败（见 $WORK_ROOT/cache_*.log）；中止多学生流程" >&2
+  exit 1
+fi
 echo "--- 缓存构建完成（3 份并行）---"
 
 # ---- Phase 2：并发起 3 个训练 ----
@@ -62,8 +72,10 @@ for s in $STUDENTS; do
   if [ "$MODE" = "smoke" ]; then
     bash "$HERE/train_one.sh" "$s" "$CONFIG" "$MODE" > "$WORK_ROOT/train_$s.log" 2>&1 &
   else
+    # P3（二次审查）：real 模式用 > 截断而非 >> 追加——重复 run_all（如失败重跑）时
+    # 日志与新输出混排无从分辨。
     nohup bash "$HERE/train_one.sh" "$s" "$CONFIG" "$MODE" \
-        >> "$WORK_ROOT/train_$s.log" 2>&1 &
+        > "$WORK_ROOT/train_$s.log" 2>&1 &
   fi
   PIDS+=($!)
   echo "  [train] $s pid=$! -> ${S_RUN[$s]}  (log: $WORK_ROOT/train_$s.log)"

@@ -44,8 +44,12 @@ class HFCausalLM:
                  max_len: int | None = None):
         if not _HF_AVAILABLE:
             raise ModelError("model_kind='hf' 需要 transformers（统一 GPU 环境应含）")
-        td = {"bf16": torch.bfloat16, "float16": torch.float16,
-              "fp16": torch.float16}.get(str(dtype).lower(), None)
+        # P2 修复（二次审查）：config Literal 允许 "bfloat16"/"float32"，适配器字典要覆盖，
+        # 否则合法 dtype 静默落到 None（fp32）。"fp32" 意图即 fp32（torch_dtype=None）。
+        _DT = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+               "float16": torch.float16, "fp16": torch.float16,
+               "fp32": None, "float32": None, "auto": None}
+        td = _DT.get(str(dtype).lower())
         try:
             self.model = _HF_AutoModelForCausalLM.from_pretrained(
                 path, torch_dtype=td).to(device).eval()
@@ -58,6 +62,9 @@ class HFCausalLM:
         self.d_model = d_model or getattr(self.model.config, "hidden_size", None)
         self.max_len = max_len or getattr(self.model.config,
                                           "max_position_embeddings", 2048)
+        # P1-B（二次审查）：scheduler 用 student.n_layers 构造 worker（CausalToyLM 分支）；
+        # HFCausalLM 之前没有该属性 → model_kind='hf' 构造调度器即 AttributeError。
+        self.n_layers = getattr(self.model.config, "num_hidden_layers", None)
 
     # ---- 内核用接口：forward / response_dists / generate（委托模块级实现）----
     def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -93,10 +100,23 @@ class HFCausalLM:
         return self.model.load_state_dict(*a, **k)
 
     def parameters(self, *a, **k):
-        return self.model.parameters(*a, **k)
+        # P2（二次审查）：HF tie_word_embeddings 时 lm_head.weight 与 embed_tokens.weight
+        # 是同一 Parameter 对象，parameters() 产出两次 → Adam / clip_grad_norm 对绑定权重
+        # 双更新（等效步长 ≈2×，确定性静默语义错误）。按对象 id 去重。
+        seen = set()
+        out = []
+        for p in self.model.parameters(*a, **k):
+            if id(p) not in seen:
+                seen.add(id(p))
+                out.append(p)
+        return out
 
     def named_parameters(self, *a, **k):
-        return self.model.named_parameters(*a, **k)
+        seen = set()
+        for name, p in self.model.named_parameters(*a, **k):
+            if id(p) not in seen:
+                seen.add(id(p))
+                yield name, p
 
     def zero_grad(self, *a, **k):
         self.model.zero_grad(*a, **k)

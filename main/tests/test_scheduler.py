@@ -134,6 +134,77 @@ def test_train_step_dense_fetches_delta_when_none():
         assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"
 
 
+def test_scheduler_worker_hf_branch_uses_factory(monkeypatch):
+    """P1-B（二次审查）：model_kind='hf' 注入 s2cfg 后，worker 走 build_model 而非
+    CausalToyLM（旧版恒走 toy 分支、对无 n_layers 的 HFCausalLM 取 n_layers → AttributeError）。"""
+    import unittest.mock as mock
+    import fullstack_opd_v2.model_factory as MF
+    from fullstack_opd_v2.scheduler import AsyncBatchedScheduler
+
+    fake_worker = mock.Mock()
+    monkeypatch.setattr(MF, "build_model", mock.Mock(return_value=fake_worker))
+
+    # 模拟 HFCausalLM student：故意不设 n_layers，验证 hf 分支不触碰它
+    student = mock.Mock()
+    student.vocab = 24
+    student.d_model = 16
+    student.state_dict.return_value = {}
+    param = torch.nn.Parameter(torch.zeros(4))
+    student.parameters.return_value = [param]         # Adam 需要非空参数列表
+    student.response_dists = mock.Mock(return_value=torch.zeros(2, 4, 24))
+    cache = mock.Mock()
+    cache.mode = "dense"
+    cache.top_k = 0
+    prompts = torch.zeros(6, 4, dtype=torch.long)
+    responses = torch.zeros(6, 5, dtype=torch.long)
+    cfg = _cfg(model_kind="hf", student_path="X")     # 顶层注入后的 s2cfg 形态
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  None, None, None, cfg, "cpu")
+    assert sched.worker is fake_worker
+    MF.build_model.assert_called_once_with(cfg, "cpu", role="student")
+
+
+def test_scheduler_topk_renormalize_wires_through(monkeypatch):
+    """P2（二次审查·测试缺口）：renormalize_topk_support=true 必须经 scheduler 传到
+    pg_loss（renormalize_support=True + 显式 student top-K support 掩码）与
+    low_var_kl_support（renormalize_support=True）——PG 与 KL 同支撑同步开。"""
+    import fullstack_opd_v2.scheduler as SCH
+
+    pg_kwargs = {}
+    kl_kwargs = {}
+    # ⚠️ 必须先保存原实现再 patch——否则 spy 内部 SCH.pg_loss 指向自己 → 无限递归挂起。
+    orig_pg = SCH.pg_loss
+    orig_kl = SCH.low_var_kl_support
+
+    def spy_pg(s_cur, s_old, delta, mask=None, clip_eps=0.2, p_old=None,
+               log_ratio_max=None, renormalize_support=False, support=None):
+        pg_kwargs.update(renormalize_support=renormalize_support, support=support,
+                         has_support=support is not None)
+        # 代理真实实现（不 monkeypatch 掉数学）
+        return orig_pg(s_cur, s_old, delta, mask, clip_eps, p_old,
+                       log_ratio_max, renormalize_support, support)
+    def spy_kl(s_topk_logp, ref_logp_at_support, mask=None, renormalize_support=False):
+        kl_kwargs.update(renormalize_support=renormalize_support)
+        return orig_kl(s_topk_logp, ref_logp_at_support, mask, renormalize_support)
+    # scheduler 在模块顶部 from .losses import pg_loss / low_var_kl_support——
+    # 绑定的是 scheduler 命名空间的引用，patch scheduler 层才生效。
+    monkeypatch.setattr(SCH, "pg_loss", spy_pg)
+    monkeypatch.setattr(SCH, "low_var_kl_support", spy_kl)
+
+    student, cache, prompts, responses, ref_ids, ref_logp, cfg = _setup_topk()
+    cfg["renormalize_topk_support"] = True
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  None, ref_ids, ref_logp, cfg, "cpu")
+    metrics = sched.run(6)
+    assert len(metrics) == 6
+    # PG 收到 renormalize 且带显式 support 掩码；KL 同步收到 renormalize
+    assert pg_kwargs.get("renormalize_support") is True
+    assert pg_kwargs.get("has_support") is True
+    assert kl_kwargs.get("renormalize_support") is True
+    for m in metrics:
+        assert math.isfinite(m["loss"])
+
+
 def test_scheduler_topk_mode_runs_end_to_end():
     """稀疏 topk 训练分支真实端到端跑通（M6）。
 

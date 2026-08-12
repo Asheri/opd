@@ -150,6 +150,20 @@ class TensorTeacherCache:
         out.scatter_(-1, student_topk_ids, matched)
         return out
 
+    # --------------------------- 设备迁移 ---------------------------
+    def to(self, device) -> "TensorTeacherCache":
+        """把缓存全部张量（含可选 fat prompts/responses）搬到 device。
+
+        P1-A（二次审查）：load() 用 map_location="cpu" 把缓存钉在 CPU，load_cache 训练
+        分支若不搬设备，GPU 路径在 KL 锚点 / scheduler 索引处必崩设备不匹配。
+        """
+        for attr in ("delta", "ids", "rl_k", "ref_k", "delta_k",
+                     "ids_sorted", "delta_k_sorted", "prompts", "responses"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                setattr(self, attr, t.to(device))
+        return self
+
     # --------------------------- 持久化 ---------------------------
     def save(self, path: str, prompts: torch.Tensor | None = None,
              responses: torch.Tensor | None = None) -> None:

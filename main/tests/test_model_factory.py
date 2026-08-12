@@ -15,7 +15,7 @@ def _cfg(**over):
     return cfg
 
 
-def _fake_hf_module(vocab=152, hidden=768, maxlen=1024):
+def _fake_hf_module(vocab=152, hidden=768, maxlen=1024, n_layers=28):
     """模拟 transformers HF 模块（config + __call__ 返回 .logits + 训练/权重委托）。
 
     HFCausalLM.__init__ 走 `from_pretrained(...).to(device).eval()` 链式调用，
@@ -25,6 +25,7 @@ def _fake_hf_module(vocab=152, hidden=768, maxlen=1024):
     mod.config.vocab_size = vocab
     mod.config.hidden_size = hidden
     mod.config.max_position_embeddings = maxlen
+    mod.config.num_hidden_layers = n_layers
     mod.training = False
     mod.to = mock.Mock(return_value=mod)
     mod.eval = mock.Mock(return_value=mod)
@@ -34,6 +35,9 @@ def _fake_hf_module(vocab=152, hidden=768, maxlen=1024):
         out.logits = torch.zeros(input_ids.size(0), input_ids.size(1), vocab)
         return out
     mod.side_effect = _call
+    # HFCausalLM.parameters/named_parameters 委托后需可迭代（去重逻辑 for p in ...）
+    mod.parameters = mock.Mock(return_value=[])
+    mod.named_parameters = mock.Mock(return_value=iter([]))
     return mod
 
 
@@ -82,6 +86,7 @@ def test_hf_causal_lm_interface_delegates(monkeypatch):
     _patch_hf_factory(monkeypatch)
     m = HFCausalLM("fake/path", "cpu", dtype="auto")
     assert m.vocab == 152 and m.d_model == 768 and m.max_len == 1024
+    assert m.n_layers == 28      # P1-B：scheduler 用 student.n_layers 构造 worker
     # forward → logits (B,L,V)
     ids = torch.zeros(2, 5, dtype=torch.long)
     assert m(ids).shape == (2, 5, 152)
@@ -95,3 +100,35 @@ def test_hf_causal_lm_interface_delegates(monkeypatch):
     m.train()
     m.eval()
     assert m.training is False
+
+
+def test_hf_parameters_dedupes_tied_embeddings(monkeypatch):
+    """P2（二次审查）：HF tie_word_embeddings 下 parameters() 产出同一对象两次 →
+    Adam/clip 双更新（≈2× 步长）。HFCausalLM.parameters 必须按对象 id 去重。"""
+    import fullstack_opd_v2.model_factory as MF
+    p = torch.nn.Parameter(torch.zeros(4))
+    mod = mock.Mock()
+    mod.config.vocab_size = 152
+    mod.config.hidden_size = 8
+    mod.config.max_position_embeddings = 64
+    mod.config.num_hidden_layers = 2
+    mod.training = False
+    mod.to = mock.Mock(return_value=mod)
+    mod.eval = mock.Mock(return_value=mod)
+    mod.parameters.return_value = iter([p, p])       # tied：同一对象两次
+    mod.side_effect = lambda ids: mock.Mock(logits=torch.zeros(ids.size(0), ids.size(1), 152))
+    factory = mock.Mock()
+    factory.from_pretrained.return_value = mod
+    monkeypatch.setattr(MF, "_HF_AutoModelForCausalLM", factory)
+    m = HFCausalLM("fake", "cpu")
+    params = list(m.parameters())
+    assert len(params) == 1 and params[0] is p
+
+
+def test_hf_dtype_bfloat16_not_silently_fp32(monkeypatch):
+    """P3（二次审查）：config Literal 允许 'bfloat16'，适配器字典必须覆盖，否则静默 fp32。"""
+    import fullstack_opd_v2.model_factory as MF
+    factory, _ = _patch_hf_factory(monkeypatch)
+    HFCausalLM("fake", "cpu", dtype="bfloat16")
+    factory.from_pretrained.assert_called_once_with(
+        "fake", torch_dtype=torch.bfloat16)

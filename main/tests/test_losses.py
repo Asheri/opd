@@ -129,6 +129,35 @@ def test_pg_loss_renormalize_dense_noop():
     assert torch.allclose(plain, renorm, atol=1e-6)
 
 
+def test_pg_loss_renormalize_over_explicit_support():
+    """P2-G（二次审查）：显式 support 掩码（完整 student top-K）覆盖 delta!=0（交集）。
+
+    delta 只在 student∩teacher 交集有值；显式 support = 更宽的 student top-K 时，
+    归一化分母用显式支撑（与 low_var_kl_support 同源），未覆盖 token Δ=0 贡献 0、
+    但计入分母。验证 support 参数优先于 delta!=0。
+    """
+    B, T, V, Ks = 3, 5, 32, 8
+    s = _logp(B, T, V, seed=30)
+    delta = torch.zeros(B, T, V)
+    # 交集：仅少量 token 有 Δ
+    g = torch.Generator().manual_seed(31)
+    inter = torch.randperm(V, generator=g)[None, None, :3].expand(B, T, 3)
+    delta.scatter_(-1, inter, torch.randn(B, T, 3, generator=g) * 0.5)
+    # 显式支撑 = 更宽的 student top-K
+    topk_ids = s.topk(Ks, dim=-1).indices          # (B,T,Ks) ⊇ inter
+    support = torch.zeros(B, T, V, dtype=torch.bool)
+    support.scatter_(-1, topk_ids, True)
+
+    p = s.exp()
+    z_exp = (p * support).sum(-1, keepdim=True) + 1e-8
+    manual = -((p * support / z_exp) * delta).sum(-1).mean()
+    loss = pg_loss(s, s, delta, renormalize_support=True, support=support)
+    assert torch.allclose(loss, manual, atol=1e-6)
+    # 与交集（delta!=0）归一结果不同（分母更宽 → 每 token 权重更小 → 损失更小）
+    loss_inter = pg_loss(s, s, delta, renormalize_support=True)
+    assert not torch.allclose(loss, loss_inter, atol=1e-6)
+
+
 def test_low_var_kl_support_renormalized():
     """稀疏 KL 归一版：π_cur 在 top-K 上重归一 → 条件 KL 期望，≥ 非归一版（k3≥0、Z<1）。"""
     V, K = 64, 8

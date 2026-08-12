@@ -248,6 +248,14 @@ class FullStackOPDv2:
     def __init__(self, cfg: dict | None = None, device: str = "cpu"):
         self.cfg = {**DEFAULT_CONFIG_V2, **(cfg or {})}
         self.device = device
+        # P2（二次审查）：hf 真实模型 + toy 随机数据 = 在噪声上静默训练（toy 随机 id 0-63
+        # 在真实词表 ~152k 里是合法 token，不报错但无意义）。显式拦，要求真实数据。
+        if self.cfg.get("model_kind") == "hf":
+            ds = self.cfg.get("dataset") or {}
+            if ds.get("type", "toy") == "toy":
+                raise DataError(
+                    "model_kind='hf' 需要真实数据（dataset.type='jsonl' + dataset.path）；"
+                    "toy 随机数据（vocab 0-63）与真实词表模型训练无意义")
         # 可插拔数据加载（data.py）：toy 默认，与旧 _make_toy_data 同源
         self.prompts, self.responses, self.reward_fn = build_data_loader(
             self.cfg, self.device).load()
@@ -353,6 +361,19 @@ class FullStackOPDv2:
             logger.info(f"[Stage 0/1] 跳过：载入预建缓存 {cache_path}")
             t = time.perf_counter()
             cache = TensorTeacherCache.load(cache_path)
+            # P1-A（二次审查）：load() 用 map_location="cpu" 把缓存钉在 CPU——GPU 训练
+            # 路径若不管搬设备，KL 锚点（CUDA 模型吃 CPU 输入）与 scheduler 索引
+            # （CUDA idxs 索引 CPU 张量）必崩。build 路径的 fat_* 本就 device 张量，
+            # 只有 load 路径需要显式搬（对称 resume 分支对 ref 张量的 .to(self.device)）。
+            cache.to(self.device)
+            # P3（二次审查）：load_cache 跳过 build，teacher 一致性校验（TensorTeacherCache
+            # .build 开头）不再触发——此处补词表一致性把关：缓存词表 ≠ 当前模型词表时，
+            # dense 路径 shape 崩溃、稀疏路径 scatter 越界/静默错位。
+            sv = getattr(student, "vocab", None)
+            if cache.vocab and sv and cache.vocab != sv:
+                raise DataError(
+                    f"预建缓存词表 {cache.vocab} 与当前模型词表 {sv} 不匹配；"
+                    "缓存与模型必须同词表（teacher 一致性语义）")
             fat_prompts, fat_responses = cache.prompts, cache.responses
             if fat_prompts is None or fat_responses is None:
                 raise DataError(
@@ -375,6 +396,13 @@ class FullStackOPDv2:
                 self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
                 warmup_student=warmup_student)
             timings["stage1_cache"] = time.perf_counter() - t
+
+        # P2（二次审查）：教师对与 warmup_student 在 Stage 1 后不再需要。HF 路径下它们是
+        # 独立加载的完整模型（2×teacher 1.5B + 1×student 副本，7B 档 ≈21GB），不释放会
+        # 让 Stage 2 训练白白多驻留（GPU 打包预算里没有这笔）。返回 dict 的 teacher 字段
+        # 无任何消费方（_cmd_train 只读 metrics/timings/run_dir），置 None 即可。
+        del teacher_rl, teacher_ref, warmup_student
+        teacher_rl = teacher_ref = None
 
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
         initial_version = 0
@@ -430,6 +458,12 @@ class FullStackOPDv2:
         # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage2"] 天然含
         # dtype/offload_to_cpu/top_k_student；这里直接取用。
         s2cfg = dict(self.cfg["stage2"])
+        # P1-B（二次审查）：model_kind / student_path 是顶层键（不在 stage2、不下渗），
+        # 但 scheduler 要用它决定 worker 的构造方式（hf → HFCausalLM 副本；toy →
+        # CausalToyLM 副本）。若不注入，scheduler 从 s2cfg 读 model_kind 恒为 None →
+        # 恒走 CausalToyLM 分支 → 对 HFCausalLM student 取 n_layers 即 AttributeError。
+        s2cfg["model_kind"] = self.cfg.get("model_kind", "toy")
+        s2cfg["student_path"] = self.cfg.get("student_path")
 
         # ---- C1：on_step checkpoint/metrics 异步落盘（不阻塞训练线程）----
         # 训练线程只把每步结果放入有界队列；后台 daemon 消费线程串行执行

@@ -251,6 +251,56 @@ def test_train_loads_prebuilt_cache(tmp_path):
     assert os.path.isfile(os.path.join(str(tmp_path), "r", "metrics.csv"))
 
 
+def test_train_loads_prebuilt_cache_moves_to_device(tmp_path, monkeypatch):
+    """P1-A（二次审查）：load_cache 分支必须把载入缓存搬到 self.device（GPU 路径防设备不匹配）。
+
+    cache.load 用 map_location="cpu"；build 路径的 fat_* 是 device 张量，只有 load 路径
+    需要显式 .to(device)。spy TensorTeacherCache.to 断言 load 分支确实调用（CPU 本地只
+    验证调用发生与 device 参数正确，GPU 上的实际迁移由此保证）。
+    """
+    import os
+    import fullstack_opd_v2.pipeline as PL
+    from fullstack_opd_v2.model import CausalToyLM
+    from fullstack_opd_v2.pipeline import FullStackOPDv2, stage1_build_cache
+
+    cache_path = os.path.join(str(tmp_path), "prebuilt.pt")
+    cfg = _cfg(tmp_path)
+    opd = FullStackOPDv2(cfg, device="cpu")
+    tr, tref = opd._stage0_teachers()
+    s1 = dict(cfg["stage1"])
+    s1["cache_path"] = cache_path
+    stage1_build_cache(opd.prompts, opd.responses, tr, tref, s1,
+                       warmup_student=CausalToyLM(
+                           vocab=DEFAULT_CONFIG_V2["vocab_size"],
+                           d_model=DEFAULT_CONFIG_V2["d_model"],
+                           n_layers=DEFAULT_CONFIG_V2["n_layers"]))
+
+    called = []
+    orig_to = PL.TensorTeacherCache.to
+    def spy_to(self, device):
+        called.append(device)
+        return orig_to(self, device)
+    monkeypatch.setattr(PL.TensorTeacherCache, "to", spy_to)
+
+    cfg2 = _cfg(tmp_path)
+    cfg2["stage1"]["cache_path"] = cache_path
+    cfg2["stage1"]["load_cache"] = True
+    cfg2["stage2"]["n_steps"] = 3
+    cfg2["run"] = {"run_dir": os.path.join(str(tmp_path), "r2"), "checkpoint_every": 2}
+    FullStackOPDv2(cfg2, device="cpu").run()
+    assert called, "load_cache 分支必须调用 cache.to(self.device)（P1-A 回归）"
+
+
+def test_hf_with_toy_data_raises():
+    """P2（二次审查）：model_kind=hf + 默认 toy 随机数据 → DataError（拒绝在噪声上训练）。"""
+    from fullstack_opd_v2.pipeline import FullStackOPDv2
+    cfg = _cfg(type("T", (), {"__truediv__": lambda self, o: str(o)})())
+    cfg["model_kind"] = "hf"
+    cfg["student_path"] = "S"
+    with pytest.raises(DataError):
+        FullStackOPDv2(cfg, device="cpu")
+
+
 def test_train_load_cache_old_format_raises(tmp_path):
     """模块2：load_cache=true 但缓存缺 fat 上下文（旧格式）→ 显式 DataError（不静默错训）。"""
     import os
@@ -297,7 +347,10 @@ def test_stage0_teachers_hf_skips_rl(tmp_path, monkeypatch):
     cfg["model_kind"] = "hf"
     cfg["teacher_rl_path"] = "RL_PATH"
     cfg["teacher_ref_path"] = "REF_PATH"
-    opd = FullStackOPDv2(cfg, device="cpu")
+    # __init__ 有 hf+toy 数据守卫（P2-F），此处只测 _stage0_teachers → object.__new__ 绕过
+    opd = object.__new__(FullStackOPDv2)
+    opd.cfg = {**DEFAULT_CONFIG_V2, **cfg}
+    opd.device = "cpu"
     teacher_rl, teacher_ref = opd._stage0_teachers()
     assert teacher_rl.path == "RL_PATH"
     assert teacher_ref.path == "REF_PATH"
@@ -311,8 +364,11 @@ def test_stage0_teachers_hf_missing_ref_raises():
     cfg["model_kind"] = "hf"
     cfg["teacher_rl_path"] = "RL"
     cfg["teacher_ref_path"] = None
+    opd = object.__new__(FullStackOPDv2)
+    opd.cfg = {**DEFAULT_CONFIG_V2, **cfg}
+    opd.device = "cpu"
     with pytest.raises(ModelError):
-        FullStackOPDv2(cfg, device="cpu")._stage0_teachers()
+        opd._stage0_teachers()
 
 
 def test_resume_warmup_uses_fresh_initial_student(tmp_path, monkeypatch):

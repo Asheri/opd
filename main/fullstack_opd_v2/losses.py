@@ -16,7 +16,8 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
             mask: torch.Tensor | None = None, clip_eps: float = 0.2,
             p_old: torch.Tensor | None = None,
             log_ratio_max: float | None = None,
-            renormalize_support: bool = False) -> torch.Tensor:
+            renormalize_support: bool = False,
+            support: torch.Tensor | None = None) -> torch.Tensor:
     """Direct-OPD 的 PG 损失 + AsyncOPD 陈旧截断（批量版）。
 
     s_cur / s_old: (B, T, V) log-softmax（cur 带梯度，old 为 rollout 时刻快照）
@@ -29,12 +30,18 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
                    与 p_old=exp(-30) 抵消后残留符号相关伪梯度（负 delta 有值、正 delta 为 0）。
                    默认 None 走原路径，正常输入下逐位不变（正常 s_old 最小值 ≈ -ln V > -log_ratio_max）。
     renormalize_support: 稀疏支撑重归一化（对齐原始 Direct-OPD）。稀疏缓存下 delta 只在
-                   student top-K 支撑上有值（其余=0），此时把 π_old 在该支撑上重归一
+                   student top-K 支撑上有值（其余=0），此时把 π_old 在支撑上重归一
                    （除以其支撑内概率和 Z），使 pg = −E_{π_old^renorm}[min(ratio·Δ, clip·Δ)]
                    成为**条件期望**——否则 top-K 尾部质量被直接丢弃、E_{π_old}[·] 系统性
                    低估 Z 倍（原始 Direct-OPD 用 softmax(student_topk_logp) 做同一件事）。
-                   支撑判定 = `delta != 0`（稀疏展开的支撑外恒为 0；支撑内 delta 恰为 0 的
-                   几率在连续 logp 下可忽略）。dense 模式（demo 默认）无 top-K，不应开。
+                   dense 模式（demo 默认）无 top-K，不应开。
+    support:    (B,T,V) 布尔支撑掩码（显式传入，P2-G 二次审查）。默认 None 时用
+                   `delta != 0` 判定——但那是 student∩teacher top-K **交集**（delta_for_
+                   student_topk 只给交集置真 Δ）；而 low_var_kl_support 在**完整 student
+                   top-K** 上归一。两者分母不同 → PG 被交集质量放大、与 KL 的 λ_kl 权衡
+                   漂移。调用方（scheduler 稀疏路径）应显式传 student top-K 掩码，使 PG
+                   与 KL 在【同一支撑】上重归一（对齐原始：delta 定义在完整 student
+                   top-K 上）。未覆盖 token 的 Δ=0 贡献 0、但计入分母——与 KL 一致。
     """
     logr = s_cur - s_old
     ratio = logr.exp()                                         # (B, T, V)
@@ -49,9 +56,12 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
     else:
         p = s_old.exp()                                        # π_old, (B, T, V)
     if renormalize_support:
-        # 稀疏支撑重归一：π_old 限定在 delta≠0 支撑上并除以支撑内概率和（条件期望）。
-        # 支撑判定用 delta（常量、无梯度），p 保持 detach 语义（p_old 本就 detach）。
-        support = (delta != 0)
+        # 稀疏支撑重归一：π_old 限定在支撑上并除以支撑内概率和（条件期望）。
+        # 支撑 = 显式传入的 student top-K 掩码（P2-G，与 KL 同源）；未传则回退
+        # delta!=0（student∩teacher 交集——旧行为，保留供单测/向后兼容）。
+        # 支撑判定用常量张量（delta 无梯度、support 无梯度），p 保持 detach 语义。
+        if support is None:
+            support = (delta != 0)
         p = p * support
         z = p.sum(-1, keepdim=True) + 1e-8
         p = p / z

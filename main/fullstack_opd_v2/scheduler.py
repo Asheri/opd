@@ -150,12 +150,16 @@ class AsyncBatchedScheduler:
         if self.rollout_engine is None:
             # 旧快照前向模型：toy → CausalToyLM 副本；hf → 同 student 路径再加载一份
             # HFCausalLM（权重随后经 weight_store 快照覆盖）。⚠️ hf 骨架：需 GPU 验证。
+            # P1-B：model_kind 由 pipeline 从顶层注入 s2cfg；student_path 同理（hf 时
+            # build_model 按 role=student 读它）。n_layers 用 getattr 防御（非 toy student
+            # 可能无该属性，避免 CausalToyLM 分支构造崩溃）。
             if cfg.get("model_kind") == "hf":
                 from .model_factory import build_model as _build_model
                 self.worker = _build_model(cfg, device, role="student")
             else:
                 self.worker = CausalToyLM(vocab=student.vocab, d_model=student.d_model,
-                                          n_layers=student.n_layers).to(device)
+                                          n_layers=getattr(student, "n_layers",
+                                                           cfg.get("n_layers", 2))).to(device)
         else:
             self.worker = None
         self._loaded_ver = -1
@@ -285,9 +289,18 @@ class AsyncBatchedScheduler:
                 s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
                 delta_d = self.cache.delta_for_student_topk(
                     idxs_dev, s_topk.indices)                   # (B,T,V) 支撑外=0
+                # P2-G（二次审查）：renormalize 时把【完整 student top-K】掩码显式传给
+                # pg_loss，与 low_var_kl_support 的支撑（也是完整 student top-K）一致——
+                # 否则 pg 用 delta!=0（student∩teacher 交集）归一、KL 用完整 top-K 归一，
+                # 分母不同 → λ_kl 权衡漂移。未覆盖 token 的 Δ=0 贡献 0、但计入分母。
+                pg_support = None
+                if self.renormalize_topk:
+                    pg_support = torch.zeros_like(delta_d, dtype=torch.bool)
+                    pg_support.scatter_(-1, s_topk.indices, True)
                 loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
                                   log_ratio_max=LOG_RATIO_MAX,
-                                  renormalize_support=self.renormalize_topk)
+                                  renormalize_support=self.renormalize_topk,
+                                  support=pg_support)
                 # 稀疏 KL 锚点
                 if self.kl_mode == "topk":
                     ref_at = self._ref_logp_at_student_topk(
