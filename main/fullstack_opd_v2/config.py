@@ -38,6 +38,9 @@ class Stage1Cfg(_Strict):
     enforce_teacher_consistency: bool = True
     cache_path: str = "fullstack_opd_cache_v2.pt"
     build_batch_size: int = 16
+    # 模块2：true 且 cache_path 文件存在 → 训练载入预建缓存、跳过 Stage 0/1（多学生复用）。
+    # 默认 false 走原重建路径（Stage 0 教师 RL + Stage 1 离线 build）。
+    load_cache: bool = False
     warmup_M: int = 4                    # L1 默认（与 DEFAULT_CONFIG_V2 对齐，避免 schema 默认吞掉翻转）
     warmup_source: Literal["none", "student_init", "teacher_perturbed", "mix"] = "student_init"
     warmup_temperature: float = 1.0

@@ -151,18 +151,27 @@ class TensorTeacherCache:
         return out
 
     # --------------------------- 持久化 ---------------------------
-    def save(self, path: str) -> None:
+    def save(self, path: str, prompts: torch.Tensor | None = None,
+             responses: torch.Tensor | None = None) -> None:
+        """落盘缓存（可选携带 fat prompts/responses，供训练 load 后直接索引）。
+
+        多学生并发（GPU_MEMORY_AND_PARALLEL_PLAN §7）：`opd cache` 预建后，
+        `opd train --set stage1.load_cache=true` 载入并【跳过 Stage 0/1】。
+        训练需要 (fat) prompts/responses 索引上下文与算 KL 锚点，故 save 时把它们
+        一并落盘；旧缓存（无 prompts/responses）load 后为 None，训练载入会显式报错。
+        """
+        payload = {"mode": self.mode, "vocab": self.vocab, "enforce": self.enforce}
         if self.mode == "dense":
-            torch.save({"mode": "dense", "vocab": self.vocab,
-                        "delta": self.delta, "enforce": self.enforce}, path)
+            payload["delta"] = self.delta
         else:
-            # 稀疏张量极小，可直接 torch.save；生产环境改用 mmap 跨进程共享（见方案 L4/L6）
-            torch.save({"mode": "topk", "vocab": self.vocab, "top_k": self.top_k,
-                        "ids": self.ids, "rl_k": self.rl_k,
-                        "ref_k": self.ref_k, "delta_k": self.delta_k,
-                        "ids_sorted": self.ids_sorted,
-                        "delta_k_sorted": self.delta_k_sorted,
-                        "enforce": self.enforce}, path)
+            payload.update({"top_k": self.top_k, "ids": self.ids, "rl_k": self.rl_k,
+                            "ref_k": self.ref_k, "delta_k": self.delta_k,
+                            "ids_sorted": self.ids_sorted,
+                            "delta_k_sorted": self.delta_k_sorted})
+        if prompts is not None or responses is not None:
+            payload["prompts"] = prompts
+            payload["responses"] = responses
+        torch.save(payload, path)
 
     @classmethod
     def load(cls, path: str) -> "TensorTeacherCache":
@@ -182,4 +191,7 @@ class TensorTeacherCache:
             obj = cls(enforce_consistency=ck["enforce"], top_k=0)
             obj.vocab = ck["vocab"]
             obj.delta = ck["delta"]          # rl/ref 不再落盘（只留 delta）
+        # 可选 fat 上下文（多学生 load_cache 路径用；旧缓存可能为 None）
+        obj.prompts = ck.get("prompts")
+        obj.responses = ck.get("responses")
         return obj

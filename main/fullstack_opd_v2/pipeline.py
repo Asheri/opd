@@ -65,6 +65,7 @@ DEFAULT_CONFIG_V2 = {
         "enforce_teacher_consistency": True,
         "cache_path": "fullstack_opd_cache_v2.pt",
         "build_batch_size": 16,
+        "load_cache": False,      # 模块2：true → 载入预建缓存跳过 Stage 0/1（多学生复用）
         # ---- L1 离线 rollout 暖缓存（缓解曝光偏差）----
         "warmup_M": 4,            # L1 默认：学生 ref 一次性 rollout 拼「胖 D」N×(1+M)（消曝光偏差）
         "warmup_source": "student_init",  # none | student_init | teacher_perturbed | mix
@@ -231,7 +232,10 @@ def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
 
     cache.build(fat_prompts, fat_responses, teacher_rl, teacher_ref,
                 cfg.get("build_batch_size", 16))
-    cache.save(cfg.get("cache_path", "fullstack_opd_cache_v2.pt"))
+    # 把 fat prompts/responses 一并落盘（模块2：`opd train --set stage1.load_cache=true`
+    # 载入后跳过 Stage 0/1，训练直接索引 fat 上下文 + 算 KL 锚点）。
+    cache.save(cfg.get("cache_path", "fullstack_opd_cache_v2.pt"),
+               prompts=fat_prompts, responses=fat_responses)
     return cache, fat_prompts, fat_responses
 
 
@@ -306,10 +310,13 @@ class FullStackOPDv2:
         n_layers = self.cfg["n_layers"]
         timings: dict = {}
 
-        logger.info("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
-        t = time.perf_counter()
-        teacher_rl, teacher_ref = self._stage0_teachers()
-        timings["stage0_rl"] = time.perf_counter() - t
+        # 模块2：多学生复用的「载入预建缓存」分支——`opd cache` 预建后（含 fat 上下文），
+        # 训练跳过 Stage 0/1（教师 RL + cache build），直接载入。默认 load_cache=false
+        # 走原重建路径。共享的只有教师权重；默认 student_init 下每学生缓存各建（§7.0）。
+        s1cfg = dict(self.cfg["stage1"])
+        cache_path = s1cfg.get("cache_path")
+        use_prebuilt = (bool(s1cfg.get("load_cache", False))
+                        and cache_path and os.path.isfile(cache_path))
 
         # L1：把 student 提前创建，使「离线 warmup 采样」与「Stage 2 KL 锚点」共享同一份
         # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
@@ -317,8 +324,38 @@ class FullStackOPDv2:
         # P1-4：warmup 专用独立初始 student——resume 会把断点权重 load 进 student，
         # 若 warmup 复用 student 则采样分布变成「续跑后的学生」，与 KL 锚点（初始
         # 分布，resume 从断点 ref 恢复）不同源，曝光偏差不变式被打破。此实例永不
-        # 被 load_state_dict 覆盖，始终代表初始分布。
-        warmup_student = build_model(self.cfg, self.device, role="student")
+        # 被 load_state_dict 覆盖，始终代表初始分布。载入预建缓存时不需要 warmup
+        # （缓存已含胖 D），不建以免 HF 路径重复加载大模型。
+        warmup_student = (build_model(self.cfg, self.device, role="student")
+                          if not use_prebuilt else None)
+
+        teacher_rl = teacher_ref = None
+        if use_prebuilt:
+            logger.info(f"[Stage 0/1] 跳过：载入预建缓存 {cache_path}")
+            t = time.perf_counter()
+            cache = TensorTeacherCache.load(cache_path)
+            fat_prompts, fat_responses = cache.prompts, cache.responses
+            if fat_prompts is None or fat_responses is None:
+                raise DataError(
+                    f"预建缓存 {cache_path} 未含 fat prompts/responses（旧格式）；"
+                    "请用新版 `opd cache` 子命令重建（stage1_build_cache 已把 fat 上下文落盘）")
+            timings["stage0_rl"] = 0.0
+            timings["stage1_cache"] = time.perf_counter() - t
+        else:
+            logger.info("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
+            t = time.perf_counter()
+            teacher_rl, teacher_ref = self._stage0_teachers()
+            timings["stage0_rl"] = time.perf_counter() - t
+
+            logger.info("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
+            t = time.perf_counter()
+            # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage1"] 天然含
+            # cache_mode/top_k_teacher（顶层 CLOUD_CONFIG 风格也生效）；这里直接取用。
+            # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
+            cache, fat_prompts, fat_responses = stage1_build_cache(
+                self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
+                warmup_student=warmup_student)
+            timings["stage1_cache"] = time.perf_counter() - t
 
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
         initial_version = 0
@@ -328,17 +365,6 @@ class FullStackOPDv2:
             initial_version = int(resume.get("version", 0))
             resume_ref = resume.get("ref")       # A3/D4：断点内 KL 锚点（旧断点可能为 None）
             logger.info(f"resume: 已加载断点学生权重，从 version={initial_version} 续跑")
-
-        logger.info("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
-        t = time.perf_counter()
-        # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage1"] 天然含
-        # cache_mode/top_k_teacher（顶层 CLOUD_CONFIG 风格也生效）；这里直接取用。
-        s1cfg = dict(self.cfg["stage1"])
-        # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
-        cache, fat_prompts, fat_responses = stage1_build_cache(
-            self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
-            warmup_student=warmup_student)
-        timings["stage1_cache"] = time.perf_counter() - t
 
         logger.info("[Stage 2] Direct-OPD 训练跑在 AsyncOPD 批量调度器上")
         t = time.perf_counter()

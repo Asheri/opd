@@ -108,6 +108,22 @@ def test_save_load_roundtrip_topk(tmp_path):
     assert torch.equal(loaded.delta_k_sorted, cache.delta_k_sorted)
 
 
+def test_save_load_with_fat_context(tmp_path):
+    """模块2：save 携带 fat prompts/responses → load 后可直接索引（多学生 load_cache 路径）。"""
+    prompts, responses, rl, ref = _make()
+    cache = TensorTeacherCache(True, 0).build(prompts, responses, rl, ref)
+    p = tmp_path / "c.pt"
+    cache.save(str(p), prompts=prompts, responses=responses)
+    loaded = TensorTeacherCache.load(str(p))
+    assert torch.equal(loaded.prompts, prompts)
+    assert torch.equal(loaded.responses, responses)
+    # 旧格式（不传 fat）向后兼容：load 后为 None
+    p2 = tmp_path / "old.pt"
+    TensorTeacherCache(True, 0).build(prompts, responses, rl, ref).save(str(p2))
+    loaded2 = TensorTeacherCache.load(str(p2))
+    assert loaded2.prompts is None and loaded2.responses is None
+
+
 def test_teacher_consistency_raises_on_mismatch():
     prompts, responses, rl, ref = _make(V=24)
     bad_ref = CausalToyLM(vocab=99, d_model=16, n_layers=1)   # 词表不一致

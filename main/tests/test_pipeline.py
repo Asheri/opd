@@ -205,6 +205,77 @@ def test_resume_keeps_kl_anchor_invariant():
         assert torch.allclose(ck2["ref"]["ref_dists"], ck["ref"]["ref_dists"])
 
 
+def test_train_loads_prebuilt_cache(tmp_path):
+    """模块2：load_cache=true 时训练跳过 Stage 0/1，载入预建缓存（fat 上下文 + Δ_T）训练。
+
+    多学生并发（GPU_MEMORY_AND_PARALLEL_PLAN §7）的复用机制：`opd cache` 预建一次，
+    多个 train 各自 load_cache=true 载入、跳过教师 RL 与 cache build。
+    """
+    import os
+    import torch
+    from fullstack_opd_v2.cache import TensorTeacherCache
+    from fullstack_opd_v2.model import CausalToyLM
+    from fullstack_opd_v2.pipeline import FullStackOPDv2, stage1_build_cache
+
+    cache_path = os.path.join(str(tmp_path), "prebuilt.pt")
+    # 1) 预建缓存（默认 L1 student_init，含 fat 上下文）
+    cfg = _cfg(tmp_path)
+    opd = FullStackOPDv2(cfg, device="cpu")
+    teacher_rl, teacher_ref = opd._stage0_teachers()
+    warmup_student = CausalToyLM(vocab=DEFAULT_CONFIG_V2["vocab_size"],
+                                 d_model=DEFAULT_CONFIG_V2["d_model"],
+                                 n_layers=DEFAULT_CONFIG_V2["n_layers"])
+    s1 = dict(cfg["stage1"])
+    s1["cache_path"] = cache_path
+    cache0, _, _ = stage1_build_cache(
+        opd.prompts, opd.responses, teacher_rl, teacher_ref, s1,
+        warmup_student=warmup_student)
+    n0 = cache0.delta.shape[0]
+
+    # 2) load_cache=true 训练：_stage0_teachers 不应被调用（跳过 Stage 0）
+    cfg2 = _cfg(tmp_path)
+    cfg2["stage1"]["cache_path"] = cache_path
+    cfg2["stage1"]["load_cache"] = True
+    cfg2["stage2"]["n_steps"] = 6
+    cfg2["run"] = {"run_dir": os.path.join(str(tmp_path), "r"), "checkpoint_every": 3}
+    opd2 = FullStackOPDv2(cfg2, device="cpu")
+    opd2._stage0_teachers = lambda: (_ for _ in ()).throw(
+        AssertionError("load_cache 路径不应调用 _stage0_teachers"))
+    out = opd2.run()
+
+    # 载入的缓存与原一致（fat N 相同、delta 逐位一致）；Stage 0/1 计时为 0/载入耗时
+    assert torch.equal(out["cache"].delta, cache0.delta)
+    assert out["cache"].delta.shape[0] == n0
+    assert out["timings"]["stage0_rl"] == 0.0
+    assert len(out["metrics"]) == 6
+    assert os.path.isfile(os.path.join(str(tmp_path), "r", "metrics.csv"))
+
+
+def test_train_load_cache_old_format_raises(tmp_path):
+    """模块2：load_cache=true 但缓存缺 fat 上下文（旧格式）→ 显式 DataError（不静默错训）。"""
+    import os
+    import torch
+    from fullstack_opd_v2.cache import TensorTeacherCache
+    from fullstack_opd_v2.pipeline import FullStackOPDv2
+    from fullstack_opd_v2.model import CausalToyLM
+    from fullstack_opd_v2.exceptions import DataError
+
+    cache_path = os.path.join(str(tmp_path), "old.pt")
+    N, P, T, V = 6, 4, 5, 24
+    prompts = torch.randint(0, V, (N, P))
+    responses = torch.randint(0, V, (N, T))
+    rl = CausalToyLM(vocab=V, d_model=16, n_layers=1)
+    ref = CausalToyLM(vocab=V, d_model=16, n_layers=1)
+    # 旧格式：build 后 save 不传 fat 上下文
+    TensorTeacherCache(True, 0).build(prompts, responses, rl, ref).save(cache_path)
+
+    cfg = _cfg(tmp_path)
+    cfg["stage1"]["cache_path"] = cache_path
+    cfg["stage1"]["load_cache"] = True
+    with pytest.raises(DataError):
+        FullStackOPDv2(cfg, device="cpu").run()
+
+
 def test_resume_warmup_uses_fresh_initial_student(tmp_path, monkeypatch):
     """P1-4：resume 时 warmup_student 是独立初始 student（非续跑学生权重）。
 
