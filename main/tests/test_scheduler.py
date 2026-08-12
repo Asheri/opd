@@ -303,11 +303,13 @@ def test_scheduler_cross_vocab_student_topk_train():
     # student：vocab=32，但数据 token 只在 [0,20)（teacher 词表内），prompt/response 复用
     student = CausalToyLM(vocab=Vs, d_model=16, n_layers=1)
     with torch.no_grad():
-        ref_dists = response_dists(student, prompts, responses)
+        full = response_dists(student, prompts, responses)   # (N,T,32) student 前向
+    # ref 锚点 = 初始 student 分布的 top-K（与 teacher 词表无关，scheduler 只用其值）
+    ref_ids, ref_logp = full.topk(K, dim=-1).indices, full.topk(K, dim=-1).values
     # student 前向得到 (B,T,32)，top-K 里可能有 ≥20 的 id（低概率垃圾 token 也可能进 top-K）
     cfg = _cfg(cache_mode="topk", top_k_student=K, ref_topk=K, n_steps=6, batch_size=4)
     sched = AsyncBatchedScheduler(student, cache, prompts, responses,
-                                  None, None, None, cfg, "cpu")
+                                  None, ref_ids, ref_logp, cfg, "cpu")
     metrics = sched.run(6)
     assert len(metrics) == 6
     for m in metrics:
