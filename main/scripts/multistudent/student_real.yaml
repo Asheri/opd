@@ -1,0 +1,44 @@
+# 多学生并发 · 真实 HF 训练基准（每学生一份，脚本按 students.env 用 --set 覆盖）
+# 见 GPU_MEMORY_AND_PARALLEL_PLAN.md §7：7B→cuda:0（8-bit-Adam 76GB）、4B+1.7B→cuda:1。
+# ⚠️ 需要 GPU + 真实模型（本地无法实测）；路径以服务器实际下载为准（--set 覆盖）。
+
+model_kind: hf              # hf 骨架：student_path / teacher_rl_path / teacher_ref_path 由脚本 --set
+dtype: bf16
+cache_mode: topk            # 真实词表 V≈152k：dense (N,T,V) 存不下
+top_k_teacher: 64
+top_k_student: 64
+ref_topk: 64
+offload_to_cpu: true
+
+stage0:
+  n_rl_steps: 20
+
+stage1:
+  cache_path: /shared/opd_multistudent/cache.pt   # 脚本 --set 覆盖（每学生一份）
+  load_cache: false          # 建缓存阶段 false；训练阶段脚本置 true（跳过 Stage 0/1）
+  build_batch_size: 16
+  warmup_M: 4
+  warmup_source: student_init   # 每学生缓存各建（§7.0：student_init 下 Δ_T 缓存不共享）
+  warmup_temperature: 1.0
+
+stage2:
+  distributed: false         # 多学生每进程一线程版调度器 + 单 --device（§7.2）
+  tp_size: 1
+  rollout_engine: toy        # scorer 用朴素前向（单卡），不用 vLLM TP=2（colocated 冲突）
+  renormalize_topk_support: true   # 稀疏支撑重归一化（对齐原始 Direct-OPD）
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 0.05
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 1.0e-3
+  n_steps: 1000              # 脚本按档覆盖
+  batch_size: 8              # 脚本按档覆盖（7B=8，4B/1.7B=16）
+
+run:
+  checkpoint_every: 50       # 训练期评估 watcher 以此为 checkpoint 节奏
+
+eval:
+  model_path: Qwen/Qwen3-R1-Distill-7B   # 脚本 --set 覆盖（eval-aime --run-dir 桥接读它）
+  n_samples: 1
+  temperature: 0.0
