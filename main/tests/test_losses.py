@@ -88,6 +88,67 @@ def test_low_var_kl_support_leq_true_kl():
     assert sparse >= 0  # k3 ≥ 0，支撑内仍非负
 
 
+def test_pg_loss_renormalize_support_conditional_expectation():
+    """稀疏支撑重归一化（对齐原始 Direct-OPD）：π_old 在 Δ≠0 支撑上重归一 → 条件期望。
+
+    非归一版 = Σ_{v∈支撑} π_old(v)·Δ(v)（尾部质量被丢，低估 Z 倍）；
+    归一版   = Σ_{v∈支撑} (π_old(v)/Z)·Δ(v) = E_{π_old^renorm}[Δ]，ratio=1 时逐位 =
+    非归一版 / 该位置支撑内 π_old 和 Z_t。
+    """
+    B, T, V = 3, 5, 32
+    s = _logp(B, T, V, seed=20)
+    delta = torch.zeros(B, T, V)
+    # 稀疏支撑：每个 (b,t) 随机 8 个位置有 Δ（模拟 student top-K 支撑）
+    g = torch.Generator().manual_seed(21)
+    ids = torch.randperm(V, generator=g)[None, None, :8].expand(B, T, 8)
+    delta.scatter_(-1, ids, torch.randn(B, T, 8, generator=g) * 0.5)
+
+    loss_plain = pg_loss(s, s, delta)                              # 非归一（ratio=1）
+    loss_renorm = pg_loss(s, s, delta, renormalize_support=True)   # 归一
+    # 手动条件期望：π_old 限定在支撑上再归一
+    p = s.exp()
+    support = (delta != 0)
+    p_sup = p * support
+    z = p_sup.sum(-1, keepdim=True) + 1e-8
+    manual = -((p_sup / z) * delta).sum(-1).mean()                 # ratio=1 → pointwise=Δ
+    assert torch.allclose(loss_renorm, manual, atol=1e-6)
+    # 归一版 ≠ 非归一版（支撑内 π_old 和 < 1 时归一放大）
+    assert not torch.allclose(loss_renorm, loss_plain, atol=1e-6)
+    # 逐位置等价：renorm(b,t) = plain(b,t) / Z_t（Z_t<1 → 归一版每位置贡献更大）
+    plain_bt = -(p_sup * delta).sum(-1)
+    renorm_bt = -((p_sup / z) * delta).sum(-1)
+    assert torch.allclose(renorm_bt, plain_bt / z.squeeze(-1), atol=1e-6)
+
+
+def test_pg_loss_renormalize_dense_noop():
+    """dense delta（无 0）时 renormalize 应为恒等（支撑=全词表，Z=1）——文档说不应开，但语义上不破坏。"""
+    s = _logp(2, 4, 24, seed=22)
+    delta = torch.randn(2, 4, 24, generator=torch.Generator().manual_seed(23))
+    plain = pg_loss(s, s, delta)
+    renorm = pg_loss(s, s, delta, renormalize_support=True)
+    assert torch.allclose(plain, renorm, atol=1e-6)
+
+
+def test_low_var_kl_support_renormalized():
+    """稀疏 KL 归一版：π_cur 在 top-K 上重归一 → 条件 KL 期望，≥ 非归一版（k3≥0、Z<1）。"""
+    V, K = 64, 8
+    s = _logp(2, 4, V, seed=24)
+    ref = _logp(2, 4, V, seed=25)
+    s_topk = s.topk(K, dim=-1).values
+    ref_at = ref.gather(-1, s.topk(K, dim=-1).indices)
+
+    plain = low_var_kl_support(s_topk, ref_at)
+    renorm = low_var_kl_support(s_topk, ref_at, renormalize_support=True)
+
+    p = s_topk.exp()
+    z = p.sum(-1, keepdim=True) + 1e-8
+    k3 = (ref_at - s_topk).exp() - (ref_at - s_topk) - 1.0
+    manual = ((p / z) * k3).sum(-1).mean()
+    assert torch.allclose(renorm, manual, atol=1e-6)
+    # 归一 ≥ 非归一（π_cur/Z ≥ π_cur，k3≥0）
+    assert renorm >= plain - 1e-6
+
+
 def test_expected_reward():
     dists = _logp(2, 4, 16, seed=11)
     delta = torch.randn(2, 4, 16, generator=torch.Generator().manual_seed(12))

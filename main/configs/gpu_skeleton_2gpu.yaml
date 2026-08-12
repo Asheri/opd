@@ -51,6 +51,7 @@ stage2:                   # Direct-OPD + AsyncOPD 调度器
   lr: 1.0e-3
   n_steps: 30
   batch_size: 16
+  renormalize_topk_support: true   # 稀疏支撑重归一化（对齐原始 Direct-OPD 条件期望，PG+KL 同步）
   # ---- GPU 部署骨架（L5/L2）----
   distributed: false      # true → DistAsyncScheduler（Ray worker + NCCL 广播）；04 脚本会置 true
   n_gpus: 2

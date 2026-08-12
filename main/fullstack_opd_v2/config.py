@@ -82,6 +82,10 @@ class Stage2Cfg(_Strict):
     dtype: Literal["fp32", "bf16", "float32", "bfloat16"] = "fp32"
     top_k_student: int = 0
     offload_to_cpu: bool = False
+    # 稀疏支撑重归一化（对齐原始 Direct-OPD）：pg_loss 把 π_old 在 Δ≠0 支撑上重归一、
+    # low_var_kl_support 把 π_cur 在 top-K 上重归一（条件期望）。默认关=原「非归一截断」
+    # 有界近似；GPU 稀疏预设（gpu_skeleton/CLOUD_CONFIG）开。PG 与 KL 必须同步开关。
+    renormalize_topk_support: bool = False
 
 
 # --------------------------- 工程化新增段 ---------------------------

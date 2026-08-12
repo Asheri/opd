@@ -94,6 +94,9 @@ DEFAULT_CONFIG_V2 = {
         "rollout_model": "Qwen/Qwen2.5-7B",  # vLLM 模型路径/名（仅 vllm 时生效）
         "rollout_dtype": "auto",  # "auto" | "bf16" | "fp8"（Blackwell 可 fp8）
         "rollout_logprobs_cap": 4096,  # 触发「精确完整分布」重建的词表上限（>则 top-K 截断）
+        # 稀疏支撑重归一化（对齐原始 Direct-OPD）：默认关=非归一有界近似；
+        # GPU 稀疏预设（CLOUD_CONFIG / gpu_skeleton）置 true。PG 与 KL 同步开关。
+        "renormalize_topk_support": False,
     },
 }
 
@@ -127,6 +130,8 @@ CLOUD_CONFIG = {
             **DEFAULT_CONFIG_V2["stage2"],
             "batch_size": 32,       # 4090 无关：PRO 6000 有 NVLink，批更大更值
             "n_steps": 1000,
+            # 稀疏支撑重归一化：GPU 稀疏预设开（对齐原始 Direct-OPD 条件期望）
+            "renormalize_topk_support": True,
             # learner 用 Megatron TP=2+SP（NVLink）；rollout 用 vLLM TP=2+FP8（见方案 L2/L3）
             # 此处仅为 demo 内核的 GPU 配置骨架，真实并行由 verl/slime/vLLM 接管。
             "rollout_engine": "vllm",   # L3：vLLM TP=2 rollout 替换朴素前向

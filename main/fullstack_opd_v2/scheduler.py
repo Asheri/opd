@@ -97,6 +97,11 @@ class AsyncBatchedScheduler:
         if cache.mode == "topk" and self.top_k_student <= 0:
             self.top_k_student = cache.top_k
         self.ref_tail_logp = cfg.get("ref_tail_logp", -1e2)   # 支撑外 ref logp（≈log 0）
+        # 稀疏支撑重归一化（对齐原始 Direct-OPD 的 softmax(student_topk_logp)）：
+        # 开 → pg_loss 把 π_old 在 Δ≠0 支撑上重归一、low_var_kl_support 把 π_cur 在
+        # top-K 上重归一（条件期望）；关 → 原「非归一截断」有界近似。默认关（保既有
+        # 行为/测试）；GPU 稀疏预设（gpu_skeleton_2gpu.yaml / CLOUD_CONFIG）开。
+        self.renormalize_topk = bool(cfg.get("renormalize_topk_support", False))
 
         # bf16 自动混合精度（L1）；仅在 cuda + 配置时启用
         self.dtype = _DTYPE_MAP.get(str(cfg.get("dtype", "fp32")).lower(), torch.float32)
@@ -273,12 +278,14 @@ class AsyncBatchedScheduler:
                 delta_d = self.cache.delta_for_student_topk(
                     idxs_dev, s_topk.indices)                   # (B,T,V) 支撑外=0
                 loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
-                                  log_ratio_max=LOG_RATIO_MAX)
+                                  log_ratio_max=LOG_RATIO_MAX,
+                                  renormalize_support=self.renormalize_topk)
                 # 稀疏 KL 锚点
                 if self.kl_mode == "topk":
                     ref_at = self._ref_logp_at_student_topk(
                         idxs_dev, s_topk.indices)               # (B,T,Ks)
-                    loss_kl = low_var_kl_support(s_topk.values, ref_at, None)
+                    loss_kl = low_var_kl_support(s_topk.values, ref_at, None,
+                                                 renormalize_support=self.renormalize_topk)
                 else:
                     loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], None)
             else:
