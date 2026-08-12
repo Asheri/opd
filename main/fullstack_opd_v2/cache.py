@@ -120,7 +120,8 @@ class TensorTeacherCache:
 
     def delta_for_student_topk(self, idxs: torch.Tensor,
                                student_topk_ids: torch.Tensor | None,
-                               fill: float = 0.0) -> torch.Tensor:
+                               fill: float = 0.0,
+                               vocab_out: int | None = None) -> torch.Tensor:
         """把离线缓存的 Δ_T 展开成 dense (B,T,V)，仅在 student 的 top-K 支撑上有值，其余 = fill。
 
         - dense 模式：直接返回完整 (B,T,V) delta（忽略 student_topk_ids）。
@@ -128,6 +129,11 @@ class TensorTeacherCache:
           top-K 内有匹配则取 teacher delta，否则 fill（默认 0）。再 scatter 回 (B,T,V)。
           支撑外的 Δ 置 0 = Direct-OPD 的「student 高概率支撑外 teacher 偏移可忽略」近似，
           且保证 `losses.pg_loss` 的 E_{π_old}[·] 加权只作用在 on-policy 支撑上。
+
+        vocab_out（方案 A · 对齐论文跨词表）：展开张量的 vocab 维度。默认 None →
+        max(student_topk_ids)+1（student 词表）。这允许 **student vocab > teacher vocab**
+        （如 7B：student 152064 vs teacher 151936）：student 超出 teacher 词表的 top-K id
+        在 searchsorted 未命中 → matched=0，scatter 进扩展维度，与 `ratio`(152064) 对齐。
         """
         if self.mode == "dense":
             return self.delta[idxs]
@@ -145,7 +151,15 @@ class TensorTeacherCache:
             max=Kt - 1)
         found = teacher_ids_sorted.gather(-1, pos) == student_topk_ids
         matched = teacher_delta_sorted.gather(-1, pos) * found  # 未匹配置 0
-        out = torch.full((B, T, self.vocab), fill,
+        if vocab_out is None:
+            # 默认取「teacher 词表」与「student top-K 最大 id+1」的较大者：
+            # 同词表场景（student top-K 只是 teacher 高概率子集）→ 保持 teacher vocab；
+            # 跨词表场景（student id 超出 teacher 词表，7B=152064）→ 扩展。
+            vocab_out = max(self.vocab, int(student_topk_ids.max()) + 1)
+        if vocab_out < self.vocab:
+            raise ValueError(
+                f"vocab_out={vocab_out} < teacher vocab={self.vocab}：展开维度不能小于缓存词表")
+        out = torch.full((B, T, vocab_out), fill,
                          dtype=matched.dtype, device=matched.device)
         out.scatter_(-1, student_topk_ids, matched)
         return out

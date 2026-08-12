@@ -130,3 +130,60 @@ def test_teacher_consistency_raises_on_mismatch():
     cache = TensorTeacherCache(enforce_consistency=True, top_k=0)
     with pytest.raises(TeacherConsistencyError):
         cache.build(prompts, responses, rl, bad_ref)
+
+
+# --------------------------- 方案 A：跨词表 top-K 支撑（对齐 Direct-OPD 论文） ---------------------------
+def _make_cross_vocab(N=6, P=4, T=5, Vt=24, Vs=32, Kt=8, seed=0):
+    """teacher vocab=Vt(24)、student vocab=Vs(32) 的跨词表场景（模拟 7B：152064 vs 151936）。
+
+    student top-K 含 ≥Vt 的 id（如 24..31）——这些在 teacher 词表外，未命中 → Δ=0。
+    """
+    g = torch.Generator().manual_seed(seed)
+    prompts = torch.randint(0, Vt, (N, P), generator=g)
+    responses = torch.randint(0, Vt, (N, T), generator=g)
+    teacher_rl = CausalToyLM(vocab=Vt, d_model=16, n_layers=1)
+    teacher_ref = CausalToyLM(vocab=Vt, d_model=16, n_layers=1)
+    cache = TensorTeacherCache(True, top_k=Kt).build(prompts, responses, teacher_rl, teacher_ref)
+    return cache, prompts, responses, teacher_rl, teacher_ref, Vt, Vs
+
+
+def test_delta_for_student_topk_cross_vocab_expands():
+    """方案 A：vocab_out(32) > teacher vocab(24) → out 维度 (B,T,32)，
+    student 超出 teacher 词的 id（24..31）未命中 → Δ=0；命中 id 取 teacher delta。"""
+    cache, prompts, responses, rl, ref, Vt, Vs = _make_cross_vocab()
+    B, T = 4, responses.size(1)
+    Ks = 6
+    # 构造 student top-K：含超出 teacher 词表的 id（24..29）与命中 id（0..5）
+    g = torch.Generator().manual_seed(1)
+    ids_low = torch.randint(0, Vt, (B, T, Ks // 2), generator=g)   # 命中区 [0,24)
+    ids_high = torch.randint(Vt, Vs, (B, T, Ks - Ks // 2), generator=g)  # 超出区 [24,32)
+    student_topk = torch.cat([ids_low, ids_high], dim=-1)
+    out = cache.delta_for_student_topk(torch.arange(B), student_topk,
+                                       vocab_out=Vs)
+    assert out.shape == (B, T, Vs)                     # 按 student 词表展开
+    # 超出区全部为 0（teacher 词表外无 Δ_T）
+    assert (out.gather(-1, ids_high) == 0).all()
+    # 命中区：若 student id 落在 teacher top-K 内则取 teacher delta，否则 0
+    # （不能全断言非零——teacher top-K 只覆盖部分 id；只验证维度与不越界）
+    assert torch.isfinite(out).all()
+
+
+def test_delta_for_student_topk_default_vocab_from_ids():
+    """vocab_out=None → 用 max(student_topk_ids)+1 推断（7B 默认路径）。"""
+    cache, prompts, responses, rl, ref, Vt, Vs = _make_cross_vocab()
+    B, T = 4, responses.size(1)
+    Ks = 6
+    g = torch.Generator().manual_seed(2)
+    ids_high = torch.randint(Vt, Vs, (B, T, Ks), generator=g)
+    out = cache.delta_for_student_topk(torch.arange(B), ids_high)  # 无 vocab_out
+    assert out.shape == (B, T, Vs)                     # 推断自 max id+1
+    assert (out == 0).all()                            # 全超出 → 全 0
+
+
+def test_delta_for_student_topk_vocab_out_smaller_raises():
+    """vocab_out < teacher vocab → 显式报错（展开维度不能小于缓存词表）。"""
+    cache, prompts, responses, rl, ref, Vt, Vs = _make_cross_vocab()
+    B, T = 2, responses.size(1)
+    student_topk = torch.randint(0, Vt, (B, T, 4))
+    with pytest.raises(ValueError):
+        cache.delta_for_student_topk(torch.arange(B), student_topk, vocab_out=Vt - 1)

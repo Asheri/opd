@@ -284,3 +284,32 @@ def test_train_step_metrics_finite_collected():
     for m in ms:
         for k in ("loss", "pg_loss", "kl_loss", "adv_mean", "reward"):
             assert math.isfinite(m[k])
+
+
+def test_scheduler_cross_vocab_student_topk_train():
+    """方案 A（对齐 Direct-OPD）：student vocab > teacher vocab 的 7B 风格端到端训练。
+
+    teacher vocab=20、student vocab=32（模拟 7B 152064 vs teacher 151936）。student top-K
+    含超出 teacher 词表的 id（20..31）→ Δ_T=0（未命中）；训练必须跑通、loss 有限。
+    """
+    N, P, T = 8, 4, 6
+    Vt, Vs, K = 20, 32, 6
+    g = torch.Generator().manual_seed(0)
+    prompts = torch.randint(0, Vt, (N, P), generator=g)
+    responses = torch.randint(0, Vt, (N, T), generator=g)
+    teacher_rl = CausalToyLM(vocab=Vt, d_model=16, n_layers=1)
+    teacher_ref = CausalToyLM(vocab=Vt, d_model=16, n_layers=1)
+    cache = TensorTeacherCache(True, top_k=K).build(prompts, responses, teacher_rl, teacher_ref)
+    # student：vocab=32，但数据 token 只在 [0,20)（teacher 词表内），prompt/response 复用
+    student = CausalToyLM(vocab=Vs, d_model=16, n_layers=1)
+    with torch.no_grad():
+        ref_dists = response_dists(student, prompts, responses)
+    # student 前向得到 (B,T,32)，top-K 里可能有 ≥20 的 id（低概率垃圾 token 也可能进 top-K）
+    cfg = _cfg(cache_mode="topk", top_k_student=K, ref_topk=K, n_steps=6, batch_size=4)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  None, None, None, cfg, "cpu")
+    metrics = sched.run(6)
+    assert len(metrics) == 6
+    for m in metrics:
+        for k in ("loss", "pg_loss", "kl_loss"):
+            assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"

@@ -311,8 +311,11 @@ class AsyncBatchedScheduler:
             # ★ Direct-OPD 迁移对象：按 student 自身 top-K 支撑取 Δ_T（L4 稀疏缓存）
             if self.use_topk:
                 s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
+                # 方案 A（对齐论文）：展开维度按 student 词表（7B=152064 > teacher 151936），
+                # student 超出 teacher 词表的 top-K id 在 searchsorted 未命中 → Δ=0。
                 delta_d = self.cache.delta_for_student_topk(
-                    idxs_dev, s_topk.indices)                   # (B,T,V) 支撑外=0
+                    idxs_dev, s_topk.indices,
+                    vocab_out=getattr(self.student, "vocab", None))  # (B,T,V) 支撑外=0
                 # P2-G（二次审查）：renormalize 时把【完整 student top-K】掩码显式传给
                 # pg_loss，与 low_var_kl_support 的支撑（也是完整 student top-K）一致——
                 # 否则 pg 用 delta!=0（student∩teacher 交集）归一、KL 用完整 top-K 归一，
