@@ -172,10 +172,15 @@ class AimeEvaluator:
             ds = load_dataset(name, split="train")
         except Exception as e:
             raise DataError(f"加载 AIME 数据集 {name!r} 失败：{e}") from e
+        # 列名兼容：不同 AIME 数据集列名不一（problem/Problem/Question/Prompt、
+        # answer/Answer/Solution）——大小写不敏感 + 候选键匹配（部署实测
+        # Maxwell-Jia/AIME_2024 是大写 Problem/Solution/Answer）。
+        prob_keys = ("problem", "question", "prompt", "Problem", "Question", "Prompt")
+        ans_keys = ("answer", "solution", "Answer", "Solution")
         rows = []
         for row in ds:
-            prob = row.get("problem") or row.get("question") or row.get("prompt")
-            ans = row.get("answer")
+            prob = next((row.get(k) for k in prob_keys if row.get(k) is not None), None)
+            ans = next((row.get(k) for k in ans_keys if row.get(k) is not None), None)
             if prob is None or ans is None:
                 raise DataError(
                     f"数据集 {name!r} 缺 problem/answer 列（实际列：{list(row.keys())}）")
