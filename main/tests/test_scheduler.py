@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import math
+import sys
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -177,12 +179,14 @@ def test_scheduler_topk_renormalize_wires_through(monkeypatch):
     orig_kl = SCH.low_var_kl_support
 
     def spy_pg(s_cur, s_old, delta, mask=None, clip_eps=0.2, p_old=None,
-               log_ratio_max=None, renormalize_support=False, support=None):
+               log_ratio_max=None, renormalize_support=False, support=None,
+               delta_clip=None):
         pg_kwargs.update(renormalize_support=renormalize_support, support=support,
                          has_support=support is not None)
         # 代理真实实现（不 monkeypatch 掉数学）
         return orig_pg(s_cur, s_old, delta, mask, clip_eps, p_old,
-                       log_ratio_max, renormalize_support, support)
+                       log_ratio_max, renormalize_support, support,
+                       delta_clip)
     def spy_kl(s_topk_logp, ref_logp_at_support, mask=None, renormalize_support=False):
         kl_kwargs.update(renormalize_support=renormalize_support)
         return orig_kl(s_topk_logp, ref_logp_at_support, mask, renormalize_support)
@@ -211,9 +215,9 @@ def test_scheduler_adamw_8bit_optimizer(monkeypatch):
     import fullstack_opd_v2.scheduler as SCH
 
     fake_opt = mock.Mock()
-    monkeypatch.setattr(SCH, "AdamW8bit", mock.Mock(return_value=fake_opt))
-    # bnb 在 scheduler._build_optimizer 内 from bitsandbytes.optim import AdamW8bit——
-    # 本地测试 CPU 无法真装 bnb，改为 monkeypatch bitsandbytes 模块模拟可用。
+    # bnb 在 scheduler._build_optimizer 内 from bitsandbytes.optim import AdamW8bit（局部导入）——
+    # 本地测试 CPU 无法真装 bnb，monkeypatch bitsandbytes 模块模拟可用（scheduler 模块本身
+    # 无 AdamW8bit 属性，不能 setattr SCH.AdamW8bit）。
     import types
     bnb = types.ModuleType("bitsandbytes")
     bnb_optim = types.ModuleType("bitsandbytes.optim")
