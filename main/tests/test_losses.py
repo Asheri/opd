@@ -158,6 +158,22 @@ def test_pg_loss_renormalize_over_explicit_support():
     assert not torch.allclose(loss, loss_inter, atol=1e-6)
 
 
+def test_pg_loss_delta_clip_bounds():
+    """部署实测 P1：Δ_T 数值护栏——clamp 到 ±delta_clip 使大 Δ_T 下 loss 有界（防梯度爆炸）。"""
+    B, T, V = 2, 4, 16
+    s = _logp(B, T, V, seed=40)
+    delta = torch.zeros(B, T, V)
+    delta[0, 0, 0] = 10.0        # 极端 Δ_T（真实教师对可达 ±10）
+    delta[0, 0, 1] = -9.0
+    unclipped = pg_loss(s, s, delta)                      # 无护栏：loss 无界大
+    clipped = pg_loss(s, s, delta, delta_clip=2.0)        # 护栏：clamp 到 ±2
+    assert clipped < unclipped
+    assert abs(clipped) <= 2.0 + 1e-6                     # loss 有界
+    # ratio=1 时 clipped = -E_{π_old}[clamp(Δ)]，逐位置验证
+    expected = -((s.exp() * torch.clamp(delta, -2.0, 2.0)).sum(-1)).mean()
+    assert torch.allclose(clipped, expected, atol=1e-6)
+
+
 def test_low_var_kl_support_renormalized():
     """稀疏 KL 归一版：π_cur 在 top-K 上重归一 → 条件 KL 期望，≥ 非归一版（k3≥0、Z<1）。"""
     V, K = 64, 8

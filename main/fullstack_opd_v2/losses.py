@@ -17,7 +17,8 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
             p_old: torch.Tensor | None = None,
             log_ratio_max: float | None = None,
             renormalize_support: bool = False,
-            support: torch.Tensor | None = None) -> torch.Tensor:
+            support: torch.Tensor | None = None,
+            delta_clip: float | None = None) -> torch.Tensor:
     """Direct-OPD 的 PG 损失 + AsyncOPD 陈旧截断（批量版）。
 
     s_cur / s_old: (B, T, V) log-softmax（cur 带梯度，old 为 rollout 时刻快照）
@@ -42,7 +43,16 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
                    漂移。调用方（scheduler 稀疏路径）应显式传 student top-K 掩码，使 PG
                    与 KL 在【同一支撑】上重归一（对齐原始：delta 定义在完整 student
                    top-K 上）。未覆盖 token 的 Δ=0 贡献 0、但计入分母——与 KL 一致。
+    delta_clip: Δ_T 数值护栏（部署实测 P1）。非 None 时先把 delta clamp 到 ±delta_clip
+                   ——真实教师对（JustRL vs R1-Distill）在数学数据上 log-ratio 差可达 ±10，
+                   PG loss 无界 → 训练早期梯度爆炸、学生坍缩到换行死区（KL 爆到 ~29）。
+                   None 保持原行为（toy 小 Δ_T 无需护栏）。
     """
+    if delta_clip is not None:
+        # Δ_T 数值护栏（部署实测）：真实词表教师对（如 JustRL vs R1-Distill）在数学数据上
+        # log-ratio 差可达 ±10（正常 <3），PG loss 无界放大 → 训练早期梯度爆炸、学生被推离
+        # 初始分布（KL 爆到 ~29）→ 坍缩到换行死区。clip 到 ±delta_clip 让 loss 有界。
+        delta = torch.clamp(delta, -delta_clip, delta_clip)
     logr = s_cur - s_old
     ratio = logr.exp()                                         # (B, T, V)
     unclipped = ratio * delta

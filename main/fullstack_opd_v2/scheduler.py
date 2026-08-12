@@ -102,6 +102,9 @@ class AsyncBatchedScheduler:
         # top-K 上重归一（条件期望）；关 → 原「非归一截断」有界近似。默认关（保既有
         # 行为/测试）；GPU 稀疏预设（gpu_skeleton_2gpu.yaml / CLOUD_CONFIG）开。
         self.renormalize_topk = bool(cfg.get("renormalize_topk_support", False))
+        # Δ_T 数值护栏（部署实测 P1）：真实教师对 log-ratio 差可达 ±10 → PG 无界爆炸、
+        # 学生坍缩。非 None 时 pg_loss 先 clamp Δ_T 到 ±delta_clip。
+        self.delta_clip = cfg.get("delta_clip")
 
         # bf16 自动混合精度（L1）；仅在 cuda + 配置时启用
         self.dtype = _DTYPE_MAP.get(str(cfg.get("dtype", "fp32")).lower(), torch.float32)
@@ -300,7 +303,7 @@ class AsyncBatchedScheduler:
                 loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
                                   log_ratio_max=LOG_RATIO_MAX,
                                   renormalize_support=self.renormalize_topk,
-                                  support=pg_support)
+                                  support=pg_support, delta_clip=self.delta_clip)
                 # 稀疏 KL 锚点
                 if self.kl_mode == "topk":
                     ref_at = self._ref_logp_at_student_topk(
@@ -318,7 +321,7 @@ class AsyncBatchedScheduler:
                     delta = self.cache.get_delta(idxs_dev)
                 delta_d = delta
                 loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
-                                  log_ratio_max=LOG_RATIO_MAX)
+                                  log_ratio_max=LOG_RATIO_MAX, delta_clip=self.delta_clip)
                 loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], None)
 
             loss = loss_pg + self.kl_coef * loss_kl
