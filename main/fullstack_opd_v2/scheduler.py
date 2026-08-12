@@ -147,9 +147,17 @@ class AsyncBatchedScheduler:
         self.rollout_engine = rollout_engine
         if self.rollout_engine is not None and not vllm_available():
             raise RuntimeError("cfg 指定 vLLM rollout 但 vllm 未安装（统一 GPU 环境应含）。")
-        self.worker = (CausalToyLM(vocab=student.vocab, d_model=student.d_model,
-                                   n_layers=student.n_layers).to(device)
-                       if self.rollout_engine is None else None)
+        if self.rollout_engine is None:
+            # 旧快照前向模型：toy → CausalToyLM 副本；hf → 同 student 路径再加载一份
+            # HFCausalLM（权重随后经 weight_store 快照覆盖）。⚠️ hf 骨架：需 GPU 验证。
+            if cfg.get("model_kind") == "hf":
+                from .model_factory import build_model as _build_model
+                self.worker = _build_model(cfg, device, role="student")
+            else:
+                self.worker = CausalToyLM(vocab=student.vocab, d_model=student.d_model,
+                                          n_layers=student.n_layers).to(device)
+        else:
+            self.worker = None
         self._loaded_ver = -1
 
     # --------------------------- 权重同步 ---------------------------

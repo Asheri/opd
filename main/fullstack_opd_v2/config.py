@@ -149,6 +149,11 @@ class OPDConfig(_Strict):
     ref_topk: int = 0
     offload_to_cpu: bool = False
     model_kind: Literal["toy", "hf", "megatron", "vllm"] = "toy"
+    # HF 骨架（model_kind="hf"）：真实模型路径。student_path=学生；
+    # teacher_rl_path/teacher_ref_path=预下载教师对（真实实验跳过 Stage 0 RL 直接加载）。
+    student_path: str | None = None
+    teacher_rl_path: str | None = None
+    teacher_ref_path: str | None = None
     stage0: Stage0Cfg = Field(default_factory=Stage0Cfg)
     stage1: Stage1Cfg = Field(default_factory=Stage1Cfg)
     stage2: Stage2Cfg = Field(default_factory=Stage2Cfg)

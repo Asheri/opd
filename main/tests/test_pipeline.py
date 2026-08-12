@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from fullstack_opd_v2.exceptions import DataError
+from fullstack_opd_v2.exceptions import DataError, ModelError
 from fullstack_opd_v2.model import CausalToyLM
 from fullstack_opd_v2.pipeline import FullStackOPDv2, DEFAULT_CONFIG_V2
 
@@ -258,7 +258,7 @@ def test_train_load_cache_old_format_raises(tmp_path):
     from fullstack_opd_v2.cache import TensorTeacherCache
     from fullstack_opd_v2.pipeline import FullStackOPDv2
     from fullstack_opd_v2.model import CausalToyLM
-    from fullstack_opd_v2.exceptions import DataError
+    from fullstack_opd_v2.exceptions import DataError, ModelError
 
     cache_path = os.path.join(str(tmp_path), "old.pt")
     N, P, T, V = 6, 4, 5, 24
@@ -274,6 +274,45 @@ def test_train_load_cache_old_format_raises(tmp_path):
     cfg["stage1"]["load_cache"] = True
     with pytest.raises(DataError):
         FullStackOPDv2(cfg, device="cpu").run()
+
+
+def test_stage0_teachers_hf_skips_rl(tmp_path, monkeypatch):
+    """HF 骨架：_stage0_teachers 从磁盘加载预下载教师对、跳过 Stage 0 RL。"""
+    import unittest.mock as mock
+    import fullstack_opd_v2.model_factory as MF
+    import fullstack_opd_v2.pipeline as PL
+    from fullstack_opd_v2.pipeline import FullStackOPDv2
+
+    def fake_hf(path, device="cpu", dtype="auto"):
+        m = mock.Mock()
+        m.vocab, m.d_model, m.max_len = 152, 768, 1024
+        m.path = path
+        return m
+    monkeypatch.setattr(MF, "HFCausalLM", fake_hf)
+    # 若走了 RL 应报错（hf 路径不应触 RL）
+    monkeypatch.setattr(PL, "stage0_small_rl",
+                        mock.Mock(side_effect=AssertionError("hf 不应跑 Stage 0 RL")))
+
+    cfg = _cfg(tmp_path)
+    cfg["model_kind"] = "hf"
+    cfg["teacher_rl_path"] = "RL_PATH"
+    cfg["teacher_ref_path"] = "REF_PATH"
+    opd = FullStackOPDv2(cfg, device="cpu")
+    teacher_rl, teacher_ref = opd._stage0_teachers()
+    assert teacher_rl.path == "RL_PATH"
+    assert teacher_ref.path == "REF_PATH"
+    PL.stage0_small_rl.assert_not_called()
+
+
+def test_stage0_teachers_hf_missing_ref_raises():
+    """HF 骨架：缺 teacher_ref_path → 显式 ModelError。"""
+    from fullstack_opd_v2.pipeline import FullStackOPDv2
+    cfg = _cfg(type("T", (), {"__truediv__": lambda self, o: str(o)})())
+    cfg["model_kind"] = "hf"
+    cfg["teacher_rl_path"] = "RL"
+    cfg["teacher_ref_path"] = None
+    with pytest.raises(ModelError):
+        FullStackOPDv2(cfg, device="cpu")._stage0_teachers()
 
 
 def test_resume_warmup_uses_fresh_initial_student(tmp_path, monkeypatch):
@@ -346,7 +385,7 @@ def test_cloud_config_l1_and_seepage():
 def test_warmup_requires_student_raises_dataerror():
     """B1 收尾：warmup_source=student_init 但未传 warmup_student 时抛 DataError（非裸 ValueError）。"""
     import pytest
-    from fullstack_opd_v2.exceptions import DataError
+    from fullstack_opd_v2.exceptions import DataError, ModelError
     from fullstack_opd_v2.pipeline import stage1_build_cache
     import torch
     p = torch.zeros(4, 3, dtype=torch.long)

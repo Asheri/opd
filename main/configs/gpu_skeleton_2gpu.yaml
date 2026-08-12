@@ -26,6 +26,13 @@ top_k_student: 256        # 训练时 student top-K 支撑
 ref_topk: 256             # KL 锚点稀疏化（避免 (N,T,V) 锚点 OOM）
 offload_to_cpu: true      # L6：colocated 换入换出（单卡线程版生效；分布式走 NCCL 广播）
 
+# ---- HF 骨架（model_kind: hf 时生效；toy 忽略）----
+# ⚠️ 真实模型路径：以服务器实际下载的 HF id/路径为准（本地无模型，仅占位）。
+model_kind: toy            # toy（demo 内核）| hf（真实模型骨架，需 GPU 验证）
+student_path: Qwen/Qwen3-R1-Distill-7B          # 学生（骨架占位）
+teacher_rl_path: JustRL-DeepSeek-1.5B           # post-RL 教师（骨架占位）
+teacher_ref_path: DeepSeek-R1-Distill-Qwen-1.5B # pre-RL 教师（骨架占位）
+
 stage0:                   # 小模型 RL → post-RL weak teacher
   lr: 1.0e-3
   n_rl_steps: 20

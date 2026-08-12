@@ -30,7 +30,7 @@ from .run import RunManager
 from .checkpoint import CheckpointManager
 from .metrics import MetricsRecorder
 from .logging import setup_logging, get_logger, close_logging
-from .exceptions import DataError, TrainingError
+from .exceptions import DataError, ModelError, TrainingError
 
 DEFAULT_CONFIG_V2 = {
     "vocab_size": 64,
@@ -48,7 +48,11 @@ DEFAULT_CONFIG_V2 = {
     "top_k_student": 0,       # >0 → 训练时在 student top-K 支撑上取 Δ_T（L4）
     "ref_topk": 0,            # >0 → KL 锚点存初始 student top-K（避免 (N,T,V) 撑爆）
     "offload_to_cpu": False,  # colocated 换入换出（L6）
-    "model_kind": "toy",      # 可插拔模型工厂（model_factory.py）：toy 默认
+    "model_kind": "toy",      # 可插拔模型工厂（model_factory.py）：toy 默认 / hf 骨架
+    # HF 骨架路径（model_kind="hf" 时生效）：学生 + 预下载教师对（跳过 Stage 0 RL）
+    "student_path": None,
+    "teacher_rl_path": None,
+    "teacher_ref_path": None,
     # ---- 工程化新增段（run 目录 / 日志 / 指标 / 数据）----
     "run": {"seed": None, "run_dir": None, "checkpoint_every": 10},
     "logging": {"level": "INFO", "file": "train.log"},
@@ -249,11 +253,26 @@ class FullStackOPDv2:
             self.cfg, self.device).load()
 
     def _stage0_teachers(self):
-        """跑 Stage 0 小模型 RL，返回 (teacher_rl, teacher_ref)。供 run()/CLI cache 复用。
+        """返回 (teacher_rl, teacher_ref)。供 run()/CLI cache 复用。
 
         B2：教师初始权重由可插拔工厂 build_model 构建（model_kind 配置生效）并注入
         stage0_small_rl；后者内部仍用 CausalToyLM 构造 ref 副本（toy RL 阶段最小改动）。
+
+        HF 骨架：真实实验的教师对是【预下载模型】（teacher_rl_path=JustRL-1.5B、
+        teacher_ref_path=R1-Distill-Qwen-1.5B），**跳过 Stage 0 RL** 直接加载两档；
+        teacher 一致性（同架构/词表/d_model）由 TensorTeacherCache.build 校验。
+        ⚠️ 骨架：需 GPU/真实模型验证。
         """
+        if self.cfg.get("model_kind") == "hf":
+            teacher_rl = build_model(self.cfg, self.device, role="teacher")
+            from .model_factory import HFCausalLM
+            ref_path = self.cfg.get("teacher_ref_path")
+            if not ref_path:
+                raise ModelError(
+                    "model_kind='hf' 但未配置 teacher_ref_path（预下载教师对）")
+            teacher_ref = HFCausalLM(ref_path, self.device,
+                                     dtype=self.cfg.get("dtype", "auto"))
+            return teacher_rl, teacher_ref
         vocab = self.cfg["vocab_size"]
         d_model = self.cfg["d_model"]
         n_layers = self.cfg["n_layers"]
