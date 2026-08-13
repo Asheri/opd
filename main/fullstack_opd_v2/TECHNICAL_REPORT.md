@@ -1004,13 +1004,28 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 
 | 用途 | 数据集 | 规模 | 说明 |
 |---|---|---|---|
-| **训练** | GSM8K 数学 | 学生训练集 | 多学生并发实验用 GSM8K；论文用 Skywork-OR1 math（见 §9.3 差异） |
+| **训练（当前）** | 默认/GSM8K 数学 | 学生训练集 | **⚠️ 非论文数据**。实际训练用了默认数据路径（未接 Skywork） |
+| **训练（论文要求，待落地）** | Skywork-OR1-RL-Data math split | 105,055 条（计划子集 10K） | **【待办】** 规格已设计、未下载未转换（见下方 §8.4） |
 | **评估** | AIME24（Maxwell-Jia/AIME_2024） | 30 题 | 竞赛数学，答案 3 位整数 |
 | **评估** | AIME25（yentinglin/aime_2025） | 30 题 | 同上 |
 | **评估** | HMMT Feb（论文数据集） | — | 论文有，本项目未跑 |
 
-> ⚠️ **训练/评估数据不同源**：本项目用 GSM8K 训练 + AIME 评估；论文用 Skywork-OR1 + DAPO 模板。
-> 即便评估协议完全对齐（ave@32），绝对分数与论文仍会有差距——预期"量级对齐"而非"逐点相等"。
+> ⚠️ **训练/评估数据不同源**：本项目当前训练用默认/GSM8K + AIME 评估；论文用 Skywork-OR1 + DAPO 模板。
+> 即便评估协议完全对齐（ave@32），**当前**绝对分数与论文仍会有差距——预期"量级对齐"而非"逐点相等"。
+
+### 8.4 Skywork 训练数据落地【待办，未完成】
+
+**状态：规格已设计（`docs/superpowers/specs/2026-08-13-align-directopd-experiment-design.md` §四），
+但数据下载与转换从未执行**——训练实际未用 Skywork。用户 2026-08-14 指出该疏漏。
+
+**计划管道**（服务器恢复后执行，数据接口已就绪零代码改动）：
+1. **下载**：Skywork-OR1-RL-Data `data/math-00000-of-00001.parquet`（105,055 条，服务器学术代理）；
+2. **转换**：跑 `Direct-OPD/scripts/prepare_skywork_math.py` → DAPO 模板 prompt + ground_truth；
+3. **子集采样**：10.5 万条随机采样 10K → 转 jsonl（`{"prompt": <DAPO 包装>, "response": <student 生成>}`）；
+4. **response 标签**：用初始 student `generate_batch` 对每个 DAPO prompt 生成响应（on-policy，
+   复用 `stage1.warmup_source=student_init` 机制）；
+5. **加载**：config 加 `dataset.type=jsonl` + 路径，走现有 `JsonLinesDataLoader`
+   （`fullstack_opd_v2/data.py` 已实现，无需改代码）。
 
 ### 8.2 prompt 模板与长度配置
 
@@ -1041,6 +1056,8 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 
 - **L2 周期刷新**未实现（动态数据集 + refresh 线程 + ring buffer，见第一部分 L2 机制）；
 - **L3 全在线**未实现（回到 Lightning-OPD live teacher）；
+- **训练数据未用论文 Skywork**：当前训练走默认数据，Skywork-OR1 math 仅完成规格设计未落地
+  （见 §8.4【待办】）——这使当前分数无法与论文直接逐点比对；
 - **7B 未蒸馏**：词表硬约束（OPD 要求学生=教师同词表；student=152064 vs teacher=151936）→
   非显存问题，是 OPD 机制硬约束；
 - **分布式 L5** 是带护栏骨架（ray/megatron/vllm 缺失时报错），未完整跑通；
@@ -1069,7 +1086,7 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 
 | 维度 | 原始论文（Direct-OPD） | 本项目 |
 |---|---|---|
-| 训练数据 | Skywork-OR1 math + DAPO 模板 | GSM8K + 数据集原模板 |
+| 训练数据 | Skywork-OR1 math + DAPO 模板 | 当前默认/GSM8K；**Skywork 待落地**（§8.4 待办，数据接口已就绪） |
 | 评估协议 | ave@32 / T=0.7 / top_p=0.95 / 31744 | 已对齐（eval-aime 支持），长生成待跑 |
 | 教师对 | 论文用弱教师（RL 前后） | 同（Stage 0 产出 post-RL 弱教师 + pre-RL 副本） |
 | Δ_T 缓存 | 论文逐 token 稠密 | dense（demo）/ top-K 稀疏（真实词表，↓1000×） |
