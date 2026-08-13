@@ -233,7 +233,14 @@ def _cmd_eval_aime(args) -> int:
         for ds in datasets:
             out_path = os.path.join(out_dir, f"{ds}.jsonl")
             res = ev.evaluate_to_jsonl(ds, out_path)
-            print(f"[eval-aime] {ds}: {res.correct}/{res.total} = {res.accuracy * 100:.2f}%  "
-                  f"→ {out_path}")
+            # 二次审阅修复 #1：分口径标注——pass1 与 ave 混排会误导
+            # （"27/30 = 56.25%" 里 27/30 是 pass@1、56.25% 是 ave@32，两码事）。
+            if ev.metric == "ave" and res.ave_accuracy is not None:
+                print(f"[eval-aime] {ds}: pass@1 {res.correct}/{res.total} "
+                      f"({100 * res.correct / res.total:.2f}%)  "
+                      f"ave@32 {res.ave_accuracy * 100:.2f}%  → {out_path}")
+            else:
+                print(f"[eval-aime] {ds}: {res.correct}/{res.total} "
+                      f"= {res.accuracy * 100:.2f}%  → {out_path}")
     print("[eval-aime] 汇总：teacher 基线 / 学生蒸馏前后对比见 benchmarks/aime24_25/aggregate.py")
     return 0

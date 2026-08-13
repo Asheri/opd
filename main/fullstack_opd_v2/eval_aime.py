@@ -62,9 +62,12 @@ def extract_answer(text: str, style: str = "boxed") -> str:
     返回原始字符串（含可能的负号/千分位），未找到返回 ""。
     """
     if style == "dapo":
-        m = re.search(r"[Aa]nswer\s*:\s*([^\n]+)", text)
-        if m:
-            mm = re.search(r"-?\d[\d,]*", m.group(1))
+        # 模板契约要求答案在【最后一行】"Answer:"（PROMPT_TEMPLATE_DAPO）。
+        # 长 CoT 可能中途写下 "answer:" 草稿再修正——取最后一个匹配（P2 修复，
+        # 否则首个匹配命中草稿 → 本应判对的采样被判错，系统性低估 ave@32）。
+        matches = re.findall(r"[Aa]nswer\s*:\s*([^\n]+)", text)
+        if matches:
+            mm = re.search(r"-?\d[\d,]*", matches[-1])
             if mm:
                 return mm.group(0)
     boxed = re.findall(r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", text)
@@ -88,6 +91,22 @@ def normalize_answer(a) -> int | None:
     return int(s)
 
 
+def _validate_device(device: str) -> str:
+    """校验 device 格式（P2 修复）：合法为 cpu | cuda[:N]。
+
+    传 '0'（应为 'cuda:0'）此前抛误导性 ModelError（"路径/HF id 无效"）；
+    前置校验给明确错误，避免排查方向被带偏。
+    """
+    s = str(device).strip().lower()
+    if s == "cpu":
+        return s
+    if s == "cuda" or re.fullmatch(r"cuda:\d+", s):
+        return s
+    raise ConfigError(
+        f"device={device!r} 非法：须 'cpu' 或 'cuda[:N]'（如 'cuda:0'）；"
+        "裸数字（如 '0'）不是合法 device")
+
+
 # --------------------------- 评估器 ---------------------------
 @dataclass
 class AimeResult:
@@ -105,6 +124,22 @@ class AimeResult:
         if self.ave_accuracy is not None:
             return self.ave_accuracy
         return self.correct / self.total if self.total else 0.0
+
+    @classmethod
+    def ave32_from_rows(cls, rows: list[dict]) -> float | None:
+        """从落盘 rows（含 correct_count/n_samples）重算 ave@32（论文口径）。
+
+        对每题算 correct_count/n_samples（正确比例），30 题平均。用于审计/复现：
+        与 evaluate() 的 ave_accuracy 应逐位一致。缺采样级字段返回 None。
+        """
+        fracs = []
+        for r in rows:
+            cc = r.get("correct_count")
+            ns = r.get("n_samples")
+            if cc is None or not ns:
+                return None
+            fracs.append(cc / ns)
+        return (sum(fracs) / len(fracs)) if fracs else None
 
 
 class AimeEvaluator:
@@ -148,7 +183,9 @@ class AimeEvaluator:
         except Exception as e:                       # pragma: no cover
             raise ModelError(f"AIME 评估需要 transformers：{e}") from e
         self.model_path = model_path
-        self.device = device
+        # P2（二次审阅修复）：device 前置校验——'0' 而非 'cuda:0' 会抛误导性
+        # ModelError（"路径/HF id 无效"）。合法：cpu | cuda[:N]。
+        self.device = _validate_device(device)
         self.max_new_tokens = int(max_new_tokens)
         self.batch_size = max(1, int(batch_size))
         # 上下文上限：模型 config 的 max_position_embeddings（Qwen3=40960，对齐论文长生成）。
@@ -162,6 +199,10 @@ class AimeEvaluator:
                 f"加载 tokenizer {model_path!r} 失败（路径/HF id 无效？）：{e}") from e
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
+        # P1（二次审阅修复）：decoder-only 批量生成必须左填充（右填充 → RoPE 位置被
+        # pad 位移 → 生成 token 质量退化）。transformers 对右填充只打 warning 不自动修。
+        # 注意 tokenizer 实例可被复用，显式设置避免副作用。
+        self.tok.padding_side = "left"
         # dtype：显式 bf16/float16 用对应精度；'auto' 在 CUDA 上默认 bf16（现代卡），CPU 用 fp32。
         if dtype in ("bf16", "float16"):
             torch_dtype = {"bf16": "bfloat16", "float16": "float16"}[dtype]
@@ -185,6 +226,12 @@ class AimeEvaluator:
         if self.max_new_tokens >= self.max_ctx:
             raise ConfigError(
                 f"max_new_tokens={self.max_new_tokens} ≥ 模型上下文上限 {self.max_ctx}；请调小")
+        # P2（二次审阅修复 #5）：max_new 逼近 max_ctx 时 prompt 被静默截到近零长度
+        # （max_length=max(1, max_ctx-max_new) → 题目信息全丢）。预留 ≥20% 上下文给 prompt。
+        if self.max_new_tokens > 0.8 * self.max_ctx:
+            raise ConfigError(
+                f"max_new_tokens={self.max_new_tokens} 超过上下文上限 {self.max_ctx} 的 80%："
+                f"生成太长会把 prompt 截断（题目信息丢失）。请调小 max_new_tokens 或换更大上下文模型")
 
     def close(self):
         """释放模型/tokenizer 与 GPU 显存。"""
@@ -252,9 +299,11 @@ class AimeEvaluator:
         responses: list[str] = []
         n = self.n_samples
         do_sample = self.temperature > 0 and n > 1
-        # P2（R2 审查）：num_return_sequences=n 把每批序列数放大 n 倍，峰值 KV/显存
-        # 随 batch×n 线性涨。按 n 收缩批内 prompt 数，把每批生成序列数压回 batch_size
-        # 量级（n 感知批缩放；batch_size<n 时退化为逐 prompt，仍受 n 保护）。
+        # P2（R2 审查）+ 二次审阅修复 #6：num_return_sequences=n 把每批序列数放大 n 倍，
+        # 峰值 KV/显存随 batch×n 线性涨。策略：
+        #   n ≤ batch_size → 每批 batch_size//n 个 prompt（把峰值压回 batch_size）；
+        #   n >  batch_size → 每次 generate 只给 1 个 prompt（峰值 = n，无法更低——
+        #     batch_size 旋钮对此区间无效，注释明示而非伪装"压回"）。
         step = self.batch_size if n <= 1 else max(1, self.batch_size // n)
         try:
             for i in range(0, len(prompts), step):
@@ -308,6 +357,11 @@ class AimeEvaluator:
                 "ground_truth": gt, "predicted": preds[0],
                 "correct": ok, "response": group[0],
                 "n_samples": n,
+                # 采样级审计数据（二次审阅修复）：每题 n 采样中【正确数】与全部预测答案——
+                # 使 ave@32 可从落盘精确重算（用户指出原 jsonl 只存 pass@1 的 correct，
+                # 无法复现 ave@32）。correct_count/n = 该题正确比例；30 题平均 = ave@32。
+                "correct_count": int(sum(per)),
+                "preds_all": preds,
             })
         ave = (sum(fracs) / len(fracs)) if fracs else None
         return AimeResult(dataset=dataset_ref, model_path=self.model_path,
@@ -326,4 +380,4 @@ class AimeEvaluator:
 
 __all__ = ["AimeEvaluator", "AimeResult", "extract_answer", "normalize_answer",
            "format_prompt", "AIME_DATASETS", "DEFAULT_DATASETS",
-           "PROMPT_TEMPLATE", "PROMPT_TEMPLATE_DAPO"]
+           "PROMPT_TEMPLATE", "PROMPT_TEMPLATE_DAPO", "_validate_device"]
