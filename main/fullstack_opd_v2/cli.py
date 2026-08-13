@@ -254,9 +254,8 @@ def _cmd_eval_aime(args) -> int:
                 print(f"[eval-aime] {ds}: 续跑（已有 {done_before} 题落盘，本轮完成 {len(res.rows)} 题）")
             # 二次审阅修复 #1：分口径标注——pass1 与 ave 混排会误导
             # （"27/30 = 56.25%" 里 27/30 是 pass@1、56.25% 是 ave@32，两码事）。
-            # res.correct 只计本轮新完成题的命中；完整 ave@32 需读全部落盘行重算。
+            # res.correct/total 均只计本轮新完成题（同口径）；完整 ave@32/pass@1 需读全部落盘行重算。
             if ev.metric == "ave":
-                total_rows = done_before + len(res.rows)
                 # 用落盘全部行重算 ave@32（含续跑前的题），pass@1 同理
                 try:
                     all_rows = [json.loads(l) for l in open(out_path, encoding="utf-8")

@@ -607,35 +607,66 @@ class AimeEvaluator:
         解决长生成评估痛点：原 evaluate_to_jsonl 等全部 N 题生成完才一次写盘，
         长协议（32768 token × 32 采样）下中断即全丢。本方法：
 
-        - 逐题处理：每题单独 generate（得 n 采样）→ 评分 → 立即追加写一行 jsonl；
+        - 逐题处理：每题单独 generate（得 n 采样）-> 评分 -> 立即追加写一行 jsonl；
         - resume：开始时读已有 jsonl 的 problem_id，跳过已完成题，只评估未完成的
           （意外中断后重跑同一 out_path 即可续跑，不重复已花算力）；
+        - **n_samples 一致性校验**：resume 时若已落盘行的 n_samples 与当前不符 -> 报错
+          （混口径会让 ave@32 无意义，宁可报错也不静默错算）；
+        - **每题进度打印**：长生成每题耗时，逐题打印 `[eval-aime] {ds}: i/N 完成`
+          + 累计 pass@1，避免"看不到进度、不知是否卡死"；
+        - **单题失败容错**：单题 generate/评分异常 -> 打印警告、**不落盘该题**、继续下一题
+          （下次 resume 会重评该题，因未落盘）；整体崩才靠 resume 兜底。
         - 每行完整（含 preds_all/correct_count），ave@32 仍可精确重算。
 
-        返回的 AimeResult.rows 只含本次新完成的题（total 仍为数据集总题数，
-        correct 只计本次完成题的命中，便于打印时区分）。
+        返回值口径：`rows`/`correct`/`total` **均只计本轮新完成题**（同口径），
+        便于打印"本轮完成 M 题"。完整 ave@32/pass@1 需读全部落盘行重算（CLI 已做）。
         """
         problems = self.load_problems(dataset_ref)
         prompts = [format_prompt(p, self.prompt_style) for p, _ in problems]
         n = self.n_samples
         done = self._load_done_ids(out_path)
+        # 缺陷2修复：resume n_samples 一致性校验（防混口径 ave@32）
+        if done and os.path.isfile(out_path):
+            with open(out_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    pid = r.get("problem_id")
+                    if isinstance(pid, int) and pid in done:
+                        prev_n = r.get("n_samples")
+                        if isinstance(prev_n, int) and prev_n != n:
+                            raise ConfigError(
+                                f"resume n_samples 不一致：已落盘 {prev_n}，当前 {n}。"
+                                f"混口径会让 ave@32 无意义。请清空 {out_path} 或用相同 "
+                                f"--n-samples 重跑。")
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        # 打开追加写句柄，逐题即时 flush
         rows: list[dict] = []
         correct = 0
         fracs: list[float] = []
+        N = len(problems)
         with open(out_path, "a", encoding="utf-8") as f:
             for i, (problem, gt) in enumerate(problems):
                 if i in done:
                     continue                    # resume：跳过已完成的题
-                group = self.generate([prompts[i]])   # 单题 n 采样，拍平 n 条
-                if self.scoring == "sympy":
-                    preds = [(_extract_boxed_answer(r) or "") for r in group]
-                    per = [self._grade_sympy(p, gt) for p in preds]
-                else:
-                    preds = [extract_answer(r, self.prompt_style) for r in group]
-                    gt_n = normalize_answer(gt)
-                    per = [normalize_answer(p) == gt_n for p in preds]
+                # 缺陷4修复：单题失败容错--不落盘该题、警告、继续下一题（resume 会重评）
+                try:
+                    group = self.generate([prompts[i]])   # 单题 n 采样，拍平 n 条
+                    if self.scoring == "sympy":
+                        preds = [(_extract_boxed_answer(r) or "") for r in group]
+                        per = [self._grade_sympy(p, gt) for p in preds]
+                    else:
+                        preds = [extract_answer(r, self.prompt_style) for r in group]
+                        gt_n = normalize_answer(gt)
+                        per = [normalize_answer(p) == gt_n for p in preds]
+                except Exception as e:
+                    print(f"[eval-aime] {dataset_ref}: 题 {i} 失败（{type(e).__name__}: "
+                          f"{str(e)[:80]}），跳过不落盘，下次 resume 重评")
+                    continue
                 ok = any(per)
                 correct += int(ok)
                 if self.metric == "ave" and n:
@@ -651,9 +682,15 @@ class AimeEvaluator:
                 rows.append(row)
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 f.flush()                        # 每题即时落盘（防中断丢整批）
+                # 缺陷1修复：逐题进度打印（长生成可见进度，避免"不知是否卡死"）
+                done_now = len(done) + len(rows)
+                pass1_so_far = sum(1 for r in rows if r["correct"])
+                print(f"[eval-aime] {dataset_ref}: {done_now}/{N} 完成 "
+                      f"(本轮 pass@1 {pass1_so_far}/{len(rows)})")
         ave = (sum(fracs) / len(fracs)) if fracs else None
+        # 缺陷3修复：total 与 correct 同口径（均只计本轮新完成题）
         return AimeResult(dataset=dataset_ref, model_path=self.model_path,
-                          correct=correct, total=len(problems), rows=rows,
+                          correct=correct, total=len(rows), rows=rows,
                           ave_accuracy=ave)
 
 

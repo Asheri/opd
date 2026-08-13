@@ -416,3 +416,78 @@ def test_load_done_ids_handles_corrupt_line(tmp_path):
     ev = object.__new__(AimeEvaluator)
     done = ev._load_done_ids(out)
     assert done == {0, 2}
+
+
+def test_progressive_resume_rejects_mismatched_n_samples(tmp_path):
+    """缺陷2：resume 时 n_samples 与已落盘不符 -> 报错（防混口径 ave@32）。"""
+    out = str(tmp_path / "AIME24.jsonl")
+    import json as _json
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(_json.dumps({"problem_id": 0, "dataset": "AIME24", "correct": True,
+                             "n_samples": 32, "correct_count": 1, "preds_all": ["42"],
+                             "response": "\boxed{42}", "ground_truth": "42",
+                             "predicted": "42"}) + "\n")
+    ev = _fake_evaluator(responses=["\boxed{7}"], problems=[("p1", "7")])
+    ev.n_samples = 8                      # 与已落盘 32 不符
+    ev.load_problems = lambda d: [("p0", "42"), ("p1", "7")]
+    ev.tok = mock.Mock()
+    with pytest.raises(ConfigError, match="n_samples 不一致"):
+        ev.evaluate_progressive("AIME24", out)
+
+
+def test_progressive_single_problem_failure_continues(tmp_path, capsys):
+    """缺陷4：单题 generate 失败 -> 警告、不落盘、继续下一题。"""
+    ev = _fake_evaluator(
+        responses=["\boxed{42}", "\boxed{7}"],
+        problems=[("p0", "42"), ("p1", "7")])
+    ev.n_samples = 1
+    ev.load_problems = lambda d: [("p0", "42"), ("p1", "7")]
+    ev.tok = mock.Mock()
+    # 让第一次 generate 抛异常，第二次正常
+    calls = {"n": 0}
+    orig_gen = ev.generate
+    def flaky_gen(prompts):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("模拟 OOM")
+        return orig_gen(prompts)
+    ev.generate = flaky_gen
+    out = str(tmp_path / "AIME24.jsonl")
+    res = ev.evaluate_progressive("AIME24", out)
+    # 题0 失败未落盘，题1 完成 -> rows 只 1 条
+    assert len(res.rows) == 1
+    assert res.rows[0]["problem_id"] == 1
+    lines = [l for l in open(out, encoding="utf-8") if l.strip()]
+    assert len(lines) == 1                 # 失败题不写盘
+    captured = capsys.readouterr().out
+    assert "题 0 失败" in captured          # 警告打印
+
+
+def test_progressive_total_matches_rows(tmp_path):
+    """缺陷3：返回值 total 与 correct 同口径（均只计本轮新完成题）。"""
+    ev = _fake_evaluator(
+        responses=["\boxed{42}", "\boxed{99}"],   # 题0 对、题1 错（99≠7）
+        problems=[("p0", "42"), ("p1", "7")])
+    ev.n_samples = 1
+    ev.load_problems = lambda d: [("p0", "42"), ("p1", "7")]
+    ev.tok = mock.Mock()
+    out = str(tmp_path / "AIME24.jsonl")
+    res = ev.evaluate_progressive("AIME24", out)
+    assert res.total == len(res.rows) == 2   # 同口径（非数据集总题数这里也=2）
+    assert res.correct == 1                   # 只题0 对
+
+
+def test_progressive_prints_per_problem_progress(tmp_path, capsys):
+    """缺陷1：每题完成打印进度（长生成可见）。"""
+    ev = _fake_evaluator(
+        responses=["\boxed{42}", "\boxed{7}", "\boxed{5}"],
+        problems=[("p0", "42"), ("p1", "7"), ("p2", "5")])
+    ev.n_samples = 1
+    ev.load_problems = lambda d: [("p0", "42"), ("p1", "7"), ("p2", "5")]
+    ev.tok = mock.Mock()
+    out = str(tmp_path / "AIME24.jsonl")
+    ev.evaluate_progressive("AIME24", out)
+    captured = capsys.readouterr().out
+    # 应出现 3 条逐题进度
+    assert captured.count("完成") >= 3
+    assert "1/3" in captured and "3/3" in captured
