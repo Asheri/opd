@@ -306,6 +306,7 @@ class AimeEvaluator:
 
     # 类级默认：测试用 object.__new__ 绕过 __init__ 构造时也具该属性（不设则 evaluate 报错）。
     scoring = "int"
+    chat_template = False
 
     def __init__(self, model_path: str, device: str = "cpu",
                  max_new_tokens: int = 2048, batch_size: int = 8,
@@ -314,7 +315,8 @@ class AimeEvaluator:
                  top_p: float | None = None,
                  metric: str = "pass1",
                  prompt_style: str = "boxed",
-                 scoring: str = "int"):
+                 scoring: str = "int",
+                 chat_template: bool = False):
         # P2：参数校验前置（transformers 导入/模型加载之前），配置错快速失败、零副作用。
         # 上下文上限按模型 config 动态取（Qwen3=40960，对齐论文 MAX_VAL_RESP_LENGTH 31744）；
         # 模型加载后才得知，故保守前置校验用 _MAX_CONTEXT（历史默认 4096）挡明显非法值，
@@ -325,6 +327,9 @@ class AimeEvaluator:
         if scoring not in ("int", "sympy"):
             raise ConfigError(f"scoring={scoring!r} 非法：须 int | sympy（sympy=论文数学等价判定）")
         self.scoring = scoring
+        # chat_template=True：对齐论文 verl 验证（schemas.py _handle_apply_chat_template）——
+        # 用模型 chat template 包裹 prompt（<|im_start|>user/assistant），非裸字符串。
+        self.chat_template = bool(chat_template)
         self.n_samples = max(1, int(n_samples))
         self.temperature = float(temperature)
         self.top_p = float(top_p) if top_p is not None else None
@@ -475,6 +480,14 @@ class AimeEvaluator:
         try:
             for i in range(0, len(prompts), step):
                 batch = prompts[i:i + step]
+                if self.chat_template:
+                    # 对齐论文 verl 验证：apply_chat_template 包裹（<|im_start|>user/assistant）。
+                    # prompt 已是 boxed 模板文本（含"reason step by step...\boxed{}"），
+                    # 作为 user 消息传入；add_generation_prompt=True 追加 assistant 头。
+                    batch = [self.tok.apply_chat_template(
+                        [{"role": "user", "content": p}],
+                        add_generation_prompt=True, tokenize=False)
+                        for p in batch]
                 enc = self.tok(batch, return_tensors="pt", padding=True,
                                truncation=True,
                                max_length=max(1, self.max_ctx - self.max_new_tokens))

@@ -145,6 +145,8 @@ class EvalCfg(_Strict):
     batch_size: int = 8
     # 评分方式：int（默认，整数精确匹配）| sympy（论文 grade_answer_mathd/sympy 数学等价判定）
     scoring: Literal["int", "sympy"] = "int"
+    # chat_template（默认 False）：True 用模型 chat template 包裹 prompt（对齐论文 verl 验证）
+    chat_template: bool = False
 
 
 class OPDConfig(_Strict):

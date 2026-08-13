@@ -154,6 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=None,
                    help="生成 batch（默认 8）。长生成（max_new_tokens 数万）必须调小——峰值显存随 "
                         "batch 线性涨，单卡 97GB 下论文 32768 长生成建议 1-2，否则 OOM")
+    p.add_argument("--chat-template", action="store_true", default=None,
+                   help="用模型 chat template 包裹 prompt（对齐论文 verl 验证的 apply_chat_template）")
     p.add_argument("--dtype", default=None, help="fp32 | bf16 | float16 | auto（默认 auto）")
     p.add_argument("--device", default=None)
     return ap
@@ -235,6 +237,8 @@ def _cmd_eval_aime(args) -> int:
                      else run_eval_cfg.get("scoring", "int")),
             batch_size=(args.batch_size if args.batch_size is not None
                         else run_eval_cfg.get("batch_size", 8)),
+            chat_template=(args.chat_template if args.chat_template
+                           else run_eval_cfg.get("chat_template", False)),
             dtype=(args.dtype if args.dtype is not None
                    else run_eval_cfg.get("dtype", "auto"))) as ev:
         print(f"[eval-aime] model={model_path}  datasets={datasets}  device={device}")

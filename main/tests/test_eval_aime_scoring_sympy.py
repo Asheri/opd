@@ -67,3 +67,79 @@ def test_sympy_leading_zeros_equivalent():
 def test_sympy_mathd_string_equal():
     assert _grade_answer_mathd("1/2", "1/2")
     assert not _grade_answer_mathd("1/2", "1/3")
+
+
+# ---------- chat_template 对齐论文 verl（apply_chat_template 包裹） ----------
+def test_chat_template_wraps_prompt(monkeypatch):
+    """chat_template=True 时 generate 用 apply_chat_template 包裹每个 prompt。"""
+    import unittest.mock as mock
+    from fullstack_opd_v2.eval_aime import AimeEvaluator
+    ev = object.__new__(AimeEvaluator)
+    ev.model_path = "fake"
+    ev.device = "cpu"
+    ev.max_new_tokens = 16
+    ev.max_ctx = 4096
+    ev.batch_size = 8
+    ev.n_samples = 1
+    ev.temperature = 0.0
+    ev.top_p = None
+    ev.metric = "pass1"
+    ev.prompt_style = "boxed"
+    ev.scoring = "int"
+    ev.chat_template = True
+    # fake tokenizer：apply_chat_template 把 user 消息包成 <|im_start|>user/assistant 标记
+    ev.tok = mock.Mock()
+    ev.tok.pad_token_id = 0
+    ev.tok.pad_token = "<pad>"
+    ev.tok.padding_side = "left"
+    ev.tok.apply_chat_template.side_effect = (
+        lambda msgs, **kw: "<|im_start|>user\n" + msgs[0]["content"] + "<|im_end|>\n<|im_start|>assistant\n"
+    )
+    # fake model.generate：验证收到的 input 已包裹
+    captured = {}
+    def fake_generate(**kw):
+        captured["input_ids"] = kw["input_ids"]
+        import torch
+        return torch.zeros(1, 5, dtype=torch.long)  # 1 序列 × 5 token
+    ev.model = mock.Mock()
+    ev.model.generate.side_effect = fake_generate
+    # fake tokenize：记录输入文本
+    import torch
+    def fake_tok_call(batch, **kw):
+        captured["texts"] = batch
+        return {"input_ids": torch.zeros(len(batch), 4, dtype=torch.long),
+                "attention_mask": torch.ones(len(batch), 4, dtype=torch.long)}
+    ev.tok.side_effect = fake_tok_call
+    out = ev.generate(["question?"])
+    assert captured["texts"][0].startswith("<|im_start|>user\n")
+    assert "question?" in captured["texts"][0]
+    assert "<|im_start|>assistant" in captured["texts"][0]
+
+
+def test_chat_template_off_keeps_raw(monkeypatch):
+    """chat_template=False（默认）时不做包裹，保持原裸字符串。"""
+    import unittest.mock as mock
+    from fullstack_opd_v2.eval_aime import AimeEvaluator
+    ev = object.__new__(AimeEvaluator)
+    ev.model_path = "fake"
+    ev.device = "cpu"
+    ev.max_new_tokens = 16
+    ev.max_ctx = 4096
+    ev.batch_size = 8
+    ev.n_samples = 1
+    ev.temperature = 0.0
+    ev.top_p = None
+    ev.metric = "pass1"
+    ev.prompt_style = "boxed"
+    ev.scoring = "int"
+    ev.chat_template = False
+    ev.tok = mock.Mock()
+    ev.tok.pad_token_id = 0
+    import torch
+    ev.tok.side_effect = lambda batch, **kw: {"input_ids": torch.zeros(len(batch), 4, dtype=torch.long),
+                                               "attention_mask": torch.ones(len(batch), 4, dtype=torch.long)}
+    captured = {}
+    ev.model = mock.Mock()
+    ev.model.generate.side_effect = lambda **kw: torch.zeros(1, 5, dtype=torch.long)
+    ev.generate(["raw question?"])
+    assert ev.tok.apply_chat_template.call_count == 0  # 未调用包裹
