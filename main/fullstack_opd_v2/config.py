@@ -141,6 +141,10 @@ class EvalCfg(_Strict):
     max_new_tokens: int = 2048
     n_samples: int = 1
     temperature: float = 0.0
+    # 生成 batch（默认 8）。长生成（max_new_tokens 数万）必须调小——峰值显存随 batch 线性涨。
+    batch_size: int = 8
+    # 评分方式：int（默认，整数精确匹配）| sympy（论文 grade_answer_mathd/sympy 数学等价判定）
+    scoring: Literal["int", "sympy"] = "int"
 
 
 class OPDConfig(_Strict):

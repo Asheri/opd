@@ -91,6 +91,162 @@ def normalize_answer(a) -> int | None:
     return int(s)
 
 
+# --------------------------- 论文评分（Direct-OPD ttrl_math fast 路径） -------------
+# 对齐论文 `reward_score/ttrl_math` 的默认 `grade()`（fast=True）：
+#   `grade_answer_mathd(...) or grade_answer_sympy(...)`。
+# 与简单整数匹配不同，它做数学等价判定（3/4 与 0.75、\frac{25}{8} 等价等），
+# 且提取用「最后一个 \boxed{}」级联（长 CoT 中途草稿不污染）。
+# 依赖 sympy（论文运行环境必装）；缺失时报错而非静默降级回整数匹配。
+
+def _boxed_last(s: str) -> str | None:
+    """取最后一个 \\boxed{...} 的完整文本（用花括号配对找闭合，论文 last_boxed_only_string）。"""
+    s = s.replace("\\fbox", "\\boxed")
+    idx = s.rfind("\\boxed")
+    if idx < 0:
+        return None
+    i = idx
+    left = 0
+    while i < len(s):
+        if s[i] == "{":
+            left += 1
+        elif s[i] == "}":
+            left -= 1
+            if left == 0:
+                return s[idx:i + 1]
+        i += 1
+    return None
+
+
+def _remove_boxed(s: str) -> str | None:
+    left = "\\boxed{"
+    if s.startswith(left) and s.endswith("}"):
+        return s[len(left):-1]
+    return None
+
+
+def _extract_boxed_answer(text: str) -> str | None:
+    """论文 extract_boxed_answer：取最后一个 \\boxed{} 内容。"""
+    b = _boxed_last(text)
+    if b is None:
+        return None
+    return _remove_boxed(b)
+
+
+def _parse_latex(expr: str) -> str:
+    """论文 _parse_latex：pylatexenc 把 latex 转成 sympy 可读的普通文本。
+
+    - \frac -> " \frac"（混合数友好）→ latex2text 输出如 "25/8"；
+    - 常见数学符号（√ π ∞ ∪ · ×）替换为文本等价。
+    依赖 pylatexenc（论文运行环境必装）；缺失时原样返回（宁可少判对也不报错）。
+    """
+    expr = expr.replace("\\tfrac", "\\frac")
+    expr = expr.replace("\\dfrac", "\\frac")
+    expr = expr.replace("\\frac", " \\frac")
+    try:
+        from pylatexenc.latex2text import LatexNodes2Text
+        expr = LatexNodes2Text().latex_to_text(expr)
+    except Exception:
+        return expr
+    expr = (expr.replace("√", "sqrt").replace("π", "pi")
+            .replace("∞", "inf").replace("∪", "U")
+            .replace("·", "*").replace("×", "*"))
+    return expr.strip()
+
+
+def _norm_sympy(expr: str) -> str:
+    """论文 _normalize（对称归一化，去单位/空格/%/latex → sympy 可读）。量级对齐原实现。"""
+    if expr is None:
+        return ""
+    expr = str(expr)
+    m = re.search(r"^\\text\{(?P<text>.+?)\}$", expr)
+    if m is not None:
+        expr = m.group("text")
+    expr = (expr.replace("\\%", "%").replace("\\$", "$")
+            .replace("$", "").replace("%", ""))
+    expr = expr.replace(" or ", " , ").replace(" and ", " , ")
+    expr = expr.replace("million", "*10^6").replace("billion", "*10^9").replace("trillion", "*10^12")
+    for unit in ["degree", "cm", "centimeter", "meter", "mile", "second", "minute",
+                 "hour", "day", "week", "month", "year", "foot", "feet", "inch", "yard"]:
+        expr = re.sub(f"{unit}(es)?(s)? *(\\^[0-9]+)?", "", expr)
+    expr = re.sub(r"\^ *\\circ", "", expr)
+    if len(expr) > 0 and expr[0] == "{" and expr[-1] == "}":
+        expr = expr[1:-1]
+    expr = re.sub(r",\\! *", "", expr)
+    try:
+        if float(expr) and abs(float(expr) - round(float(expr))) <= 1e-7:
+            expr = str(int(round(float(expr))))
+    except Exception:
+        pass
+    # 论文顺序：含 latex 时先转文本（\frac{25}{8} -> 25/8），再做混合数/去空格/去 {}。
+    if "\\" in expr:
+        expr = _parse_latex(expr)
+    expr = re.sub(r"- *", "-", expr)
+    # 混合数 7 3/4 -> 7+3/4
+    expr = re.sub(r"(\d) +(\d)", r"\1+\2", expr)
+    expr = expr.replace(" ", "")
+    expr = expr.replace("{", "").replace("}", "")
+    expr = expr.lower()
+    try:
+        f = float(expr)
+        if abs(f - round(f)) <= 1e-7:
+            expr = str(int(round(f)))
+    except Exception:
+        pass
+    return expr
+
+
+def _sympy_parse(expr: str):      # pragma: no cover - 依赖 sympy
+    """论文 _sympy_parse：^ -> **，implicit multiplication。"""
+    import sympy
+    from sympy.parsing import sympy_parser
+    py = expr.replace("^", "**")
+    return sympy_parser.parse_expr(
+        py, transformations=(sympy_parser.standard_transformations
+                              + (sympy_parser.implicit_multiplication_application,)))
+
+
+def _are_equal_under_sympy(gt: str, given: str) -> bool:    # pragma: no cover
+    """论文 are_equal_under_sympy：sympy 化简差为 0 判等。"""
+    import sympy
+    bad = ["^{", "^(", re.compile(r"\^[0-9]+\^"), re.compile(r"\^[0-9][0-9]+")]
+    expr = f"({gt})-({given})"
+    if any((b in expr if isinstance(b, str) else b.search(expr)) for b in bad):
+        return False
+    if len(set(c for c in expr if c.isalpha() and c not in "sqrfrac")) > 2:
+        return False
+    try:
+        diff = _sympy_parse(expr)
+        return sympy.simplify(diff) == 0
+    except Exception:
+        return False
+
+
+def _grade_answer_sympy(given: str, ground_truth: str) -> bool:    # pragma: no cover
+    """论文 grade_answer_sympy（fast 路径，无 math_verify 兜底）。"""
+    gt_n, gv_n = _norm_sympy(ground_truth), _norm_sympy(given)
+    if gt_n == gv_n:
+        return True
+    if not gv_n:
+        return False
+    if gt_n == given and len(given) == 0:
+        return False
+    # 单元素（AIME 答案都是整数/分数，忽略 tuple 分支）
+    f_gt = re.fullmatch(r"-?\d+/\d+", gt_n)
+    f_gv = re.fullmatch(r"-?\d+/\d+", gv_n)
+    if f_gt and f_gv:
+        return gt_n == gv_n
+    i_gt = re.fullmatch(r"-?\d+", gt_n)
+    i_gv = re.fullmatch(r"-?\d+", gv_n)
+    if bool(i_gt) != bool(i_gv):
+        return False
+    return _are_equal_under_sympy(gt_n, gv_n)
+
+
+def _grade_answer_mathd(given: str, ground_truth: str) -> bool:
+    """论文 grade_answer_mathd：mathd 归一化后字符串相等。"""
+    return _norm_sympy(given) == _norm_sympy(ground_truth)
+
+
 def _validate_device(device: str) -> str:
     """校验 device 格式（P2 修复）：合法为 cpu | cuda[:N]。
 
@@ -148,13 +304,17 @@ class AimeEvaluator:
     n_samples>1 时对每题采样 N 条，`correct` 记 pass@1（任一采样答对即对）。
     """
 
+    # 类级默认：测试用 object.__new__ 绕过 __init__ 构造时也具该属性（不设则 evaluate 报错）。
+    scoring = "int"
+
     def __init__(self, model_path: str, device: str = "cpu",
                  max_new_tokens: int = 2048, batch_size: int = 8,
                  n_samples: int = 1, temperature: float = 0.0,
                  trust_remote_code: bool = False, dtype: str = "auto",
                  top_p: float | None = None,
                  metric: str = "pass1",
-                 prompt_style: str = "boxed"):
+                 prompt_style: str = "boxed",
+                 scoring: str = "int"):
         # P2：参数校验前置（transformers 导入/模型加载之前），配置错快速失败、零副作用。
         # 上下文上限按模型 config 动态取（Qwen3=40960，对齐论文 MAX_VAL_RESP_LENGTH 31744）；
         # 模型加载后才得知，故保守前置校验用 _MAX_CONTEXT（历史默认 4096）挡明显非法值，
@@ -162,6 +322,9 @@ class AimeEvaluator:
         if int(max_new_tokens) >= _MAX_CONTEXT and int(max_new_tokens) > 32768:
             raise ConfigError(
                 f"max_new_tokens={max_new_tokens} 异常大（>32768）；请检查")
+        if scoring not in ("int", "sympy"):
+            raise ConfigError(f"scoring={scoring!r} 非法：须 int | sympy（sympy=论文数学等价判定）")
+        self.scoring = scoring
         self.n_samples = max(1, int(n_samples))
         self.temperature = float(temperature)
         self.top_p = float(top_p) if top_p is not None else None
@@ -296,15 +459,19 @@ class AimeEvaluator:
         避免逐 prompt 多次模型调用（R1 性能修复）。
         """
         import torch
+        import math
         responses: list[str] = []
         n = self.n_samples
         do_sample = self.temperature > 0 and n > 1
-        # P2（R2 审查）+ 二次审阅修复 #6：num_return_sequences=n 把每批序列数放大 n 倍，
-        # 峰值 KV/显存随 batch×n 线性涨。策略：
-        #   n ≤ batch_size → 每批 batch_size//n 个 prompt（把峰值压回 batch_size）；
-        #   n >  batch_size → 每次 generate 只给 1 个 prompt（峰值 = n，无法更低——
-        #     batch_size 旋钮对此区间无效，注释明示而非伪装"压回"）。
-        step = self.batch_size if n <= 1 else max(1, self.batch_size // n)
+        # P2（R2 审查）+ 二次审阅修复 #6（实质修复）：num_return_sequences=n 把每批序列数
+        # 放大 n 倍，峰值 KV/显存随 batch×n 线性涨（部署实测：n=32 × 30000 token 长生成
+        # 在 4B 上 OOM——93GB 撑爆 96GB）。真正解决：把每批的序列数压到 batch_size 量级——
+        #   - 每批 prompt 数 = batch_size // chunk（prompt 维度收窄）
+        #   - 每个 prompt 的 n 条采样拆成 ceil(n/chunk) 个子批（num_return_sequences=chunk），
+        #     峰值序列数 = chunk × (batch_size//chunk) ≈ batch_size，与 n 无关。
+        chunk = n if n <= 1 else max(1, min(self.batch_size, n))
+        step = self.batch_size if n <= 1 else max(1, self.batch_size // chunk)
+        n_chunks = max(1, math.ceil(n / chunk)) if n > 1 else 1
         try:
             for i in range(0, len(prompts), step):
                 batch = prompts[i:i + step]
@@ -313,23 +480,36 @@ class AimeEvaluator:
                                max_length=max(1, self.max_ctx - self.max_new_tokens))
                 enc = {k: v.to(self.device) for k, v in enc.items()}
                 seq_len = enc["input_ids"].size(1)
-                with torch.no_grad():
-                    gen_kwargs = dict(
-                        max_new_tokens=self.max_new_tokens,
-                        do_sample=do_sample, num_return_sequences=n,
-                        temperature=self.temperature if do_sample else 1.0,
-                        pad_token_id=self.tok.pad_token_id)
-                    if do_sample and self.top_p is not None:
-                        gen_kwargs["top_p"] = self.top_p
-                    out = self.model.generate(**enc, **gen_kwargs)
-                for o in out:
-                    responses.append(self.tok.decode(o[seq_len:],
-                                                     skip_special_tokens=True))
+                for _c in range(n_chunks):
+                    with torch.no_grad():
+                        gen_kwargs = dict(
+                            max_new_tokens=self.max_new_tokens,
+                            do_sample=do_sample, num_return_sequences=chunk,
+                            temperature=self.temperature if do_sample else 1.0,
+                            pad_token_id=self.tok.pad_token_id)
+                        if do_sample and self.top_p is not None:
+                            gen_kwargs["top_p"] = self.top_p
+                        out = self.model.generate(**enc, **gen_kwargs)
+                    for o in out:
+                        responses.append(self.tok.decode(o[seq_len:],
+                                                         skip_special_tokens=True))
         except Exception as e:
             raise TrainingError(f"AIME 生成失败：{e}") from e
         return responses
 
     # --------------------------- 评估 ---------------------------
+    def _grade_sympy(self, pred: str, gt: str) -> bool:
+        """论文 grade()：grade_answer_mathd(...) or grade_answer_sympy(...)。"""
+        if not pred:
+            return False
+        try:
+            if _grade_answer_mathd(pred, gt):
+                return True
+            return _grade_answer_sympy(pred, gt)
+        except ImportError:
+            raise ModelError(
+                "scoring='sympy' 需要 sympy（论文评分依赖）；请 pip install sympy")
+
     def evaluate(self, dataset_ref: str) -> AimeResult:
         """在单个 AIME 数据集上评估。
 
@@ -345,9 +525,14 @@ class AimeEvaluator:
         rows = []
         for i, (problem, gt) in enumerate(problems):
             group = responses[i * n:(i + 1) * n]
-            preds = [extract_answer(r, self.prompt_style) for r in group]
-            gt_n = normalize_answer(gt)
-            per = [normalize_answer(p) == gt_n for p in preds]
+            if self.scoring == "sympy":
+                # 论文协议：\boxed{} 级联提取 + 数学等价判定（grade_answer_mathd or sympy）
+                preds = [(_extract_boxed_answer(r) or "") for r in group]
+                per = [self._grade_sympy(p, gt) for p in preds]
+            else:
+                preds = [extract_answer(r, self.prompt_style) for r in group]
+                gt_n = normalize_answer(gt)
+                per = [normalize_answer(p) == gt_n for p in preds]
             ok = any(per)
             correct += int(ok)
             if self.metric == "ave" and n:

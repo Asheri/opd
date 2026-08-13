@@ -116,6 +116,7 @@ def test_cli_eval_aime_run_dir_bridge(tmp_path, capsys, monkeypatch):
     import fullstack_opd_v2.eval_aime as EA
 
     class FakeAimeEvaluator:
+        metric = "pass1"          # CLI 按 ev.metric 分支打印（真实类有该属性）
         def __init__(self, *a, **k):
             pass
         def __enter__(self):
