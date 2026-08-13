@@ -96,6 +96,7 @@ def _fake_evaluator(responses, problems, **over):
     ev.model_path = "fake"
     ev.device = "cpu"
     ev.max_new_tokens = 16
+    ev.max_ctx = 4096
     ev.batch_size = 8
     ev.n_samples = 1
     ev.temperature = 0.0
@@ -169,6 +170,7 @@ def test_evaluate_ave_metric_returns_per_problem_fraction():
     ev.model_path = "fake"
     ev.device = "cpu"
     ev.max_new_tokens = 16
+    ev.max_ctx = 4096
     ev.batch_size = 8
     ev.n_samples = 2
     ev.temperature = 0.7
@@ -208,6 +210,7 @@ def test_generate_passes_top_p_when_sampling(monkeypatch):
     ev.top_p = 0.95
     ev.batch_size = 8
     ev.max_new_tokens = 8
+    ev.max_ctx = 4096
     tok = mock.Mock()
     tok.pad_token_id = 0
     tok.decode = mock.Mock(return_value="\\boxed{1}")
@@ -241,6 +244,7 @@ def test_n_samples_pass_at_1():
     ev.model_path = "fake"
     ev.device = "cpu"
     ev.max_new_tokens = 16
+    ev.max_ctx = 4096
     ev.batch_size = 8
     ev.n_samples = 2
     ev.temperature = 0.7
@@ -256,19 +260,19 @@ def test_n_samples_pass_at_1():
 
 
 def test_max_new_tokens_too_large_rejected():
-    """R1 + P2：max_new_tokens >= 4096 抛 ConfigError（校验前置、不加载模型）。
+    """R1 + P2 + 对齐论文长生成：max_new_tokens 异常大（>32768）抛 ConfigError（前置）。
 
-    P2 修复后参数校验在 transformers 导入之前：max_new_tokens 过大用不存在的模型
-    路径也直接抛 ConfigError（不触碰模型加载）；4095 通过校验、进入 tokenizer
-    加载才抛 ModelError——证明该校验真实生效于 __init__，而非测试自复制的逻辑。
+    论文评估用长生成（MAX_VAL_RESP_LENGTH=31744）→ 放宽容许到 32768；
+    32768 通过前置校验、进入 tokenizer 加载（路径不存在）才抛 ModelError。
     """
     import fullstack_opd_v2.eval_aime as EA
-    with pytest.raises(ConfigError):
-        AimeEvaluator("/nonexistent/path", max_new_tokens=EA._MAX_CONTEXT + 10)
-    with pytest.raises(ConfigError):                      # 边界：==4096 抛错
-        AimeEvaluator("/nonexistent/path", max_new_tokens=EA._MAX_CONTEXT)
-    with pytest.raises(ModelError):                       # 边界：4095 通过校验 → 路径不存在
-        AimeEvaluator("/nonexistent/path", max_new_tokens=EA._MAX_CONTEXT - 1)
+    with pytest.raises(ConfigError):                      # >32768 异常大 → 前置抛
+        AimeEvaluator("/nonexistent/path", max_new_tokens=40000)
+    with pytest.raises(ModelError):                       # 32768 通过前置 → 路径不存在
+        AimeEvaluator("/nonexistent/path", max_new_tokens=32768)
+    with pytest.raises(ModelError):                       # 4095 通过 → 路径不存在
+        AimeEvaluator("/nonexistent/path", max_new_tokens=4095)
+    assert EA._MAX_CONTEXT == 4096                        # 历史默认仍 4096（回退值）
 
 
 def test_generate_direct_batch_n_samples(monkeypatch):
@@ -293,6 +297,7 @@ def test_generate_direct_batch_n_samples(monkeypatch):
         ev.prompt_style = "boxed"
         ev.batch_size = batch_size
         ev.max_new_tokens = 8
+        ev.max_ctx = 4096
         tok = mock.Mock()
         tok.pad_token_id = 0
         tok.decode = mock.Mock(return_value="\\boxed{1}")

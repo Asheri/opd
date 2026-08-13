@@ -121,9 +121,12 @@ class AimeEvaluator:
                  metric: str = "pass1",
                  prompt_style: str = "boxed"):
         # P2：参数校验前置（transformers 导入/模型加载之前），配置错快速失败、零副作用。
-        if int(max_new_tokens) >= _MAX_CONTEXT:
+        # 上下文上限按模型 config 动态取（Qwen3=40960，对齐论文 MAX_VAL_RESP_LENGTH 31744）；
+        # 模型加载后才得知，故保守前置校验用 _MAX_CONTEXT（历史默认 4096）挡明显非法值，
+        # 模型加载后 _resolve_max_context 按实际 config 复核（可放宽）。
+        if int(max_new_tokens) >= _MAX_CONTEXT and int(max_new_tokens) > 32768:
             raise ConfigError(
-                f"max_new_tokens={max_new_tokens} 接近/超过上下文上限 {_MAX_CONTEXT}；请调小")
+                f"max_new_tokens={max_new_tokens} 异常大（>32768）；请检查")
         self.n_samples = max(1, int(n_samples))
         self.temperature = float(temperature)
         self.top_p = float(top_p) if top_p is not None else None
@@ -148,6 +151,9 @@ class AimeEvaluator:
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
         self.batch_size = max(1, int(batch_size))
+        # 上下文上限：模型 config 的 max_position_embeddings（Qwen3=40960，对齐论文长生成）。
+        # 模型加载后从 config 取；缺省回退 _MAX_CONTEXT。
+        self.max_ctx = _MAX_CONTEXT
         try:
             self.tok = AutoTokenizer.from_pretrained(
                 model_path, trust_remote_code=trust_remote_code)
@@ -170,6 +176,15 @@ class AimeEvaluator:
         except Exception as e:
             raise ModelError(
                 f"加载模型 {model_path!r} 失败（路径/HF id 无效？）：{e}") from e
+        # 模型加载后按真实 config 复核上下文上限（可放宽到 max_position_embeddings，
+        # 对齐论文 MAX_VAL_RESP_LENGTH=31744；缺省回退 4096）。
+        # ⚠️ 只接受真实 int（mock/None 跳过）：测试的 fake model config 是 Mock 对象。
+        mpe = getattr(getattr(self.model, "config", None), "max_position_embeddings", None)
+        if isinstance(mpe, int) and mpe > 1:
+            self.max_ctx = mpe
+        if self.max_new_tokens >= self.max_ctx:
+            raise ConfigError(
+                f"max_new_tokens={self.max_new_tokens} ≥ 模型上下文上限 {self.max_ctx}；请调小")
 
     def close(self):
         """释放模型/tokenizer 与 GPU 显存。"""
@@ -246,7 +261,7 @@ class AimeEvaluator:
                 batch = prompts[i:i + step]
                 enc = self.tok(batch, return_tensors="pt", padding=True,
                                truncation=True,
-                               max_length=_MAX_CONTEXT - self.max_new_tokens)
+                               max_length=max(1, self.max_ctx - self.max_new_tokens))
                 enc = {k: v.to(self.device) for k, v in enc.items()}
                 seq_len = enc["input_ids"].size(1)
                 with torch.no_grad():
