@@ -123,6 +123,13 @@ def test_cli_eval_aime_run_dir_bridge(tmp_path, capsys, monkeypatch):
             return self          # R1：eval-aime 用 with AimeEvaluator(...) as ev 确保 close
         def __exit__(self, *exc):
             return False
+        def _load_done_ids(self, out_path):
+            return set()         # resume：无历史（fake 每次全新）
+        def evaluate_progressive(self, ds, out_path):
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"dataset": ds, "correct": True}) + "\n")
+            return type("R", (), {"correct": 1, "total": 1, "accuracy": 1.0, "rows": []})()
         def evaluate_to_jsonl(self, ds, out_path):
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:

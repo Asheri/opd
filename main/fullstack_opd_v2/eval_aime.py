@@ -575,6 +575,87 @@ class AimeEvaluator:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         return res
 
+    def _load_done_ids(self, out_path: str) -> set[int]:
+        """读已有 jsonl，返回已完成的 problem_id 集合（resume 保护）。
+
+        中断恢复：某题完成即落盘一行；重跑时跳过已落盘的题，只评估未完成的。
+        若已有行损坏（json 解析失败）则忽略该行（宁可重评也不卡死）。
+        """
+        if not os.path.isfile(out_path):
+            return set()
+        done: set[int] = set()
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue          # 损坏行：跳过（该题会重评）
+                    pid = r.get("problem_id")
+                    if isinstance(pid, int):
+                        done.add(pid)
+        except OSError:
+            return set()                  # 读失败：当无历史，重跑
+        return done
+
+    def evaluate_progressive(self, dataset_ref: str, out_path: str) -> AimeResult:
+        """逐题评估并**每题即时落盘** + 中断重载保护（resume）。
+
+        解决长生成评估痛点：原 evaluate_to_jsonl 等全部 N 题生成完才一次写盘，
+        长协议（32768 token × 32 采样）下中断即全丢。本方法：
+
+        - 逐题处理：每题单独 generate（得 n 采样）→ 评分 → 立即追加写一行 jsonl；
+        - resume：开始时读已有 jsonl 的 problem_id，跳过已完成题，只评估未完成的
+          （意外中断后重跑同一 out_path 即可续跑，不重复已花算力）；
+        - 每行完整（含 preds_all/correct_count），ave@32 仍可精确重算。
+
+        返回的 AimeResult.rows 只含本次新完成的题（total 仍为数据集总题数，
+        correct 只计本次完成题的命中，便于打印时区分）。
+        """
+        problems = self.load_problems(dataset_ref)
+        prompts = [format_prompt(p, self.prompt_style) for p, _ in problems]
+        n = self.n_samples
+        done = self._load_done_ids(out_path)
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        # 打开追加写句柄，逐题即时 flush
+        rows: list[dict] = []
+        correct = 0
+        fracs: list[float] = []
+        with open(out_path, "a", encoding="utf-8") as f:
+            for i, (problem, gt) in enumerate(problems):
+                if i in done:
+                    continue                    # resume：跳过已完成的题
+                group = self.generate([prompts[i]])   # 单题 n 采样，拍平 n 条
+                if self.scoring == "sympy":
+                    preds = [(_extract_boxed_answer(r) or "") for r in group]
+                    per = [self._grade_sympy(p, gt) for p in preds]
+                else:
+                    preds = [extract_answer(r, self.prompt_style) for r in group]
+                    gt_n = normalize_answer(gt)
+                    per = [normalize_answer(p) == gt_n for p in preds]
+                ok = any(per)
+                correct += int(ok)
+                if self.metric == "ave" and n:
+                    fracs.append(sum(per) / n)
+                row = {
+                    "problem_id": i, "dataset": dataset_ref,
+                    "ground_truth": gt, "predicted": preds[0],
+                    "correct": ok, "response": group[0],
+                    "n_samples": n,
+                    "correct_count": int(sum(per)),
+                    "preds_all": preds,
+                }
+                rows.append(row)
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f.flush()                        # 每题即时落盘（防中断丢整批）
+        ave = (sum(fracs) / len(fracs)) if fracs else None
+        return AimeResult(dataset=dataset_ref, model_path=self.model_path,
+                          correct=correct, total=len(problems), rows=rows,
+                          ave_accuracy=ave)
+
 
 __all__ = ["AimeEvaluator", "AimeResult", "extract_answer", "normalize_answer",
            "format_prompt", "AIME_DATASETS", "DEFAULT_DATASETS",

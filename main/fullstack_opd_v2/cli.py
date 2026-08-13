@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 from pydantic import ValidationError
@@ -245,15 +246,49 @@ def _cmd_eval_aime(args) -> int:
         print(f"[eval-aime] 输出目录: {out_dir}")
         for ds in datasets:
             out_path = os.path.join(out_dir, f"{ds}.jsonl")
-            res = ev.evaluate_to_jsonl(ds, out_path)
+            # 逐题即时落盘 + 中断 resume：每题完成即写一行，重跑跳过已完成题。
+            # （原 evaluate_to_jsonl 等全部生成完才写，长协议中断即全丢。）
+            done_before = len(ev._load_done_ids(out_path)) if os.path.isfile(out_path) else 0
+            res = ev.evaluate_progressive(ds, out_path)
+            if done_before:
+                print(f"[eval-aime] {ds}: 续跑（已有 {done_before} 题落盘，本轮完成 {len(res.rows)} 题）")
             # 二次审阅修复 #1：分口径标注——pass1 与 ave 混排会误导
             # （"27/30 = 56.25%" 里 27/30 是 pass@1、56.25% 是 ave@32，两码事）。
-            if ev.metric == "ave" and res.ave_accuracy is not None:
-                print(f"[eval-aime] {ds}: pass@1 {res.correct}/{res.total} "
-                      f"({100 * res.correct / res.total:.2f}%)  "
-                      f"ave@32 {res.ave_accuracy * 100:.2f}%  → {out_path}")
+            # res.correct 只计本轮新完成题的命中；完整 ave@32 需读全部落盘行重算。
+            if ev.metric == "ave":
+                total_rows = done_before + len(res.rows)
+                # 用落盘全部行重算 ave@32（含续跑前的题），pass@1 同理
+                try:
+                    all_rows = [json.loads(l) for l in open(out_path, encoding="utf-8")
+                                if l.strip()]
+                    fracs = [r["correct_count"] / r["n_samples"] for r in all_rows
+                             if r.get("correct_count") is not None and r.get("n_samples")]
+                    ave32 = (sum(fracs) / len(fracs)) if fracs else None
+                    pass1 = sum(1 for r in all_rows if r["correct"])
+                    if ave32 is not None:
+                        print(f"[eval-aime] {ds}: pass@1 {pass1}/{len(all_rows)} "
+                              f"({100 * pass1 / len(all_rows):.2f}%)  "
+                              f"ave@32 {ave32 * 100:.2f}%  → {out_path}")
+                    else:
+                        print(f"[eval-aime] {ds}: {pass1}/{len(all_rows)} "
+                              f"= {100 * pass1 / len(all_rows):.2f}%  → {out_path}")
+                except Exception:
+                    if ev.metric == "ave" and res.ave_accuracy is not None:
+                        print(f"[eval-aime] {ds}: pass@1 {res.correct}/{res.total} "
+                              f"({100 * res.correct / res.total:.2f}%)  "
+                              f"ave@32 {res.ave_accuracy * 100:.2f}%  → {out_path}")
+                    else:
+                        print(f"[eval-aime] {ds}: {res.correct}/{res.total} "
+                              f"= {res.accuracy * 100:.2f}%  → {out_path}")
             else:
-                print(f"[eval-aime] {ds}: {res.correct}/{res.total} "
-                      f"= {res.accuracy * 100:.2f}%  → {out_path}")
+                try:
+                    all_rows = [json.loads(l) for l in open(out_path, encoding="utf-8")
+                                if l.strip()]
+                    pass1 = sum(1 for r in all_rows if r["correct"])
+                    print(f"[eval-aime] {ds}: {pass1}/{len(all_rows)} "
+                          f"= {100 * pass1 / len(all_rows):.2f}%  → {out_path}")
+                except Exception:
+                    print(f"[eval-aime] {ds}: {res.correct}/{res.total} "
+                          f"= {res.accuracy * 100:.2f}%  → {out_path}")
     print("[eval-aime] 汇总：teacher 基线 / 学生蒸馏前后对比见 benchmarks/aime24_25/aggregate.py")
     return 0

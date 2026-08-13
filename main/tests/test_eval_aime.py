@@ -1,4 +1,5 @@
 """eval_aime.py 单测：纯函数答案提取/规范化/提示格式化 + 评估器（mock 模型/数据集）。"""
+import json
 import unittest.mock as mock
 
 import pytest
@@ -354,3 +355,64 @@ def test_close_frees_model():
     ev.close()
     m.to.assert_called_once_with("cpu")
     assert not hasattr(ev, "model")   # 已释放
+
+
+# ---------- 逐题即时落盘 + 中断 resume（evaluate_progressive） ----------
+def test_evaluate_progressive_writes_per_problem(tmp_path):
+    """progressive：每题完成后立即追加写一行 jsonl（而非全部生成完才写）。"""
+    ev = _fake_evaluator(
+        responses=["\boxed{42}", "\boxed{7}", "\boxed{5}"],   # 每题 1 条（n=1）
+        problems=[("p0", "42"), ("p1", "7"), ("p2", "5")])
+    ev.n_samples = 1
+    ev.load_problems = lambda d: [("p0", "42"), ("p1", "7"), ("p2", "5")]
+    ev.tok = mock.Mock()
+    out = str(tmp_path / "AIME24.jsonl")
+    res = ev.evaluate_progressive("AIME24", out)
+    # 3 题全部完成
+    assert len(res.rows) == 3
+    lines = [l for l in open(out, encoding="utf-8") if l.strip()]
+    assert len(lines) == 3          # 每题一行
+    for l in lines:
+        d = json.loads(l)
+        assert "correct_count" in d and "preds_all" in d   # 采样级字段保留
+
+
+def test_evaluate_progressive_resume_skips_done(tmp_path):
+    """resume：已有落盘题重跑时跳过，只评估未完成的题。"""
+    # 预写前 2 题（模拟上次中断）
+    out = str(tmp_path / "AIME24.jsonl")
+    import json as _json
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(_json.dumps({"problem_id": 0, "dataset": "AIME24",
+                             "ground_truth": "42", "predicted": "42", "correct": True,
+                             "response": "\boxed{42}", "n_samples": 1,
+                             "correct_count": 1, "preds_all": ["42"]}) + "\n")
+        f.write(_json.dumps({"problem_id": 1, "dataset": "AIME24",
+                             "ground_truth": "7", "predicted": "7", "correct": True,
+                             "response": "\boxed{7}", "n_samples": 1,
+                             "correct_count": 1, "preds_all": ["7"]}) + "\n")
+    # 续跑：只剩题 2 未完成
+    ev = _fake_evaluator(responses=["\boxed{5}"], problems=[("p2", "5")])
+    ev.n_samples = 1
+    ev.load_problems = lambda d: [("p0", "42"), ("p1", "7"), ("p2", "5")]
+    ev.tok = mock.Mock()
+    res = ev.evaluate_progressive("AIME24", out)
+    assert len(res.rows) == 1        # 只新完成 1 题
+    assert res.rows[0]["problem_id"] == 2
+    # 落盘 3 行（2 旧 + 1 新），无重复
+    lines = [l for l in open(out, encoding="utf-8") if l.strip()]
+    assert len(lines) == 3
+    ids = [json.loads(l)["problem_id"] for l in lines]
+    assert sorted(ids) == [0, 1, 2]
+
+
+def test_load_done_ids_handles_corrupt_line(tmp_path):
+    """resume 读坏行：跳过损坏行（该题重评），不卡死。"""
+    out = str(tmp_path / "AIME24.jsonl")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write('{"problem_id": 0, "dataset": "AIME24"}\n')
+        f.write("not-valid-json\n")          # 损坏行
+        f.write('{"problem_id": 2, "dataset": "AIME24"}\n')
+    ev = object.__new__(AimeEvaluator)
+    done = ev._load_done_ids(out)
+    assert done == {0, 2}
