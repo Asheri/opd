@@ -7,7 +7,7 @@
 
 **文档分工**：本文件讲「**数据怎么流动 + 优化目标怎么度量**」；工程实现细节（线程/队列/
 版本号/缓存张量的代码级说明、逐行对齐的数学）见
-`main/fullstack_opd_v2/ENGINEERING_IMPLEMENTATION.md`（标 🔍 的地方为通俗例子）。本文的
+`main/fullstack_opd_v2/TECHNICAL_REPORT.md`（标 🔍 的地方为通俗例子）。本文的
 数学记号与 ENGINEERING §0.6 完全对齐，两文互相引用不重复。
 
 ---
@@ -514,7 +514,7 @@ $$\min_{\theta,\;\text{架构}} \;\; T_{total}(\theta)
 
 ---
 
-## 附 · 数学解释关键点速查（与 ENGINEERING_IMPLEMENTATION.md 交叉索引）
+## 附 · 数学解释关键点速查（与 TECHNICAL_REPORT.md 交叉索引）
 
 1. **为什么迁移 Δ_T 而非教师终态**：Δ_T = 减法去掉教师 RL 前偏好，只留 RL 改进方向；
    当 student 已强于教师，模仿终态覆盖强行为，迁移偏移则保留提升。（ENGINEERING §0.6）

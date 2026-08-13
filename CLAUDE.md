@@ -151,10 +151,49 @@ vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。L2 �
 ## 深入阅读
 
 - `main/README.md` — 三篇论文核心抽取、代码地图、v1→v2 重构对照表、审阅修复记录
-- `main/fullstack_opd_v2/ENGINEERING_IMPLEMENTATION.md` — **工程实现的权威说明**（~72KB）：
-  §0.5 端到端时序、§0.6 逐行对齐的数学模型、§0.7 L0–L3 谱、§1 异步机制、§2 教师离线、
-  §3 信用分配、§4 已知边界、附 1 机制↔代码速查表
+- `main/fullstack_opd_v2/TECHNICAL_REPORT.md` — **技术文档与训练分析报告（唯一权威）**：
+  §0–§4 工程实现（端到端时序、数学模型、异步机制、教师离线、信用分配、边界）、
+  §5 benchmark 分数与评估协议、§6 显存、§7 用时、§8 数据构成、§9 已知边界与复现
 - `DEPLOY.md` — 依赖冲突的架构裁剪方案与安装步骤
+
+## 文档要求（工程实现技术文档 + 训练分析报告）
+
+**本项目的长期硬性要求**：需要把目前为止的详细工程实现（**按照原始论文修改后的版本**，
+即 Direct-OPD / Lightning-OPD / AsyncOPD 三篇叠加 + 本项目的落地改动）写成一份
+**详细技术文档**（建议 `main/fullstack_opd_v2/TECHNICAL_REPORT.md`，或按需分章节）。
+该文档**必须包含**以下部分，缺一不可：
+
+1. **工程实现（按原始论文修改后）**：完整描述三篇论文机制如何叠加、每一步相对原始论文
+   的改动及其理由（例如：离线固定 `D` 的 L0/L1 改动、`renormalize_topk_support` 对齐原始
+   Direct-OPD、跨词表 `delta_for_student_topk`、async 调度器解耦等）。可参考/继承
+   `TECHNICAL_REPORT.md` §0–§4 的数学对齐写法，但要按「当前代码的真实状态」更新。
+
+2. **训练分析（必须含 benchmark 分数与协议）**：
+   - **训练前后（pre/post）的 benchmark 分数对比**：基座 vs 学生（如 1.7B/7B/4B 三档），
+     短生成与长生成两套都要记录。
+   - **benchmark 方式必须写全协议**：论文对齐口径为
+     `avg@32, n=32, T=0.7, top_p=0.95, max_new_tokens=32768, boxed 模板, sympy 评分`
+     （以及 chat_template 包裹、batch_size、dtype 等实测参数）。每个数字都要注明用哪套
+     协议测出，绝不混用（本项目踩过 pass@1 vs ave@32 混报的坑）。
+   - 若某数字是短生成（如 2048）测的，必须显式标注"短生成，非论文协议"。
+
+3. **训练与评估的显存占用分析**：逐阶段（stage0 RL / stage1 cache build / stage2 训练 /
+   AIME 评估）实测或推算显存峰值，说明构成（权重 / KV cache / logits / 激活 / 中间张量）。
+   记录关键教训，例如：长序列（32K）× 大 vocab（151936）下 **logits 张量是隐形显存杀手**；
+   `attn_implementation` 未显式设 flash_attn 时 SDPA 开销大；batch_size 与峰值显存的关系。
+
+4. **训练与评估的用时分析**：各阶段 wall-clock 耗时、每数据集/每采样平均耗时、吞吐
+   （token/s）、batch_size 对用时的加速比（如 batch 1→2）、长生成 vs 短生成的时间放大倍数。
+
+5. **训练数据构成分析**：数据集来源（Skywork/DAPO/AIME）、训练集与评估集划分、每条样本
+   prompt 模板、`max_prompt_length` / `max_response_length` / `MAX_VAL_RESP_LENGTH` 等长度
+   配置、教师对 Δ_T 的缓存模式（dense/topk、top_k）、warmup 拼接对数据量的影响（`N×(1+M)`）。
+
+6. **其他必要信息**：参考原始论文的机制速查、已知边界与未实现项（如 L2 周期刷新）、
+   复现步骤（命令 + 配置）、与本文件其它节（架构/算法约束/配置约定）的交叉引用。
+
+> 写作时遵循「代码注释、文档、提交信息均用中文」的全局要求。文档随代码演进持续维护，
+> 不要让它过期（当前代码的真实状态为准，不沿用旧描述）。
 
 ## 语言
 

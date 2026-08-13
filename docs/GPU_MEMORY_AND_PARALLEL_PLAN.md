@@ -3,7 +3,7 @@
 > 硬件：**2×RTX PRO 6000 Blackwell，96GB×2 + NVLink**（CUDA 12.8，统一环境 `requirements-unified.txt`）。
 > 算法内核：`main/fullstack_opd_v2/` 全栈 OPD（Stage 0 教师 RL → Stage 1 离线 Δ_T 缓存 → Stage 2 异步 Direct-OPD）。
 > 项目真实模型：教师对 JustRL-1.5B / DeepSeek-R1-Distill-Qwen-1.5B；学生 Qwen3-1.7B / Qwen3-4B / R1-Distill-Qwen-7B；词表 V≈152k。
-> 相关：`OPTIMIZATION_PLAN_2xRTXPRO6000.md`（性能方案，尺寸上限账）、`RUNBOOK_2xPRO6000.md`（运维）、`ENGINEERING_IMPLEMENTATION.md`（实现）。
+> 相关：`OPTIMIZATION_PLAN_2xRTXPRO6000.md`（性能方案，尺寸上限账）、`RUNBOOK_2xPRO6000.md`（运维）、`TECHNICAL_REPORT.md`（实现）。
 
 > ⚠️ **诚实声明**：本文数字为**估算账**（每参数常量精确、激活/缓存按规模推算），上线以
 > `nvidia-smi` / `nsys` 实测为准；NVLink 带宽、激活占用随 batch 变，文中已标注。
@@ -134,7 +134,7 @@ rank0 · learner（训练）                     rank1 · rollout scorer（算 s
 
 7B + fp32 Adam（122GB）会让人想切 Megatron TP=2——**但**：
 1. **colocated 冲突**：rank1 被占为 learner 分片后，无法同时做 scorer → 失去 5.1 的异步重叠
-   （`ENGINEERING_IMPLEMENTATION.md` §4 已记：TP 集合通信需 rank1 协同，与并发 rollout 死锁，
+   （`TECHNICAL_REPORT.md` §4 已记：TP 集合通信需 rank1 协同，与并发 rollout 死锁，
    `scheduler.py` 有护栏）。
 2. 8-bit Adam 已让 7B 单卡装下（76GB），**TP 省的是不存在的压力**。
 → 默认 **learner 单卡 + scorer 单卡**。只有当需要 fp32 Adam 的数值精度（不用 8-bit）时才走

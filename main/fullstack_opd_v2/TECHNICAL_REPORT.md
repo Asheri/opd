@@ -1,4 +1,28 @@
-# 全栈 OPD v2 · 工程实现说明（非数学原理）
+# 全栈 OPD 叠加 · 技术文档与训练分析报告
+
+> **本文档 = 工程实现 + 训练分析 唯一权威说明**（由原 `ENGINEERING_IMPLEMENTATION.md` 扩展而来）。
+> 满足项目 CLAUDE.md「文档要求」节的六点：①工程实现（按原始论文修改后）②训练前后 benchmark
+> 分数与协议 ③显存占用 ④用时 ⑤数据构成 ⑥其他必要信息。
+>
+> **第一部分**（§0–§4 + 附 1/2）讲**代码是怎么搭的**：线程、队列、版本号、缓存张量、张量形状、
+> 函数名。不推导公式（π_old 加权、k3 恒等式等只作为张量名出现）。带 🔍 的小节是「通俗理解 +
+> 具体例子」，给不熟悉异步/分布式训练的同学。适用代码：`main/fullstack_opd_v2/`。
+>
+> **第二部分**（§5–§9）是**实验分析报告**：benchmark 分数与协议、显存、用时、数据构成、已知
+> 边界与复现。所有实验数字必须标注所用协议（本项目的教训：pass@1 与 ave@32 混报会产生误导）。
+
+| 章节 | 内容 | 对应 CLAUDE.md 要求 |
+|---|---|---|
+| **第一部分** §0–§4 | 工程实现（模型/分布、端到端时序、异步、教师离线、信用分配、边界） | ① 工程实现 |
+| **§5** | 训练前后 benchmark 分数 + 完整评估协议声明 | ② 训练分析 |
+| **§6** | 训练与评估的显存占用分析 | ③ 显存 |
+| **§7** | 训练与评估的用时分析 | ④ 用时 |
+| **§8** | 训练数据构成分析 | ⑤ 数据 |
+| **§9** | 已知边界、长生成失败教训、复现步骤 | ⑥ 其他 |
+
+---
+
+# 第一部分 · 工程实现（按原始论文修改后的版本）
 
 > 本文只讲**代码是怎么搭的**：线程、队列、版本号、缓存张量、张量形状、函数名。
 > 不推导公式（π_old 加权、k3 恒等式等只作为张量名出现）。所有名词都能在下表文件里直接搜到。
@@ -813,3 +837,267 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 | **动作 a** | 本 OPD 里 = `responses`（固定离线数据），按 `idxs` 索引现取，不持久缓存 |
 | **rollout 阶段 log prob** | = `s_old`，随批次入队，learner 重算不了（旧权重已消失），必须携带 |
 | **重放缓冲 replay buffer** | 论文/工业用大容量持久缓冲反复复用样本；本实现是有界在途队列（只走一遍、超期即丢），非 replay buffer |
+
+---
+
+# 第二部分 · 训练分析与实验报告
+
+> 本部分回答"这个 OPD 流水线实际训练效果如何、花多少资源、数据是什么"。
+> **每个分数必须注明协议**：本项目踩过 pass@1 与 ave@32 混报导致数字误导的坑（见 §5.1）。
+> 未实测的项如实标注【待补】，不编造。
+
+## 5. 训练前后 benchmark 分数（含评估协议声明）
+
+### 5.1 评估协议（权威口径，与 Direct-OPD 论文对齐）
+
+论文 `train_justrl_qwen.sh` 的验证协议（launch 脚本原样）：
+
+| 设置 | 论文值 | 本项目 eval-aime 对应参数 |
+|---|---|---|
+| 每 prompt 采样数 | **32**（`VAL_N=32`） | `--n-samples 32` |
+| 采样温度 | **0.7**（`val_kwargs.temperature=0.7`） | `--temperature 0.7` |
+| Top-p | **0.95**（`val_kwargs.top_p=0.95`） | `--top-p 0.95` |
+| 最大生成长度 | **31,744**（`MAX_VAL_RESP_LENGTH`；Qwen3 config 上限 40960） | `--max-new-tokens 31744` |
+| prompt 模板 | boxed（"reason step by step… within \\boxed{}"）+ **chat_template 包裹**（verl `apply_chat_template`） | `--prompt-style boxed --chat-template` |
+| 评分 | `\boxed{}` 级联提取 + **sympy/mathd 数学等价判定**（`ttrl_math.grade`） | `--scoring sympy` |
+| 指标 | **ave@32**（每题 32 采样中答对比例的平均） | `--metric ave` |
+| 数据集 | aime24 / aime25 / hmmt_feb | `--datasets AIME24 AIME25` |
+
+**两个必须区分的口径**：
+- **ave@N**：`accuracy = 每题 N 采样中答对比例的均值`（论文口径）。n=32 → ave@32；n=8 → ave@8。
+- **pass@1**：`correct/total`（任一采样答对即算对）。本项目早期误把 pass@1 当 ave@32 报告，
+  导致"33.3 / 23.3 / 30.0"这类规整数字被质疑像假数据——实为 pass@1 的凑整巧合。
+
+### 5.2 已实测分数（短生成协议，pass@1）
+
+> ⚠️ 以下为**短生成**（max_new_tokens≈2048）+ boxed 模板测得的 **pass@1**，**非论文 ave@32 协议**。
+> 数值会系统性低于论文协议（短生成截断在 CoT 中途、模型未写出 `\boxed{}`）。来源：
+> `docs/multistudent_cloud_training_report.md`。
+
+| 学生 | 基座 AIME24 | 基座 AIME25 | 训练后 AIME24 | 训练后 AIME25 | 训练步数/时长 |
+|---|---|---|---|---|---|
+| Qwen3-1.7B | 6.7% (2/30) | 10.0% (3/30) | 6.7% | **13.3%** (+3.3pp) | 60 步 / ~137s |
+| Qwen3-4B | — | — | **16.7%** | **16.7%** | 60 步 / ~137s |
+| Qwen3-7B | — | — | —（词表不匹配，未蒸馏） | | |
+
+**1.7B 中间断点曲线**（200 步，短生成 pass@1，验证过训）：
+
+| 断点 | AIME24 | AIME25 |
+|---|---|---|
+| step40 | 10.0% | 6.7% |
+| step80 | 3.3% | 13.3% |
+| **step120 ⭐** | **13.3%** | **16.7%** |
+| step160 | 3.3% | 16.7% |
+| step199（终） | 3.3% | 6.7% |
+
+**结论**：step120 是最佳检查点；step199 大幅回落 → **200 步过训**，建议早停 ~120 步。
+> ⚠️ 30 题小样本下 3.3%=1/30、13.3%=4/30，差距仅 3 题——短生成 pass@1 方差极大，
+> 需 ave@32 长生成协议重验（见 §5.3）。
+
+### 5.3 论文协议 ave@32 长生成评估【待补】
+
+**为什么待补**：论文协议（32768 token 长生成）在单卡 + transformers 原生生成下每个采样
+需 30-60 分钟，960 采样 × 多模型需数百小时，**现实不可行**。已两次尝试后终止（详见 §9.2）。
+
+**已确认的工程事实（供后续重跑）**：
+- 短生成（2048）下 **30/30 题全部无 `\boxed{}`**——模型截断在 CoT 中途，从未写出最终答案；
+  `preds_all` 非空是 `extract_answer` 的"最后数字回退"抓的 CoT 中间数，是噪声不是能力。
+- 因此"2048 短生成分数"不是模型真实水平，而是**截断噪声**；长生成才是有效协议。
+
+**待补表格**（服务器恢复后用 ave@32 长生成协议填充）：
+
+| 模型 | AIME24 ave@32 | AIME25 ave@32 | 备注 |
+|---|---|---|---|
+| 1.7B 基座（Qwen3-1.7B） | 【待补】 | 【待补】 | 对齐论文 Qwen3-1.7B 起点 |
+| 1.7B ms_step120 | 【待补】 | 【待补】 | 验证是否真最优断点 |
+| 1.7B ms_step80 / step160 | 【待补】 | 【待补】 | 验证 3.3% 是否噪声 |
+| 4B v3_step59 | 【待补】 | 【待补】 | 对齐论文 Qwen3-4B |
+| 7B 基座 / 7B 学生 | 【待补】 | 【待补】 | DeepSeek-R1-Distill-7B |
+
+**协议调整建议（用户 2026-08-14 提出，权衡单卡耗时）**：
+- 采样数降为 **n=8 或 n=16**（ave@8 / ave@16，仍保"平均正确率"口径，方差略大）；
+- **max_new_tokens 下调**（如 8192，覆盖模型自然 CoT 收尾、比 32768 快 ~4×）；
+- 或两者结合（n=8 + 8192，估算单模型单数据集约 3 小时，若启用 flash_attn）。
+- **关键加速**：eval-aime 应传 `attn_implementation="flash_attention_2"`（服务器已装 flash_attn 2.8.3），
+  当前未传默认走 SDPA，长序列开销大（见 §6.4）。
+
+## 6. 训练与评估的显存占用分析
+
+### 6.1 每参数显存常量（真实模型，RTX PRO 6000 96GB）
+
+| 项 | 1.7B (Qwen3-1.7B) | 4B (Qwen3-4B) | 7B (DeepSeek-R1-Distill-7B) |
+|---|---|---|---|
+| 权重 bf16 | ~3.4 GB | ~8 GB | ~14 GB |
+| KV cache / token（GQA） | 112 KB（8 KV 头） | — | — |
+| 满长 32768 KV cache | ~3.6 GB/序列 | ~8 GB/序列 | ~12 GB/序列 |
+
+> 细节见 `docs/GPU_MEMORY_AND_PARALLEL_PLAN.md`（§1 每参数常量 + §3 分阶段显存账）。
+
+### 6.2 训练阶段显存账（Stage 0/1/2）
+
+| 阶段 | 内容 | 显存特点 |
+|---|---|---|
+| Stage 0 教师 RL | 1.5B 弱教师 REINFORCE | 微（batch 小） |
+| Stage 1 离线缓存 | 教师对全 D 推理 Δ_T | **Δ_T 大张量 (N,T,V)**；dense 在真实词表下 233GB 超限 → 用 **top-K 稀疏**（`top_k=256`，↓1000×） |
+| Stage 2 Direct-OPD | learner + scorer 同卡 colocate | 学生权重 + 快照 + Δ_T 缓存 + 优化器 |
+
+**实测踩坑（多学生并发）**：
+- 每进程驻留 student+worker+teacher+优化器，7B 峰值 **94.7GB 满** → warmup_student 条件建 + batch 降 + `expandable_segments`；
+- 4B 用 bnb `adamw_8bit` 反而把权重转 fp32 更占（94.3GB 满）→ **改 `optimizer=adam`（fp32）+ batch=2**。
+
+### 6.3 评估阶段显存（短生成 2048）
+
+- 单模型短生成：权重 + 短 KV + logits ≈ 20-30GB，可双模型同卡并行（1.7B 两进程 ~14-19GB 稳定）。
+
+### 6.4 评估阶段显存（长生成 32768）—— 教训
+
+实测双模型并行长生成：基座 49GB + 学生 45.7GB = **94.7GB / 97.9GB，余量仅 3.2GB**。
+
+**组成分析（为什么远超"权重+KV"预估 ~14GB）**：
+
+| 项 | 估算 | 说明 |
+|---|---|---|
+| 权重 bf16 | 3.4 GB | — |
+| KV cache（满长, batch2） | ~7.5 GB/模型 | 28×8×128×2B ×2 序列 ×32768 |
+| **logits 张量** | **~20-25 GB** | batch×seq×vocab(151936)×bf16——**长序列下是隐形显存杀手，最易被低估** |
+| prefill 激活 | ~10-30 GB | 未显式用 flash_attn，SDPA 长 prefill 中间缓冲大 |
+
+**关键教训**：
+1. **长序列（32K）× 大 vocab（152K）的 logits 是最大隐形开销**，远超 KV cache；
+2. eval-aime **未显式传 `attn_implementation="flash_attention_2"`** → 默认 SDPA，长序列开销大；
+   flash_attn 已装（2.8.3）却未启用，是浪费的 3-10× 加速潜力；
+3. batch=2 让 logits/KV 翻倍，是 94.7GB 逼近上限的直接原因；batch=1 则余量充足（~30GB）。
+
+## 7. 训练与评估的用时分析
+
+### 7.1 训练阶段耗时（实测，2×RTX PRO 6000）
+
+| 阶段 | 1.7B | 4B |
+|---|---|---|
+| Stage 0（小模型 RL） | 1.9s | 2.0s |
+| Stage 1（离线缓存 Δ_T） | 42.0s | 47.6s |
+| Stage 2（异步训练） | 168.3s（200 步） | 87.5s（60 步） |
+| **总计** | **212.2s** | **137.1s** |
+
+- 端到端（含缓存构建）≈ **2.3~3.5 分钟**完成一个学生的完整 OPD 蒸馏。
+- 时间大头是 Stage 1 离线缓存（~42-48s）——**"离线教师对"方案的收益点**（Stage 2 无 live teacher 前向）。
+
+### 7.2 评估耗时（实测与估算）
+
+| 协议 | 单数据集耗时 | 说明 |
+|---|---|---|
+| 短生成 2048, n=1（贪心） | ~2-4 分钟 | 快，但分数是截断噪声 |
+| 短生成 2048, n=32 | ~75 分钟（4B）/ ~70 分钟（7B） | batch=8 |
+| **长生成 32768, n=32** | **20-40 小时/模型（实测单采样 ~50 分钟）** | 单卡不可行，已终止 |
+
+**实测 decode 速度**（1.7B，短序列）：~27.7 tok/s。长序列（32K KV 压力 + 双进程共享卡）显著更慢。
+
+### 7.3 吞吐与 batch 加速
+
+- batch=1 → batch=2：序列级吞吐提升 ~50-80%，但显存翻倍（logits/KV）；
+- 长生成 batch=1 单卡余量充足，batch=2 逼近上限（94.7GB）；
+- **未启用 flash_attn 是最大浪费**：启用后长序列 decode 预计提速 3-10×。
+
+## 8. 训练数据构成分析
+
+### 8.1 数据来源与划分
+
+| 用途 | 数据集 | 规模 | 说明 |
+|---|---|---|---|
+| **训练** | GSM8K 数学 | 学生训练集 | 多学生并发实验用 GSM8K；论文用 Skywork-OR1 math（见 §9.3 差异） |
+| **评估** | AIME24（Maxwell-Jia/AIME_2024） | 30 题 | 竞赛数学，答案 3 位整数 |
+| **评估** | AIME25（yentinglin/aime_2025） | 30 题 | 同上 |
+| **评估** | HMMT Feb（论文数据集） | — | 论文有，本项目未跑 |
+
+> ⚠️ **训练/评估数据不同源**：本项目用 GSM8K 训练 + AIME 评估；论文用 Skywork-OR1 + DAPO 模板。
+> 即便评估协议完全对齐（ave@32），绝对分数与论文仍会有差距——预期"量级对齐"而非"逐点相等"。
+
+### 8.2 prompt 模板与长度配置
+
+| 配置 | 值 |
+|---|---|
+| 训练 prompt 模板 | 数据集自带（GSM8K 数学题） |
+| 评估 prompt 模板 | boxed（`"reason step by step… within \\boxed{}"`）；论文另用 DAPO 模板 |
+| `max_prompt_length`（论文） | 1024 |
+| `max_response_length`（论文训练） | 2048 |
+| `MAX_VAL_RESP_LENGTH`（论文验证） | 32768 |
+| 本项目评估 `max_new_tokens` | 短生成 2048 / 长生成 32768（实测单卡不可行，见 §5.3） |
+
+### 8.3 Δ_T 缓存模式与数据量影响
+
+| 配置 | 值 | 影响 |
+|---|---|---|
+| `stage1.cache_mode` | topk（GPU/真实词表） | Δ_T 只存 top-K，体积 ↓1000×（vs dense 233GB OOM） |
+| `top_k_teacher` | 256 | 每 (n,t) 位置存 256 个 token 的教师偏好 |
+| `top_k_student` | 256 | 训练时按学生 top-K 展开支撑 |
+| `warmup_M` / `warmup_source` | 0 / none（ms 系列） | 未启用 L1 暖缓存（L1 开启时数据量 N×(1+M)） |
+
+> L1 暖缓存：`warmup_M=4` + `warmup_source=student_init` 时，每 prompt 的缓存数据从 1 条
+> 扩到 5 条（N×(1+M)）；`mix` 则 9 条（N×(1+2M)）。本项目 ms 系列用 0/none（L0）。
+
+## 9. 已知边界、长生成教训与复现
+
+### 9.1 未实现项 / 已知边界（工程）
+
+- **L2 周期刷新**未实现（动态数据集 + refresh 线程 + ring buffer，见第一部分 L2 机制）；
+- **L3 全在线**未实现（回到 Lightning-OPD live teacher）；
+- **7B 未蒸馏**：词表硬约束（OPD 要求学生=教师同词表；student=152064 vs teacher=151936）→
+  非显存问题，是 OPD 机制硬约束；
+- **分布式 L5** 是带护栏骨架（ray/megatron/vllm 缺失时报错），未完整跑通；
+- **重放缓冲**：本实现是有界在途队列，非论文的持久 replay buffer（样本只走一遍）。
+
+### 9.2 长生成评估失败教训（32768 单卡不可行）
+
+**背景**：论文协议（32768 token 长生成）在单卡 + transformers 原生生成下不可行，两次尝试后终止。
+
+**失败时间线**（2026-08-13/14）：
+1. 4B 长生成（batch=1）→ OOM 历史；chunk 修复后跑通短生成；
+2. 1.7B 基座+学生双并行长生成（batch=2）→ 显存峰值 94.7GB/97.9GB 逼近上限；
+3. 单采样实测 ~50 分钟（超长 CoT 到 32768 上限），960 采样需数百小时 → 终止。
+
+**根因（三层）**：
+1. **decode 慢**：1.7B 短序列仅 27.7 tok/s；长序列（32K KV）显著更慢；
+2. **logits 显存大**：长序列 × 151936 vocab 的 logits 张量 ~20-25GB（被低估的隐形杀手）；
+3. **未启用 flash_attn**：`attn_implementation` 未显式设，默认 SDPA，浪费 3-10× 加速。
+
+**改进方案**（配合用户 2026-08-14 提出的协议调整）：
+- eval-aime 加 `attn_implementation="flash_attention_2"`（服务器已装 flash_attn 2.8.3）；
+- 采样数 n=8/16 + max_new_tokens 下调（如 8192）；
+- **逐题即时落盘 + resume**（本次已实现，见 §5.3 底部与代码）——中断可续跑，不再全丢。
+
+### 9.3 与原始论文的主要差异（对齐"按原始论文修改后"要求）
+
+| 维度 | 原始论文（Direct-OPD） | 本项目 |
+|---|---|---|
+| 训练数据 | Skywork-OR1 math + DAPO 模板 | GSM8K + 数据集原模板 |
+| 评估协议 | ave@32 / T=0.7 / top_p=0.95 / 31744 | 已对齐（eval-aime 支持），长生成待跑 |
+| 教师对 | 论文用弱教师（RL 前后） | 同（Stage 0 产出 post-RL 弱教师 + pre-RL 副本） |
+| Δ_T 缓存 | 论文逐 token 稠密 | dense（demo）/ top-K 稀疏（真实词表，↓1000×） |
+| 学生更新 | 同步（论文基线） | **异步**（AsyncBatchedScheduler 四线程流水线） |
+| 信用分配 | 分布级 PG | 同 + 稀疏支撑 `delta_for_student_topk` |
+| KL 锚 | 对初始学生分布 | 同 + `low_var_kl_support` 稀疏版（有界近似） |
+
+### 9.4 复现步骤
+
+**训练**（服务器，2×RTX PRO 6000，多学生并发）：
+
+```bash
+cd /root/opd/main
+# 单学生：1.7B 200 步 / 4B 60 步
+python -m fullstack_opd_v2 train --config <student_config.yaml>
+# 多学生并发编排（模块 4）
+bash scripts/multistudent/run_all.sh          # SMOKE=1 toy / MODEL_MODE=real 真实
+```
+
+**评估**（论文协议对齐，逐题落盘 + resume）：
+
+```bash
+python -m fullstack_opd_v2 eval-aime \
+  --model <HF 模型路径> \
+  --datasets AIME24 AIME25 \
+  --n-samples 8 --temperature 0.7 --top-p 0.95 \
+  --metric ave --prompt-style boxed --scoring sympy --chat-template \
+  --batch-size 1 --max-new-tokens 8192 --dtype bf16 \
+  --out <输出目录> --device cuda:0
+# 中断后重跑同 --out：自动跳过已完成题（resume）
+```
