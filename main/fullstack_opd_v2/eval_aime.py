@@ -307,6 +307,7 @@ class AimeEvaluator:
     # 类级默认：测试用 object.__new__ 绕过 __init__ 构造时也具该属性（不设则 evaluate 报错）。
     scoring = "int"
     chat_template = False
+    attn_implementation = None   # None=transformers 默认(SDPA)；"flash_attention_2"=启用 flash_attn(长生成提速)
 
     def __init__(self, model_path: str, device: str = "cpu",
                  max_new_tokens: int = 2048, batch_size: int = 8,
@@ -316,7 +317,8 @@ class AimeEvaluator:
                  metric: str = "pass1",
                  prompt_style: str = "boxed",
                  scoring: str = "int",
-                 chat_template: bool = False):
+                 chat_template: bool = False,
+                 attn_implementation: str | None = None):
         # P2：参数校验前置（transformers 导入/模型加载之前），配置错快速失败、零副作用。
         # 上下文上限按模型 config 动态取（Qwen3=40960，对齐论文 MAX_VAL_RESP_LENGTH 31744）；
         # 模型加载后才得知，故保守前置校验用 _MAX_CONTEXT（历史默认 4096）挡明显非法值，
@@ -330,6 +332,11 @@ class AimeEvaluator:
         # chat_template=True：对齐论文 verl 验证（schemas.py _handle_apply_chat_template）——
         # 用模型 chat template 包裹 prompt（<|im_start|>user/assistant），非裸字符串。
         self.chat_template = bool(chat_template)
+        # attn_implementation：None=SDPA 默认；"flash_attention_2" 启用 flash_attn（长生成 decode 提速 ~1.5-3x）。
+        # 校验合法值；"flash_attention_2" 需装 flash_attn 包（from_pretrained 时 transformers 自动选 backend）。
+        if attn_implementation is not None and attn_implementation not in ("flash_attention_2", "sdpa", "eager", "flash_attention"):
+            raise ConfigError(f"attn_implementation={attn_implementation!r} 非法：须 None | flash_attention_2 | sdpa | eager")
+        self.attn_implementation = attn_implementation
         self.n_samples = max(1, int(n_samples))
         self.temperature = float(temperature)
         self.top_p = float(top_p) if top_p is not None else None
@@ -379,6 +386,8 @@ class AimeEvaluator:
         else:
             torch_dtype = None
         kwargs = {"torch_dtype": torch_dtype} if torch_dtype else {}
+        if self.attn_implementation is not None:
+            kwargs["attn_implementation"] = self.attn_implementation
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path, trust_remote_code=trust_remote_code, **kwargs).to(device).eval()

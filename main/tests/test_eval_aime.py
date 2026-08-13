@@ -491,3 +491,11 @@ def test_progressive_prints_per_problem_progress(tmp_path, capsys):
     # 应出现 3 条逐题进度
     assert captured.count("完成") >= 3
     assert "1/3" in captured and "3/3" in captured
+
+
+def test_attn_implementation_invalid_rejected():
+    """attn_implementation 非法值报错（合法 None/flash_attention_2/sdpa/eager）。"""
+    with pytest.raises(ConfigError, match="attn_implementation"):
+        AimeEvaluator("/nonexistent/model", device="cpu",
+                      n_samples=1, temperature=0.0,
+                      attn_implementation="invalid_impl")

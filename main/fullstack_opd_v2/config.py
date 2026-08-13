@@ -147,6 +147,8 @@ class EvalCfg(_Strict):
     scoring: Literal["int", "sympy"] = "int"
     # chat_template（默认 False）：True 用模型 chat template 包裹 prompt（对齐论文 verl 验证）
     chat_template: bool = False
+    # attn_implementation：None=SDPA 默认；"flash_attention_2" 启用 flash_attn（长生成 decode 提速）
+    attn_implementation: str | None = None
 
 
 class OPDConfig(_Strict):
