@@ -347,47 +347,58 @@ history 太短 / variance 不可靠 / disagreement 不存在 / cold start -> fal
 
 ```yaml
 l2:
-  enabled: false
-  t_train: 100
-  m_refresh: 1000
-  ring_buffer_capacity: 5000
-  refresh:
-    ratio:
-      mode: adaptive          # fixed | linear | adaptive（§5.8 ablation）
-      initial: 0.30
-      min: 0.10
-      max: 0.60               # <1，保留 base anchor（§5.4）
-      age_weight: 0.25
-      drift_weight: 0.50
-      quality_weight: 0.25
-      ema_beta: 0.9
-      warmup_steps: 500
-      max_step_change: 0.05
-  rollout:
-    selector:
-      enabled: true
-      candidate_multiplier: 4      # M_candidate = 4·M_selected（§6.5）
-      value_fraction: 0.80         # 高价值占比（§6.3）
-      coverage_fraction: 0.20
-      value_weights:               # V(p) 系数（§6.2）
-        uncertainty: 0.4
-        disagreement: 0.4
-        novelty: 0.2
-      compute_aware: false         # §6.4 ELG
-      max_same_prompt_fraction: 0.05   # §6.8
-      exploration_fraction: 0.20
-  health_monitor: true
-  health:                     # §4.3 rule-based 阈值（configurable）
-    hit_rate:         {warning: 0.995, critical: 0.98}
-    refresh_age_p95:  {warning: 5,     critical: 10}
-    reuse_p95:        {warning: 8,     critical: 20}
-    max_length_ratio: {warning: 0.10,  critical: 0.25}
-  alert_cooldown: 50          # §4.4 同一 warning 冷却步数
-  refresh_min_interval: 50
-  refresh_max_interval: 150
-  delta_slope_eps: 0.001
-  value_protect_quantile: 0.9
-  utility:
+  enabled: false                    # 总开关：false 退回 L0/L1 静态路径，零行为变化
+  t_train: 100                      # 每轮训练步数
+  m_refresh: 1000                   # 每轮刷新量（= M_selected）
+
+  cache:                            # §2 ring buffer 基础
+    base_size: 50000
+    refresh_size: 5000              # ring buffer capacity
+    max_response_length: 8192
+    value_protect_quantile: 0.9     # §2 Q3 价值保护
+    refresh_min_interval: 50        # §2 Q1 触发约束
+    refresh_max_interval: 150
+    delta_slope_eps: 0.001
+
+  disagreement:                     # §3
+    enabled: true
+
+  health_monitor:                   # §4
+    enabled: true
+    health:                         # §4.3 rule-based 阈值（configurable）
+      hit_rate:         {warning: 0.995, critical: 0.98}
+      refresh_age_p95:  {warning: 5,     critical: 10}
+      reuse_p95:        {warning: 8,     critical: 20}
+      max_length_ratio: {warning: 0.10,  critical: 0.25}
+    alert_cooldown: 50              # §4.4 同一 warning 冷却步数
+
+  refresh_ratio:                    # §5 dynamic ratio
+    enabled: true
+    mode: adaptive                  # fixed | linear | adaptive（§5.8）
+    initial: 0.30
+    min: 0.10
+    max: 0.60                       # <1，保留 base anchor（§5.4）
+    age_weight: 0.25
+    drift_weight: 0.50
+    quality_weight: 0.25
+    ema_beta: 0.9
+    warmup_steps: 500
+    max_step_change: 0.05
+
+  selective_rollout:                # §6
+    enabled: true
+    candidate_multiplier: 4         # M_candidate = 4·M_selected（§6.5）
+    value_fraction: 0.80            # §6.3 高价值占比
+    coverage_fraction: 0.20
+    value_weights:                  # §6.2 V(p) 系数
+      uncertainty: 0.4
+      disagreement: 0.4
+      novelty: 0.2
+    compute_aware: false            # §6.4 ELG
+    max_same_prompt_fraction: 0.05  # §6.8
+    exploration_fraction: 0.20
+
+  utility:                          # §3.5 sample utility 系数
     disagreement_weight: 0.5
     reward_weight: 0.3
     age_penalty: 0.2
@@ -455,14 +466,38 @@ l2:
 - deterministic given seed
 - distributed-safe（跨 rank 选样一致）
 
+### 整合与工程检查（§13.7）
+- unit / integration / distributed / deterministic seed tests
+- config validation（每模块 enabled 开关）
+- cache consistency check
+- no teacher forward inside train step（断言）
+- no unexpected GPU memory growth
+- no unbounded metadata growth
+
 ---
 
-## 10. Ablation
+## 10. Ablation（实验矩阵，详见 §13）
 
-- **Selective Rollout**（§6.11）：`random/uncertainty_only/disagreement_only/value_based/value_plus_coverage`，对比 token_savings vs quality retained。
-- **Dynamic Ratio**（§5.8）：`mode=fixed/linear/adaptive` 三组共享同一 feeder，对比 adaptive 是否优于 fixed。
-- **四能力组合**：关 selective / 关 dynamic / 仅 health-monitor 记录 / 全开。
-对比 `E[Δ_T]` 收敛曲线 + AIME 分数，验证各模块贡献。
+**模块级**（单模块 ablation hooks）：
+- **Selective Rollout**（§6.11）：`random/uncertainty_only/disagreement_only/value_based/value_plus_coverage`
+- **Dynamic Ratio**（§5.8）：`mode=fixed/linear/adaptive`
+
+**系统级**（E0-E6，每模块 `enabled: false` 可关）：
+
+| 实验 | 配置 | 验证 |
+|------|------|------|
+| E0 | Base only | L0/L1 基线 |
+| E1 | Base + fixed Refresh | L2 基础（无四能力） |
+| E2 | E1 + Disagreement | Q1：disagreement 找高价值样本？ |
+| E3 | E2 + Health Monitor | Q2：提前发现 cache degradation？ |
+| E4 | E3 + Dynamic Ratio | Q3：dynamic 优于固定 70/30？ |
+| E5 | E4 + Selective Rollout | Q4：降 compute 保性能？ |
+| E6 | 全模块 + Random Rollout | 隔离 Selective Rollout 贡献 |
+
+**判断标准**（不只看 final benchmark）：
+- `Performance / Teacher Compute`
+- `Performance / Rollout Tokens`
+- 性能提升 0.1% 但 teacher compute 降 40% 仍视为成功。
 
 ---
 
@@ -496,3 +531,71 @@ refresh sample 数据流：
    -> feeder 按 α（§5 dynamic）采 -> _train_step（纯查表, teacher-free）
    -> §4 Health Monitor 观测 -> §5 controller 调 α -> §6 next selection
 ```
+
+---
+
+## 13. 四模块整合与实验框架
+
+> 不增加新算法，完成四者工程整合、配置解耦、ablation framework。
+> 最终数据流：Selective Rollout -> Teacher Evaluation -> Disagreement -> Utility -> Refresh Cache -> Health Monitor -> Dynamic Ratio -> Training
+
+### 13.1 模块职责（单向依赖，禁止循环修改）
+
+| 模块 | 回答 |
+|------|------|
+| Selective Rollout | 哪些 prompt 值得生成？ |
+| Teacher-Student Disagreement | 哪些生成结果最值得学习？ |
+| Cache Health Monitor | 当前 cache 是否健康？ |
+| Dynamic Refresh Ratio | 下一阶段用多少 refresh 数据？ |
+
+单向依赖链（禁止模块间循环直接修改彼此内部状态；下游不直接改上游状态，上游信号缺失时下游走 fallback §6.9）：
+
+Rollout Selector -> Teacher/Student Signals -> Disagreement -> Sample Utility -> Refresh Cache -> Health Monitor -> Dynamic Ratio Controller -> Hybrid Feeder
+
+### 13.2 统一 Sample Metadata
+
+跨模块统一持久化字段（第一版，per-token logp 算完即弃见 §11）：
+
+sample_id, prompt_id, generation_step, generation_version, response_length, token_mask, reward, rl_k, ref_k, disagreement, disagreement_abs, utility, reuse_count
+
+### 13.3 实验矩阵
+
+见 §10（E0-E6）。每模块 `enabled: false` 可关，支持单项 ablation。
+
+### 13.4 每实验统一记录
+
+- **Training Quality**：final reward / benchmark score / training loss / KL
+- **Efficiency**：total rollout tokens / teacher forward tokens / teacher wall-clock / training throughput / total training time
+- **Cache**：hit rate / mean age / p95 age / reuse / disagreement / coverage / response length
+- **Selector**：selection rate / token savings / selected sample quality / exploration ratio
+
+### 13.5 核心实验问题
+
+- **Q1**：Disagreement 能否找到真正高价值样本？
+- **Q2**：Cache Health Monitor 能否提前发现 cache degradation？
+- **Q3**：Dynamic Ratio 是否优于固定 70/30？
+- **Q4**：Selective Rollout 能否降低 rollout/teacher compute，同时保持最终性能？
+
+### 13.6 实验图
+
+1. Reward vs Training Step
+2. Benchmark vs Training Step
+3. Refresh Ratio vs Training Step
+4. Cache Age vs Training Step
+5. Disagreement vs Training Step
+6. **Teacher Compute vs Performance**（最重要）
+7. **Rollout Tokens vs Performance**（最重要）
+8. Selected vs Random Prompt Quality
+
+### 13.7 工程检查清单
+
+- unit / integration / distributed / deterministic seed tests
+- config validation（每模块 enabled + extra="forbid"）
+- cache consistency check（teacher 一致性 + ring buffer 完整性）
+- **no teacher forward inside train step**（断言）
+- no unexpected GPU memory growth
+- no unbounded metadata growth（prompt state / reuse count 有界）
+
+### 13.8 Implementation Report（9 项）
+
+1. 架构变化 2. 文件变化 3. 数据流 4. 配置 5. 测试结果 6. 性能变化 7. Ablation 结果 8. 已知问题 9. 下一阶段建议
