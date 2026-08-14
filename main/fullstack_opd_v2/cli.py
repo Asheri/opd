@@ -353,7 +353,12 @@ def _cmd_eval_budget(args) -> int:
                      dtype=args.dtype, completion_max_tokens=args.completion_max_tokens)
     report_path = os.path.join(out_dir, "2026-08-15-budget-aware-eval.md")
     write_report(res, report_path)
+    # Stage 1.7：追加 Budget Curve / 效率指标报告（纯指标层，不改 evaluation 内核）
+    from .budget_curve import write_budget_curve_report
+    curve_path = os.path.join(out_dir, "2026-08-15-budget-curve-analysis.md")
+    write_budget_curve_report(res, curve_path)
     n_skip = sum(1 for _, p in models if not p)
-    print(f"[budget-eval] 报告写至 {report_path}（{len(res)} 个 model×budget×dataset 结果，"
+    print(f"[budget-eval] 报告写至 {report_path} / {curve_path}"
+          f"（{len(res)} 个 model×budget×dataset 结果，"
           f"{n_skip} 个占位模型跳过）")
     return 0

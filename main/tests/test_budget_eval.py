@@ -346,5 +346,6 @@ def test_cli_eval_budget_skips_empty_path(tmp_path):
         rc = _cmd_eval_budget(args)
     assert rc == 0
     assert mr.called
-    # 空路径占位 → run_matrix 返回 [] → 报告写出（仅表头）
+    # 空路径占位 → run_matrix 返回 [] → 两份报告（Stage 1.6 + 1.7）都写出
     assert (tmp_path / "2026-08-15-budget-aware-eval.md").exists()
+    assert (tmp_path / "2026-08-15-budget-curve-analysis.md").exists()
