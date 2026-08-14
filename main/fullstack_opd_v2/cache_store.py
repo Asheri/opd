@@ -35,7 +35,7 @@ class CacheConsistencyError(Exception):
 # §5 metadata schema
 # ---------------------------------------------------------------------------
 METADATA_KEYS = (
-    "dataset_size", "max_prompt_len", "max_response_len", "top_k",
+    "dataset_size", "max_prompt_len", "max_response_len", "top_k", "vocab",
     "dtype", "num_samples", "total_tokens", "format_version",
     "tokenizer_hash", "teacher_model_hash", "reference_model_hash",
     "generation_model_hash", "checksum",
@@ -152,6 +152,7 @@ def write_cache_disk(cache, prefix: str, responses: torch.Tensor | None = None,
         "max_prompt_len": int(max_prompt_len),
         "max_response_len": int(max_response_len),
         "top_k": int(cache.top_k),
+        "vocab": int(cache.vocab),
         "dtype": str(dtype),
         "num_samples": int(N),
         "total_tokens": int(lengths_np.sum()),

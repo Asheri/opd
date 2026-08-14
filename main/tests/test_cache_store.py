@@ -165,6 +165,36 @@ def test_disk_reload_restart_lookup(tmp_path):
     assert torch.equal(o1, o2)
 
 
+def test_stage1_build_cache_disk_integration(tmp_path):
+    """S1-6：stage1_build_cache(storage='disk') 写磁盘三件套 + metadata，DiskTeacherCache
+    加载后与 in-memory 输出一致（build→disk→load 全链路）。"""
+    from fullstack_opd_v2.pipeline import stage1_build_cache
+    prompts, responses, rl, ref = _make(N=6, T=6, V=24)
+    prefix = str(tmp_path / "c")
+    cfg = {"cache_mode": "topk", "top_k_teacher": 7, "cache_path": prefix,
+           "build_batch_size": 4, "dtype": "bf16", "warmup_M": 0,
+           "warmup_source": "none", "warmup_temperature": 1.0,
+           "enforce_teacher_consistency": True}
+    cache, fp, fr = stage1_build_cache(
+        prompts, responses, rl, ref, cfg, storage="disk",
+        hashes={"tokenizer_hash": "t", "teacher_model_hash": "a",
+                "reference_model_hash": "b", "generation_model_hash": "g"})
+    # 磁盘三件套 + metadata 已写
+    assert np.memmap(f"{prefix}.ids_sorted.dat", dtype=np.int32, mode="r").size > 0
+    assert np.memmap(f"{prefix}.delta_k_sorted.dat", dtype=np.float32, mode="r").size > 0
+    meta = load_cache_metadata(prefix)
+    assert meta["tokenizer_hash"] == "t"
+    assert meta["vocab"] == cache.vocab
+    assert meta["num_samples"] == prompts.size(0) == fp.size(0)
+    # DiskTeacherCache 加载 → 与 build 出的 in-memory 缓存逐位一致
+    disk = DiskTeacherCache(prefix, device="cpu", top_k=cache.top_k, vocab=cache.vocab)
+    B, T, Ks = 2, responses.size(1), 4
+    idxs = torch.tensor([0, 1])
+    student_topk = torch.randint(0, cache.vocab, (B, T, Ks))
+    assert torch.equal(cache.delta_for_student_topk(idxs, student_topk),
+                       disk.delta_for_student_topk(idxs, student_topk))
+
+
 def test_hash_model_dir_deterministic(tmp_path):
     """同一目录哈希确定；不同目录可区分；None 退化为路径哈希。"""
     a = tmp_path / "a"; a.mkdir()

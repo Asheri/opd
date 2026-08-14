@@ -22,6 +22,9 @@ import time
 import torch
 
 from .cache import TensorTeacherCache
+from .cache_store import (DiskTeacherCache, hash_models_from_cfg,
+                          load_cache_metadata, verify_consistency,
+                          write_cache_disk)
 from .model import CausalToyLM, generate_batch, token_logprobs, response_dists
 from .scheduler import AsyncBatchedScheduler, launch_distributed_scheduler
 from .data import build_data_loader
@@ -192,7 +195,9 @@ def stage0_small_rl(prompts, reward_fn, cfg: dict, device,
 
 # ----------------------------- Stage 1 -----------------------------
 def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
-                       cfg: dict, warmup_student=None):
+                       cfg: dict, warmup_student=None,
+                       storage: str = "memory", hashes: dict | None = None,
+                       pad_id: int = 0):
     """Lightning-OPD：批量预计算教师对并预计算 Δ_T，训练期不再启 teacher server。
 
     cache_mode="topk"（且 top_k_teacher>0）时走 L4 稀疏缓存：每位置只存 teacher top-K，
@@ -249,10 +254,18 @@ def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
 
     cache.build(fat_prompts, fat_responses, teacher_rl, teacher_ref,
                 cfg.get("build_batch_size", 16))
-    # 把 fat prompts/responses 一并落盘（模块2：`opd train --set stage1.load_cache=true`
-    # 载入后跳过 Stage 0/1，训练直接索引 fat 上下文 + 算 KL 锚点）。
-    cache.save(cfg.get("cache_path", "fullstack_opd_cache_v2.pt"),
-               prompts=fat_prompts, responses=fat_responses)
+    # 落盘（Stage 1）：storage="disk" → 磁盘 mmap（最小 sufficient statistics + metadata +
+    # checksum + 一致性哈希，解决 50K×8192 显存墙）；否则原 torch.save 全量缓存 +
+    # fat 上下文（模块2：`opd train --set stage1.load_cache=true` 载入后跳过 Stage 0/1）。
+    cache_path = cfg.get("cache_path", "fullstack_opd_cache_v2.pt")
+    if storage == "disk":
+        write_cache_disk(cache, cache_path, responses=fat_responses, pad_id=pad_id,
+                         hashes=hashes, max_response_len=fat_responses.size(1),
+                         max_prompt_len=fat_prompts.size(1),
+                         dtype=str(cfg.get("dtype", "bf16")),
+                         dataset_size=fat_prompts.size(0))
+    else:
+        cache.save(cache_path, prompts=fat_prompts, responses=fat_responses)
     return cache, fat_prompts, fat_responses
 
 
@@ -355,8 +368,19 @@ class FullStackOPDv2:
         # 走原重建路径。共享的只有教师权重；默认 student_init 下每学生缓存各建（§7.0）。
         s1cfg = dict(self.cfg["stage1"])
         cache_path = s1cfg.get("cache_path")
-        use_prebuilt = (bool(s1cfg.get("load_cache", False))
-                        and cache_path and os.path.isfile(cache_path))
+        # Stage 1：storage=disk 的缓存是「前缀」多文件（<prefix>.metadata.json 等），
+        # 存在性按 metadata.json 判断；memory 按单个 .pt 判断。
+        cache_block = self.cfg.get("cache") or {}
+        storage = cache_block.get("storage", "memory")
+        # dense 模式忽略 storage（磁盘只存 top-K 支撑）；dense 一律走内存 .pt 路径，
+        # 避免 cache.storage 默认 disk 把默认 dense 配置错误导向磁盘。
+        if self.cfg.get("cache_mode", "dense") != "topk":
+            storage = "memory"
+        if storage == "disk":
+            prebuilt_exists = bool(cache_path and os.path.isfile(f"{cache_path}.metadata.json"))
+        else:
+            prebuilt_exists = bool(cache_path and os.path.isfile(cache_path))
+        use_prebuilt = bool(s1cfg.get("load_cache", False)) and prebuilt_exists
 
         # L1：把 student 提前创建，使「离线 warmup 采样」与「Stage 2 KL 锚点」共享同一份
         # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
@@ -377,25 +401,44 @@ class FullStackOPDv2:
         if use_prebuilt:
             logger.info(f"[Stage 0/1] 跳过：载入预建缓存 {cache_path}")
             t = time.perf_counter()
-            cache = TensorTeacherCache.load(cache_path)
-            # P1-A（二次审查）：load() 用 map_location="cpu" 把缓存钉在 CPU——GPU 训练
-            # 路径若不管搬设备，KL 锚点（CUDA 模型吃 CPU 输入）与 scheduler 索引
-            # （CUDA idxs 索引 CPU 张量）必崩。build 路径的 fat_* 本就 device 张量，
-            # 只有 load 路径需要显式搬（对称 resume 分支对 ref 张量的 .to(self.device)）。
-            cache.to(self.device)
-            # P3（二次审查）：load_cache 跳过 build，teacher 一致性校验（TensorTeacherCache
-            # .build 开头）不再触发——此处补词表一致性把关：缓存词表 ≠ 当前模型词表时，
-            # dense 路径 shape 崩溃、稀疏路径 scatter 越界/静默错位。
-            sv = getattr(student, "vocab", None)
-            if cache.vocab and sv and cache.vocab != sv:
-                raise DataError(
-                    f"预建缓存词表 {cache.vocab} 与当前模型词表 {sv} 不匹配；"
-                    "缓存与模型必须同词表（teacher 一致性语义）")
-            fat_prompts, fat_responses = cache.prompts, cache.responses
-            if fat_prompts is None or fat_responses is None:
-                raise DataError(
-                    f"预建缓存 {cache_path} 未含 fat prompts/responses（旧格式）；"
-                    "请用新版 `opd cache` 子命令重建（stage1_build_cache 已把 fat 上下文落盘）")
+            if storage == "disk":
+                # Stage 1：磁盘 mmap 缓存。先校验 metadata 一致性（tokenizer/教师/ref/
+                # top_k/长度/checksum，不匹配 fail fast），再 batch-local mmap 加载。
+                meta = load_cache_metadata(cache_path)
+                hashes_now = hash_models_from_cfg(self.cfg)
+                verify_consistency(meta, self.cfg, hashes_now)
+                cache = DiskTeacherCache(cache_path, device=self.device,
+                                         top_k=int(meta["top_k"]),
+                                         vocab=int(meta["vocab"]))
+                # 磁盘缓存不持久化 prompts/responses（最小 sufficient statistics）——
+                # fat 上下文即当前数据集行（磁盘场景 warmup_M=0，无胖 D 扩展）。校验缓存
+                # 行数与数据集一致，防止缓存与数据不同源时 scheduler 越界/错位。
+                fat_prompts, fat_responses = self.prompts, self.responses
+                if int(meta["num_samples"]) != fat_prompts.size(0):
+                    raise DataError(
+                        f"磁盘缓存 num_samples={meta['num_samples']} 与当前数据集行数 "
+                        f"{fat_prompts.size(0)} 不一致；磁盘缓存只持久化 Δ_T，必须与数据集同源"
+                        "（磁盘场景不支持 warmup 胖 D 扩展）")
+            else:
+                cache = TensorTeacherCache.load(cache_path)
+                # P1-A（二次审查）：load() 用 map_location="cpu" 把缓存钉在 CPU——GPU 训练
+                # 路径若不管搬设备，KL 锚点（CUDA 模型吃 CPU 输入）与 scheduler 索引
+                # （CUDA idxs 索引 CPU 张量）必崩。build 路径的 fat_* 本就 device 张量，
+                # 只有 load 路径需要显式搬（对称 resume 分支对 ref 张量的 .to(self.device)）。
+                cache.to(self.device)
+                # P3（二次审查）：load_cache 跳过 build，teacher 一致性校验（TensorTeacherCache
+                # .build 开头）不再触发——此处补词表一致性把关：缓存词表 ≠ 当前模型词表时，
+                # dense 路径 shape 崩溃、稀疏路径 scatter 越界/静默错位。
+                sv = getattr(student, "vocab", None)
+                if cache.vocab and sv and cache.vocab != sv:
+                    raise DataError(
+                        f"预建缓存词表 {cache.vocab} 与当前模型词表 {sv} 不匹配；"
+                        "缓存与模型必须同词表（teacher 一致性语义）")
+                fat_prompts, fat_responses = cache.prompts, cache.responses
+                if fat_prompts is None or fat_responses is None:
+                    raise DataError(
+                        f"预建缓存 {cache_path} 未含 fat prompts/responses（旧格式）；"
+                        "请用新版 `opd cache` 子命令重建（stage1_build_cache 已把 fat 上下文落盘）")
             timings["stage0_rl"] = 0.0
             timings["stage1_cache"] = time.perf_counter() - t
         else:
@@ -411,7 +454,9 @@ class FullStackOPDv2:
             # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
             cache, fat_prompts, fat_responses = stage1_build_cache(
                 self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
-                warmup_student=warmup_student)
+                warmup_student=warmup_student,
+                storage=storage, hashes=hash_models_from_cfg(self.cfg),
+                pad_id=int((self.cfg.get("dataset") or {}).get("pad_id", 0)))
             timings["stage1_cache"] = time.perf_counter() - t
 
         # P2（二次审查）：教师对与 warmup_student 在 Stage 1 后不再需要。HF 路径下它们是
