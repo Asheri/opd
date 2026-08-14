@@ -291,11 +291,55 @@ Refresh Pool 不足（`N_R < N_required`）时：`α_actual = min(α_t, N_R/N_ba
 
 ---
 
-## 6. Selective Rollout
+## 6. Selective Rollout（权威定义）
 
-- 每样本难度分 `d(i) = EMA(D_i^abs)`（来自缓存 disagreement）。
-- 刷新时温度采样 `p(i) ∝ exp(d(i)/τ)`。
-- `selective_rollout: false` 退回随机。
+> 目标：从 `M_refresh -> rollout -> teacher` 改为 `M_candidate -> cheap scoring -> M_selected -> expensive rollout`，降低 rollout/teacher token 成本，保数据覆盖与训练质量。
+> 第一版不用 learned selector，用已有 cheap signal；可解释、deterministic given seed、configurable、ablation-friendly、distributed-safe。
+
+### 6.1 Prompt State（轻量历史，复用已有字段）
+每 prompt 维护：`prompt_id, times_seen, last_seen_step, reward_ema, reward_var, disagreement_ema, last_response_length, reuse_count`。reward/disagreement/reuse 复用 §3/§4 已有信号，**不重复 forward**。
+
+### 6.2 Prompt Value
+```
+V(p) = λU·U(p) + λD·D(p) + λN·N(p) − λR·R(p)
+```
+第一版 `V = 0.4U + 0.4D + 0.2N`：
+- `U(p) = Var(R|p)` uncertainty（reward variance）
+- `D(p) = EMA[D_i|p]` disagreement（来自 §3）
+- `N(p) = 1/√(1+times_seen(p))` novelty
+
+### 6.3 Coverage-aware sampling（不直接 Top-K）
+```
+P_select = λ·P_high-value + (1−λ)·P_coverage
+```
+默认 80% 高价值 + 20% uniform/coverage。
+
+### 6.4 Compute-aware Score（可选）
+```
+ELG(p) = V(p) / (Cost(p) + ε)
+```
+`Cost(p)` 用历史 response length EMA 近似，防长 response 吞噬 rollout budget。
+
+### 6.5 Candidate Pool（两阶段，核心降本）
+`M_candidate = 4·M_selected`：sample 4M candidate -> cheap scoring -> 80% top-value + 20% random coverage -> M selected -> student rollout -> teacher forward。**candidate 阶段不跑 teacher**。
+
+### 6.6 Buckets（可选）
+easy/uncertain/hard/unknown，默认 10% easy / 70% uncertain / 20% hard。无可靠历史不硬分类；unknown 进 coverage bucket。
+
+### 6.7 与 Refresh Pool 联动（闭环）
+rollout 完成 teacher scoring 后，`U_i`（§3.5 sample utility）回写 prompt state：`prompt_value(p) <- EMA(prompt_value(p), U_i)`。形成 rollout result -> prompt history -> next selection 闭环。
+
+### 6.8 Diversity Protection
+per-bucket quota / `max_same_prompt_fraction: 0.05` / `exploration_fraction: 0.20`，防 selector 只选少数高分 prompt。
+
+### 6.9 Failure Handling
+history 太短 / variance 不可靠 / disagreement 不存在 / cold start -> fallback `P_select = P_uniform`，不产生 NaN/空 batch。
+
+### 6.10 Logging
+`selector/{candidate_count, selected_count, selection_rate, value_mean, value_p90, high_value_fraction, exploration_fraction, estimated_tokens, actual_tokens, token_savings, reward_selected, reward_random, disagreement_selected, disagreement_random}`。最重要的是 **token_savings + quality retained**。
+
+### 6.11 Ablation
+`random / uncertainty_only / disagreement_only / value_based / value_plus_coverage`，对比 rollout tokens / teacher forward tokens / final reward / benchmark accuracy / cache freshness。回答"减少 X% rollout compute 下性能损失是否显著"。
 
 ---
 
@@ -319,8 +363,19 @@ l2:
       ema_beta: 0.9
       warmup_steps: 500
       max_step_change: 0.05
-  selective_rollout: true
-  selection_temperature: 1.0
+  rollout:
+    selector:
+      enabled: true
+      candidate_multiplier: 4      # M_candidate = 4·M_selected（§6.5）
+      value_fraction: 0.80         # 高价值占比（§6.3）
+      coverage_fraction: 0.20
+      value_weights:               # V(p) 系数（§6.2）
+        uncertainty: 0.4
+        disagreement: 0.4
+        novelty: 0.2
+      compute_aware: false         # §6.4 ELG
+      max_same_prompt_fraction: 0.05   # §6.8
+      exploration_fraction: 0.20
   health_monitor: true
   health:                     # §4.3 rule-based 阈值（configurable）
     hit_rate:         {warning: 0.995, critical: 0.98}
@@ -391,10 +446,20 @@ l2:
 - distributed consistency
 - extreme age / drift / quality（信号极值不崩溃）
 
+### Selective Rollout 测试（§6 权威要求）
+- candidate pool 两阶段（4M->M，candidate 不跑 teacher）
+- coverage-aware 80/20 采样比例
+- value 函数（uncertainty/disagreement/novelty）
+- diversity protection（max_same_prompt_fraction）
+- failure fallback（cold start -> uniform，不 NaN/空 batch）
+- deterministic given seed
+- distributed-safe（跨 rank 选样一致）
+
 ---
 
 ## 10. Ablation
 
+- **Selective Rollout**（§6.11）：`random/uncertainty_only/disagreement_only/value_based/value_plus_coverage`，对比 token_savings vs quality retained。
 - **Dynamic Ratio**（§5.8）：`mode=fixed/linear/adaptive` 三组共享同一 feeder，对比 adaptive 是否优于 fixed。
 - **四能力组合**：关 selective / 关 dynamic / 仅 health-monitor 记录 / 全开。
 对比 `E[Δ_T]` 收敛曲线 + AIME 分数，验证各模块贡献。
@@ -420,10 +485,14 @@ Skywork 50K parquet -> jsonl -> 初始 response 预生成(8192) -> 初始 topk c
 
 refresh sample 数据流：
 ```
-selective prompt -> student 生成 y + logπ_S
+§6 candidate pool: sample 4M prompt -> cheap scoring(V=0.4U+0.4D+0.2N)
+   -> 80% top-value + 20% coverage -> M selected
+   -> student 生成 y + logπ_S
    -> 初始 student 前向 logπ_Ref(y)
    -> teacher 前向 top-k + chosen logπ_T^RL/Ref(y)
    -> D_t = [π_T^RL−π_T^Ref]−[π_S−π_Ref] -> mask 聚合 D_i^abs
    -> append_refresh(ring buffer, 带 generation_step/version)
-   -> feeder 按 mix_ratio 采 -> _train_step(纯查表, teacher-free)
+   -> U_i 回写 prompt state（§6.7 闭环）
+   -> feeder 按 α（§5 dynamic）采 -> _train_step（纯查表, teacher-free）
+   -> §4 Health Monitor 观测 -> §5 controller 调 α -> §6 next selection
 ```
