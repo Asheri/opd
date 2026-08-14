@@ -872,7 +872,7 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 
 > ⚠️ 以下为**短生成**（max_new_tokens≈2048）+ boxed 模板测得的 **pass@1**，**非论文 ave@32 协议**。
 > 数值会系统性低于论文协议（短生成截断在 CoT 中途、模型未写出 `\boxed{}`）。来源：
-> `docs/multistudent_cloud_training_report.md`。
+> 来源：原 `docs/multistudent_cloud_training_report.md`（已并入本文档并删除，避免重复维护）。
 
 | 学生 | 基座 AIME24 | 基座 AIME25 | 训练后 AIME24 | 训练后 AIME25 | 训练步数/时长 |
 |---|---|---|---|---|---|
