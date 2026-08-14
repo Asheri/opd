@@ -118,9 +118,9 @@ def main():
     idxs = torch.randint(0, N, (16,), generator=g)
     Ks = min(8, args.top_k)
     student_topk = torch.randint(0, V, (16, T, Ks), generator=g)
-    ref_out = cache.delta_for_student_topk(idxs, student_topk)
+    ref_out = cache.delta_for_student_topk(idxs, student_topk).cpu()
     out = disk.delta_for_student_topk(idxs, student_topk)
-    if not torch.equal(out, ref_out):
+    if not torch.equal(out.cpu(), ref_out):
         _fail(f"3. batch lookup 与 in-memory 不一致（shape {out.shape} vs {ref_out.shape}）")
     print("[OK] 3. 随机 batch lookup 与 in-memory 逐位一致")
 
@@ -133,10 +133,10 @@ def main():
 
     # ---- 5. 训练 steps：真实 _train_step 消费磁盘缓存（teacher-free，delta 只来自磁盘）----
     from fullstack_opd_v2.losses import pg_loss
-    student = CausalToyLM(vocab=V, d_model=16, n_layers=1, max_len=P + T)
+    student = CausalToyLM(vocab=V, d_model=16, n_layers=1, max_len=P + T).to(device)
     opt = torch.optim.AdamW(student.parameters(), lr=1e-4)
-    resp_bs = responses[:2]                                # (B,T) 训练响应
-    prompt_bs = prompts[:2]                                # (B,P) 提示
+    resp_bs = responses[:2].to(device)                     # (B,T) 训练响应
+    prompt_bs = prompts[:2].to(device)                     # (B,P) 提示
     with torch.no_grad():
         s_old = student.response_dists(prompt_bs, resp_bs) # rollout 时刻 π_old 快照
     for step in range(args.steps):
