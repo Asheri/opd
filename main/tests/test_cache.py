@@ -187,3 +187,60 @@ def test_delta_for_student_topk_vocab_out_smaller_raises():
     student_topk = torch.randint(0, Vt, (B, T, 4))
     with pytest.raises(ValueError):
         cache.delta_for_student_topk(torch.arange(B), student_topk, vocab_out=Vt - 1)
+
+
+# ---- S1-3：expand_student_topk_delta 纯函数（in-memory / 磁盘共用；DiskTeacherCache 会复用）----
+
+def test_expand_pure_matches_inmemory_bitwise():
+    """纯函数 expand_student_topk_delta 与 TensorTeacherCache.delta_for_student_topk
+    在【同输入同输出】下逐位一致——保证磁盘路径复用后训练数字不变。"""
+    from fullstack_opd_v2.cache import expand_student_topk_delta
+    prompts, responses, rl, ref = _make(N=6, T=5, V=24)
+    K = 7
+    cache = TensorTeacherCache(True, top_k=K).build(prompts, responses, rl, ref)
+    B, T = 3, responses.size(1)
+    Ks = 5
+    idxs = torch.tensor([0, 1, 2])
+    student_topk = torch.randint(0, rl.vocab, (B, T, Ks))
+    # in-memory 路径（内部取 sorted 切片 → 调纯函数）
+    ref_out = cache.delta_for_student_topk(idxs, student_topk)
+    # 磁盘路径等价：直接取 sorted 切片喂纯函数
+    pure_out = expand_student_topk_delta(cache.ids_sorted[idxs], cache.delta_k_sorted[idxs],
+                                         student_topk, cache.vocab)
+    assert pure_out.shape == ref_out.shape
+    assert torch.equal(pure_out, ref_out)
+
+
+def test_expand_pure_cross_vocab_expands():
+    """纯函数跨词表：student vocab > teacher vocab 时扩展展开维度。"""
+    from fullstack_opd_v2.cache import expand_student_topk_delta
+    cache, prompts, responses, rl, ref, Vt, Vs = _make_cross_vocab()
+    B, T = 2, responses.size(1)
+    student_topk = torch.randint(Vt, Vs, (B, T, 4))          # 全在 [Vt, Vs) 高 id 区
+    out = expand_student_topk_delta(cache.ids_sorted[torch.arange(B)],
+                                    cache.delta_k_sorted[torch.arange(B)],
+                                    student_topk, cache.vocab)
+    assert out.shape[2] == Vs                               # 扩展到 student 词表
+    # 高 id 区不在 teacher 支撑 → 全部 fill(0)
+    assert torch.allclose(out, torch.zeros_like(out), atol=1e-7)
+
+
+def test_expand_pure_respects_mask():
+    """S1-5 变长：mask 置 0 的 (B,T) 位置 Δ 全为 0（padding 不参与统计）。"""
+    from fullstack_opd_v2.cache import expand_student_topk_delta
+    prompts, responses, rl, ref = _make(N=4, T=5, V=24)
+    K = 7
+    cache = TensorTeacherCache(True, top_k=K).build(prompts, responses, rl, ref)
+    B, T = 2, responses.size(1)
+    idxs = torch.tensor([0, 1])
+    teacher_ids = cache.ids[idxs]                            # 全匹配 teacher 支撑
+    mask = torch.zeros(B, T, dtype=torch.bool)
+    mask[:, 0] = True                                        # 只留第 0 个位置有效
+    out = expand_student_topk_delta(cache.ids_sorted[idxs], cache.delta_k_sorted[idxs],
+                                    teacher_ids, cache.vocab, mask=mask)
+    # 无 mask 基线（对照）：有效位置上 Δ 与 unmasked 一致；无效位置全 0
+    base = expand_student_topk_delta(cache.ids_sorted[idxs], cache.delta_k_sorted[idxs],
+                                     teacher_ids, cache.vocab)
+    assert torch.allclose(out[:, 0:1], base[:, 0:1], atol=1e-7)   # 有效位置不变
+    assert torch.allclose(out[:, 1:], torch.zeros_like(out[:, 1:]), atol=1e-7)  # padding 排除
+    assert base[:, 0].abs().sum() > 0                        # 有效位置确有 teacher Δ（非恒 0）

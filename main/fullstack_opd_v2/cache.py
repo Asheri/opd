@@ -23,6 +23,47 @@ class TeacherConsistencyError(Exception):
     """SFT 与 OPD 的 teacher 不一致时抛出（会导致不可约梯度偏差）。"""
 
 
+@torch.no_grad()
+def expand_student_topk_delta(ids_sorted: torch.Tensor,
+                              delta_k_sorted: torch.Tensor,
+                              student_topk_ids: torch.Tensor,
+                              vocab: int,
+                              vocab_out: int | None = None,
+                              fill: float = 0.0,
+                              mask: torch.Tensor | None = None) -> torch.Tensor:
+    """把 teacher top-K 支撑展开成 dense (B,T,V)，仅在 student 的 top-K 支撑上有值。
+
+    纯张量逻辑（无状态、无 self），供 in-memory `TensorTeacherCache` 与磁盘
+    `DiskTeacherCache` 共用（Stage 1 磁盘 mmap 存储，S1-3）。语义与
+    `TensorTeacherCache.delta_for_student_topk` 完全一致：
+
+    - `ids_sorted`/`delta_k_sorted`：(B,T,Kt)，teacher top-K 已按 token id 升序预排序。
+    - `student_topk_ids`：(B,T,Ks)，student 的 top-K 支撑。
+    - 每个 student top-K token 用 searchsorted 二分定位到 ≤ 它的 teacher 位置，命中
+      （教师支撑含该 id）取 teacher delta，未命中置 0；再 scatter 回 (B,T,V)。
+    - `vocab_out`：展开维度。默认 max(vocab, student_topk_ids.max()+1)；跨词表
+      （student vocab > teacher vocab，如 7B=152064 vs 151936）时扩展对齐 ratio。
+    - `mask`（可选，S1-5 变长）：(B,T) 有效 token 掩码，padding 位置 Δ 置 0 → 不参与
+      PG/KL 统计。None = 全 valid（兼容旧行为）。
+    """
+    B = student_topk_ids.size(0)
+    T = student_topk_ids.size(1)
+    Kt = ids_sorted.size(-1)
+    pos = torch.searchsorted(ids_sorted, student_topk_ids.contiguous()).clamp(max=Kt - 1)
+    found = ids_sorted.gather(-1, pos) == student_topk_ids
+    matched = delta_k_sorted.gather(-1, pos) * found           # 未匹配置 0
+    if vocab_out is None:
+        vocab_out = max(vocab, int(student_topk_ids.max()) + 1)
+    if vocab_out < vocab:
+        raise ValueError(
+            f"vocab_out={vocab_out} < teacher vocab={vocab}：展开维度不能小于缓存词表")
+    out = torch.full((B, T, vocab_out), fill, dtype=matched.dtype, device=matched.device)
+    out.scatter_(-1, student_topk_ids, matched)
+    if mask is not None:
+        out = out * mask.unsqueeze(-1)                         # padding 位置 Δ=0
+    return out
+
+
 class TensorTeacherCache:
     def __init__(self, enforce_consistency: bool = True, top_k: int = 0):
         """
@@ -138,31 +179,12 @@ class TensorTeacherCache:
         if self.mode == "dense":
             return self.delta[idxs]
         # 稀疏展开。⚠️ idxs 是一维批次索引 (B,)，不是 (B,T)——B/T 要从支撑张量取。
-        B = idxs.size(0)
-        T = student_topk_ids.size(1)
-        Kt = self.ids.size(-1)
-        Ks = student_topk_ids.size(-1)
-        # P1-1：二分匹配（searchsorted）替代 O(Ks×Kt) 全对比较。teacher 支撑已升序预排序，
-        # 每个 student id 二分定位到 ≤ 它的最大 teacher 位置，命中即取对齐 delta，未命中置 0。
-        # 数值与全对比较完全一致（含重复 student id）：searchsorted 定位任意一个相等位置即可。
+        # 核心逻辑抽为模块级纯函数 expand_student_topk_delta（S1-3，in-memory/磁盘共用）：
+        # searchsorted 二分匹配替代 O(Ks×Kt) 全对比较，数值与全对比较完全一致。
         teacher_ids_sorted = self.ids_sorted[idxs]             # (B, T, Kt) 已升序
         teacher_delta_sorted = self.delta_k_sorted[idxs]       # (B, T, Kt)
-        pos = torch.searchsorted(teacher_ids_sorted, student_topk_ids.contiguous()).clamp(
-            max=Kt - 1)
-        found = teacher_ids_sorted.gather(-1, pos) == student_topk_ids
-        matched = teacher_delta_sorted.gather(-1, pos) * found  # 未匹配置 0
-        if vocab_out is None:
-            # 默认取「teacher 词表」与「student top-K 最大 id+1」的较大者：
-            # 同词表场景（student top-K 只是 teacher 高概率子集）→ 保持 teacher vocab；
-            # 跨词表场景（student id 超出 teacher 词表，7B=152064）→ 扩展。
-            vocab_out = max(self.vocab, int(student_topk_ids.max()) + 1)
-        if vocab_out < self.vocab:
-            raise ValueError(
-                f"vocab_out={vocab_out} < teacher vocab={self.vocab}：展开维度不能小于缓存词表")
-        out = torch.full((B, T, vocab_out), fill,
-                         dtype=matched.dtype, device=matched.device)
-        out.scatter_(-1, student_topk_ids, matched)
-        return out
+        return expand_student_topk_delta(teacher_ids_sorted, teacher_delta_sorted,
+                                         student_topk_ids, self.vocab, vocab_out, fill)
 
     # --------------------------- 设备迁移 ---------------------------
     def to(self, device) -> "TensorTeacherCache":
