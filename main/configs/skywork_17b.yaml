@@ -1,0 +1,78 @@
+# 1.7B 学生 Skywork 数据重训练配置（docs/2026-08-14-skywork-1.7b-retrain-plan.md）
+#
+# 数据：Skywork-OR1 math 10K 子集（prepare_skywork_jsonl.py + prepare_skywork_responses.py 产出）
+# 健康超参：复用服务器 ms_17b 实测收敛配置（lr=3e-5/kl=0.5/delta_clip=2.0/top_k=256）
+# 教师对：JustRL-DeepSeek-1.5B（rl）/ DeepSeek-R1-Distill-Qwen-1.5B（ref），同 R1/Qwen2.5 家族
+#
+# 用法（服务器恢复后）：
+#   建缓存：python -m fullstack_opd_v2 train --config configs/skywork_17b.yaml \
+#             --run-dir <run_dir> --device cuda:0 --set stage1.load_cache=false
+#   训练：  python -m fullstack_opd_v2 train --config configs/skywork_17b.yaml \
+#             --run-dir <run_dir> --device cuda:0 --set stage1.load_cache=true
+
+model_kind: hf
+student_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+teacher_rl_path: /root/autodl-tmp/models/JustRL-DeepSeek-1.5B
+teacher_ref_path: /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-1.5B
+
+dtype: bf16
+cache_mode: topk
+top_k_teacher: 256
+top_k_student: 256
+ref_topk: 256
+offload_to_cpu: true
+
+# ---- 数据：Skywork 10K jsonl（response 由 prepare_skywork_responses.py 预生成）----
+dataset:
+  type: jsonl
+  path: /root/autodl-tmp/datasets/skywork_10k.jsonl
+  prompt_key: prompt
+  response_key: response
+  max_prompt_len: 1024            # 对齐论文 MAX_PROMPT_LENGTH
+  max_response_len: 2048          # 对齐论文 MAX_RESP_LENGTH（训练短生成）
+  tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+
+stage0:
+  n_rl_steps: 20                  # hf 路径跳过 Stage0 RL（_stage0_teachers 直接用预下载教师对），仅占位
+
+stage1:
+  enforce_teacher_consistency: true
+  cache_path: /root/autodl-tmp/cache_skywork_17b.pt
+  load_cache: false               # 首次建缓存 false；训练阶段置 true（跳过 Stage0/1）
+  build_batch_size: 8             # 真实词表 + 10K 条，控显存
+  warmup_M: 0                     # L0（HF 无 generate_batch；L1 用 prepare 脚本预生成多 response 实现）
+  warmup_source: none
+  warmup_temperature: 1.0
+
+stage2:
+  scheduling_mode: fully_async
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 0.5                # ← ms_17b 健康值（非默认 0.05，防塌陷）
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 3.0e-5                      # ← ms_17b 健康值（非默认 1e-3，保守防爆）
+  n_steps: 200                    # ← step120 最优、step199 过训（复现 + 监测）
+  batch_size: 8                   # ← ms_17b 健康值
+  distributed: false              # 单卡线程版调度器
+  rollout_engine: toy             # scorer 朴素前向（单卡，不用 vLLM TP）
+  renormalize_topk_support: true  # 对齐原始 Direct-OPD 稀疏支撑归一化
+  delta_clip: 2.0                 # ← Δ_T 数值护栏（真实词表 log-ratio 差 ±10 -> PG 爆炸）
+  dtype: bf16
+  top_k_student: 256
+  offload_to_cpu: false           # 单卡 batch=8 显存够，learner 不 offload
+
+run:
+  checkpoint_every: 20            # step20/40/.../200 共 10 断点（捕捉 step120 最优）
+
+eval:
+  model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  n_samples: 8                    # 待 10min flash 实测定（n=8 或 16）
+  temperature: 0.7
+  max_new_tokens: 8192            # 待实测定（8192 或 16384）
+  top_p: 0.95
+  metric: ave
+  prompt_style: boxed
+  scoring: sympy
+  chat_template: true
+  attn_implementation: flash_attention_2
