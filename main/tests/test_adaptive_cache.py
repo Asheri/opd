@@ -99,3 +99,56 @@ def test_ratio_max_step_change():
     a1 = c.update(0, 0, 0)
     a2 = c.update(100, 0, 100)
     assert abs(a2 - a1) <= 0.05 + 1e-6
+
+
+def test_prompt_state_update_tracks_history():
+    """PromptStateStore.update 记录 times_seen/reward_ema/disagreement_ema/resp_len（§6.1）。"""
+    from fullstack_opd_v2.adaptive_cache import PromptStateStore
+    ps = PromptStateStore(n_prompts=10)
+    ps.update(prompt_id=3, reward=1.0, disagreement=0.5, resp_len=8, step=5)
+    assert ps.times_seen[3].item() == 1
+    assert ps.last_seen_step[3].item() == 5
+    assert torch.allclose(ps.reward_ema[3], torch.tensor(0.1), atol=1e-6)  # 0.9*0+0.1*1
+    # 二次 update 后 EMA 收敛
+    ps.update(prompt_id=3, reward=1.0, disagreement=0.5, resp_len=8, step=6)
+    assert torch.allclose(ps.reward_ema[3], torch.tensor(0.19), atol=1e-6)
+    # novelty 随 times_seen 单调下降
+    assert ps.novelty()[3].item() < ps.novelty()[0].item()
+
+
+def test_selector_candidate_pool_two_stage():
+    """candidate pool 两阶段：4M candidate -> M selected，candidate 不跑 teacher（§6.5）。"""
+    from fullstack_opd_v2.adaptive_cache import RefreshSelector, PromptStateStore
+    ps = PromptStateStore(n_prompts=100)
+    sel = RefreshSelector(ps, candidate_multiplier=4, value_fraction=0.8)
+    selected = sel.select(n_selected=10, n_prompts=100)
+    assert len(selected) == 10
+
+
+def test_selector_deterministic_seed():
+    """deterministic given seed（§6.13）。"""
+    from fullstack_opd_v2.adaptive_cache import RefreshSelector, PromptStateStore
+    ps = PromptStateStore(n_prompts=100)
+    s1 = RefreshSelector(ps, seed=42).select(10, 100)
+    s2 = RefreshSelector(ps, seed=42).select(10, 100)
+    assert torch.equal(s1, s2)
+
+
+def test_selector_failure_fallback_uniform():
+    """cold start / history 太短 -> fallback uniform（§6.9）。"""
+    from fullstack_opd_v2.adaptive_cache import RefreshSelector, PromptStateStore
+    ps = PromptStateStore(n_prompts=50)   # 无历史
+    sel = RefreshSelector(ps)
+    selected = sel.select(10, 50)
+    assert len(selected) == 10   # 不 NaN/空
+
+
+def test_selector_diversity_max_same_prompt():
+    """max_same_prompt_fraction 限制单 prompt 占比（§6.8）。"""
+    from collections import Counter
+    from fullstack_opd_v2.adaptive_cache import RefreshSelector, PromptStateStore
+    ps = PromptStateStore(n_prompts=20)
+    sel = RefreshSelector(ps, max_same_prompt_fraction=0.1)
+    selected = sel.select(10, 20)
+    # 单 prompt 不应超过 1（10*0.1 向下取整）
+    assert max(Counter(selected.tolist()).values()) <= 1

@@ -8,12 +8,14 @@
 设计原则：可解释、可监控、compute overhead 可控、可 ablation、不破坏训练。
 所有类经 l2.enabled 总开关控制，关闭时 pipeline 退回 L0/L1 静态路径。
 
-本文件当前实现（任务 2.1-2.3 + 3.1 + 4.1）：
+本文件当前实现（任务 2.1-2.3 + 3.1 + 4.1 + 5.1）：
 - `RefreshRingBuffer`：L2 refresh pool 动态 ring buffer（§2 双池结构；run_refresh_phase 依赖 append）。
 - `DisagreementComputer`：§3 Teacher-Student Disagreement（rollout 阶段计算，_train_step 保持 teacher-free）。
 - `run_refresh_phase` / `_build_mask`：§3.3 + §6.5 rollout 相位编排（student 生成 -> 4 logp -> D_i^abs -> append）。
 - `CacheHealthMonitor`：§4 七维监控 + rule-based health score + alert cooldown（Observe-only，不自动改训练）。
 - `DynamicRatioController`：§5 三信号 controller α（EMA + max_step_change + cold start + fixed/linear/adaptive）。
+- `PromptStateStore`：§6.1 per-prompt 轻量历史状态（times_seen/reward_ema/disagreement_ema/resp_len）。
+- `RefreshSelector`：§6 Selective Rollout（candidate pool 两阶段 + value/coverage/diversity + fallback）。
 """
 from __future__ import annotations
 
@@ -351,3 +353,116 @@ class DynamicRatioController:
     def cold_start_adjust(self, alpha, n_refresh, n_batch) -> float:
         """§5.5：refresh 不足时 α_actual=min(α, N_R/N_batch)。"""
         return min(alpha, n_refresh / max(1, n_batch))
+
+
+class PromptStateStore:
+    """§6.1 per-prompt 轻量历史状态（复用 §3/§4 信号，不重复 forward）。
+
+    为每个 prompt 维护极简可微状态：times_seen / last_seen_step / reward_ema /
+    reward_var / disagreement_ema / last_response_length / reuse_count。
+    全部为固定形状张量（O(n_prompts)），无增长、无遗留，供 RefreshSelector
+    做 cheap scoring（V=0.4U+0.4D+0.2N），candidate 阶段不跑 teacher。
+    """
+
+    def __init__(self, n_prompts: int):
+        self.n = n_prompts
+        self.times_seen = torch.zeros(n_prompts, dtype=torch.long)
+        self.last_seen_step = torch.zeros(n_prompts, dtype=torch.long)
+        self.reward_ema = torch.zeros(n_prompts)
+        self.reward_var = torch.zeros(n_prompts)
+        self.disagreement_ema = torch.zeros(n_prompts)
+        self.last_response_length = torch.zeros(n_prompts, dtype=torch.long)
+        self.reuse_count = torch.zeros(n_prompts, dtype=torch.long)
+
+    def update(self, prompt_id, reward, disagreement, resp_len, step):
+        """一次 rollout 后更新该 prompt 的历史状态（EMA 平滑）。"""
+        prompt_id = int(prompt_id)
+        self.times_seen[prompt_id] += 1
+        self.last_seen_step[prompt_id] = step
+        # reward EMA（含方差一阶近似：|Δ| 作为不确定度增量）
+        self.reward_ema[prompt_id] = 0.9 * self.reward_ema[prompt_id] + 0.1 * reward
+        self.reward_var[prompt_id] = 0.9 * self.reward_var[prompt_id] + \
+            0.1 * abs(reward - self.reward_ema[prompt_id])
+        self.disagreement_ema[prompt_id] = 0.9 * self.disagreement_ema[prompt_id] + \
+            0.1 * disagreement
+        self.last_response_length[prompt_id] = resp_len
+
+    def record_reuse(self, prompt_id):
+        """记录样本被 recycle 复用（§6.8 diversity 反信号）。"""
+        self.reuse_count[int(prompt_id)] += 1
+
+    def novelty(self) -> torch.Tensor:
+        """novelty：从未见/少见的 prompt 更高（§6.3 价值权重 N）。"""
+        return 1.0 / torch.sqrt(1.0 + self.times_seen.float())
+
+
+class RefreshSelector:
+    """§6 Selective Rollout（candidate pool 两阶段降本）。
+
+    M_candidate=4·M_selected -> cheap scoring(V=0.4U+0.4D+0.2N)
+    -> 80% top-value + 20% coverage -> M selected。
+    candidate 阶段不跑 teacher（只对 O(n) 历史状态打分）。diversity protection
+    （max_same_prompt_fraction 限单 prompt 占比）+ failure fallback uniform。
+    """
+
+    def __init__(self, prompt_state: PromptStateStore, candidate_multiplier: int = 4,
+                 value_fraction: float = 0.80, coverage_fraction: float = 0.20,
+                 value_weights: dict | None = None, compute_aware: bool = False,
+                 max_same_prompt_fraction: float = 0.05,
+                 exploration_fraction: float = 0.20, seed: int = 42):
+        self.ps = prompt_state
+        self.cm = candidate_multiplier
+        self.vf = value_fraction
+        self.cf = coverage_fraction
+        self.vw = value_weights or {"uncertainty": 0.4, "disagreement": 0.4, "novelty": 0.2}
+        self.compute_aware = compute_aware
+        self.max_same = max_same_prompt_fraction
+        self.exploration = exploration_fraction
+        self.gen = torch.Generator().manual_seed(seed)
+
+    def _value(self) -> torch.Tensor:
+        """§6.3 cheap value：V = λU·U + λD·D + λN·N（可选 compute-aware 除 cost）。"""
+        U = self.ps.reward_var                        # uncertainty
+        D = self.ps.disagreement_ema
+        N = self.ps.novelty()
+        v = (self.vw["uncertainty"] * U + self.vw["disagreement"] * D
+             + self.vw["novelty"] * N)
+        if self.compute_aware:
+            cost = self.ps.last_response_length.float() + 1e-8
+            v = v / cost
+        return v
+
+    def select(self, n_selected: int, n_prompts: int) -> torch.Tensor:
+        """两阶段：candidate pool -> top-value + coverage -> M selected（§6.5）。
+
+        failure fallback：history 太短（times_seen 全 0）或 n_selected>=n_prompts
+        时退化为 uniform（§6.9 cold start）。
+        """
+        if self.ps.times_seen.sum() == 0 or n_selected >= n_prompts:
+            return torch.randint(0, n_prompts, (n_selected,), generator=self.gen)
+        n_cand = min(self.cm * n_selected, n_prompts)
+        cand = torch.randperm(n_prompts, generator=self.gen)[:n_cand]
+        v = self._value()[cand]
+        n_high = int(round(n_selected * self.vf))
+        n_cov = n_selected - n_high
+        # 80% top-value（§6.3）
+        top = cand[v.topk(min(n_high, n_cand)).indices]
+        # 20% coverage（从候选中随机补足，排除已选）
+        remaining = cand[~torch.isin(cand, top)]
+        cov = remaining[torch.randperm(len(remaining), generator=self.gen)[:n_cov]] \
+            if len(remaining) > 0 else top[:n_cov]
+        selected = torch.cat([top, cov])
+        # diversity：max_same_prompt_fraction 限制单 prompt 占比（§6.8）
+        max_per = max(1, int(n_selected * self.max_same))
+        from collections import Counter
+        cnt = Counter(selected.tolist())
+        filtered: list[int] = []
+        for p in selected.tolist():
+            if cnt[p] <= max_per:
+                filtered.append(p)
+            else:
+                cnt[p] -= 1
+        # 不足补 uniform（不重复起生成器，保证确定性）
+        while len(filtered) < n_selected:
+            filtered.append(torch.randint(0, n_prompts, (1,), generator=self.gen).item())
+        return torch.tensor(filtered[:n_selected])
