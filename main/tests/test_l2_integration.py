@@ -164,3 +164,36 @@ def test_no_unbounded_metadata_growth():
     for i in range(500):
         hm.record_reuse(sample_id=i % 50)
     assert len(hm._reuse_counts) <= 50   # reuse 计数按 sample_id 去重，有界
+
+
+# ============================================================================
+# 任务 6.2：E0-E6 实验矩阵配置生成
+# ============================================================================
+
+def test_e0_e6_matrix_configs_valid():
+    """E0-E6 每个实验都能生成合法配置，且各模块开关状态符合矩阵定义（§10）。"""
+    from fullstack_opd_v2.experiment import (
+        EXPERIMENT_MATRIX, build_config)
+    from fullstack_opd_v2.config import ConfigError
+    for name in EXPERIMENT_MATRIX:
+        cfg = build_config(name, n_steps=10)
+        assert cfg["l2"]["enabled"] is (name != "E0_baseline_off")
+        assert cfg["stage2"]["batch_size"] == 4   # toy/CPU 友好默认注入
+    # 未知实验名须报错
+    with pytest.raises(KeyError):
+        build_config("E99_unknown")
+
+
+def test_e0_e6_matrix_off_configs():
+    """E2-E6 的单项 ablation 开关反映到 l2 子配置（每模块可独立关闭）。"""
+    from fullstack_opd_v2.experiment import build_config
+    c2 = build_config("E2_no_selective_rollout")
+    assert c2["l2"]["selective_rollout"]["enabled"] is False
+    c3 = build_config("E3_no_health_monitor")
+    assert c3["l2"]["health_monitor"]["enabled"] is False
+    c4 = build_config("E4_fixed_refresh_ratio")
+    assert c4["l2"]["refresh_ratio"]["mode"] == "fixed"
+    c5 = build_config("E5_no_disagreement")
+    assert c5["l2"]["disagreement"]["enabled"] is False
+    c6 = build_config("E6_no_value_protect")
+    assert c6["l2"]["cache"]["value_protect_quantile"] == 1.0
