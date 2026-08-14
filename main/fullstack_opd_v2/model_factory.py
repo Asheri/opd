@@ -67,9 +67,30 @@ class HFCausalLM:
         self.n_layers = getattr(self.model.config, "num_hidden_layers", None)
 
     # ---- 内核用接口：forward / response_dists / generate（委托模块级实现）----
-    def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """(B,L) -> logits (B,L,V)，与 CausalToyLM.forward 对齐（供 response_dists 用）。"""
-        return self.model(input_ids).logits
+    def __call__(self, input_ids: torch.Tensor,
+                 attention_mask=None) -> torch.Tensor:
+        """(B,L) -> logits (B,L,V)，与 CausalToyLM.forward 对齐（供 response_dists 用）。
+
+        §2.3：真实变长序列须传 attention_mask（L2 rollout 相位变长支持）；toy 等长路径可省略。
+        """
+        kw = {"input_ids": input_ids}
+        if attention_mask is not None:
+            kw["attention_mask"] = attention_mask
+        return self.model(**kw).logits
+
+    @torch.no_grad()
+    def generate_batch(self, prompts: torch.Tensor, max_new: int = 8192,
+                       temperature: float = 1.0) -> torch.Tensor:
+        """自回归生成（§2.3 骨架：委托 HF generate，真实规模应走 vLLM）。
+
+        (B,P) -> (B,T) 仅返回【新生成】部分（去掉 prompt），与 CausalToyLM.generate_batch 对齐。
+        """
+        out = self.model.generate(
+            prompts, max_new_tokens=max_new,
+            do_sample=temperature > 0,
+            temperature=max(temperature, 1e-6),
+            top_p=0.95)
+        return out[:, prompts.size(1):]
 
     def response_dists(self, prompts: torch.Tensor, responses: torch.Tensor):
         from .model import response_dists

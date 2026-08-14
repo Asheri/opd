@@ -132,3 +132,58 @@ def test_hf_dtype_bfloat16_not_silently_fp32(monkeypatch):
     HFCausalLM("fake", "cpu", dtype="bfloat16")
     factory.from_pretrained.assert_called_once_with(
         "fake", torch_dtype=torch.bfloat16)
+
+
+# --------------------------- L2 §2.3：HFCausalLM generate_batch + attention_mask（rollout 骨架）---------------------------
+def test_hf_call_passes_attention_mask(monkeypatch):
+    """HFCausalLM.__call__(input_ids, attention_mask=None) 传 attention_mask（§2.3 变长序列骨架）。"""
+    import fullstack_opd_v2.model_factory as MF
+    seen = {}
+    mod = mock.Mock()
+    mod.config.vocab_size = 152
+    mod.config.hidden_size = 8
+    mod.config.max_position_embeddings = 64
+    mod.config.num_hidden_layers = 2
+    mod.training = False
+    mod.to = mock.Mock(return_value=mod)
+    mod.eval = mock.Mock(return_value=mod)
+    mod.parameters.return_value = []
+
+    def _call(input_ids, attention_mask=None):
+        seen["mask"] = attention_mask
+        out = mock.Mock()
+        out.logits = torch.zeros(input_ids.size(0), input_ids.size(1), 152)
+        return out
+    mod.side_effect = _call
+    factory = mock.Mock()
+    factory.from_pretrained.return_value = mod
+    monkeypatch.setattr(MF, "_HF_AutoModelForCausalLM", factory)
+
+    m = HFCausalLM("fake", "cpu")
+    ids = torch.zeros(2, 5, dtype=torch.long)
+    mask = torch.ones(2, 5, dtype=torch.long)
+    m(ids)                       # 未传 mask：attention_mask 应为 None（兼容 toy 等长路径）
+    assert seen["mask"] is None
+    m(ids, attention_mask=mask)  # 传 mask：透传到 HF 模型
+    assert seen["mask"] is mask
+
+
+def test_hf_generate_batch_delegates(monkeypatch):
+    """HFCausalLM.generate_batch 委托 model.generate 并只返回新生成部分（§2.3 rollout 骨架）。"""
+    import fullstack_opd_v2.model_factory as MF
+    mod = _fake_hf_module(vocab=152)
+    out = torch.zeros(2, 8, dtype=torch.long)          # P(5)+T(3)
+    mod.generate = mock.Mock(return_value=out)
+    factory = mock.Mock()
+    factory.from_pretrained.return_value = mod
+    monkeypatch.setattr(MF, "_HF_AutoModelForCausalLM", factory)
+
+    m = HFCausalLM("fake", "cpu")
+    prompts = torch.zeros(2, 5, dtype=torch.long)
+    generated = m.generate_batch(prompts, max_new=3, temperature=1.0)
+    # 委托 model.generate，返回 (B, max_new)=去掉 prompt 部分
+    assert generated.shape == (2, 3)
+    args, kw = mod.generate.call_args
+    assert args[0] is prompts
+    assert kw["max_new_tokens"] == 3
+    assert kw["do_sample"] is True
