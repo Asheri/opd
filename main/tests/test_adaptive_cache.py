@@ -45,3 +45,24 @@ def test_gather_chosen_logp():
     expected = log_dists.gather(2, responses.unsqueeze(-1)).squeeze(-1)
     assert logp.shape == (2, 3)
     assert torch.allclose(logp, expected, atol=1e-6)
+
+
+def test_health_score_thresholds():
+    """rule-based HEALTHY/WARNING/CRITICAL 分类（§4.3）。"""
+    from fullstack_opd_v2.adaptive_cache import CacheHealthMonitor
+    hm = CacheHealthMonitor(health={"hit_rate": {"warning": 0.995, "critical": 0.98},
+                                    "refresh_age_p95": {"warning": 5, "critical": 10}})
+    assert hm.classify(hit_rate=0.999) == "HEALTHY"
+    assert hm.classify(hit_rate=0.99) == "WARNING"
+    assert hm.classify(hit_rate=0.97) == "CRITICAL"
+
+
+def test_health_alert_cooldown():
+    """同一 warning cooldown 内不重复（§4.4）。"""
+    from fullstack_opd_v2.adaptive_cache import CacheHealthMonitor
+    hm = CacheHealthMonitor(health={"hit_rate": {"warning": 0.995, "critical": 0.98}},
+                            alert_cooldown=5)
+    hm.record(step=1, hit_rate=0.99)   # WARNING
+    assert hm.last_status == "WARNING"
+    hm.record(step=2, hit_rate=0.99)   # 同 warning，cooldown 内不重复
+    assert hm._alert_count == 1

@@ -8,10 +8,11 @@
 设计原则：可解释、可监控、compute overhead 可控、可 ablation、不破坏训练。
 所有类经 l2.enabled 总开关控制，关闭时 pipeline 退回 L0/L1 静态路径。
 
-本文件当前实现（任务 2.1-2.3）：
+本文件当前实现（任务 2.1-2.3 + 3.1）：
 - `RefreshRingBuffer`：L2 refresh pool 动态 ring buffer（§2 双池结构；run_refresh_phase 依赖 append）。
 - `DisagreementComputer`：§3 Teacher-Student Disagreement（rollout 阶段计算，_train_step 保持 teacher-free）。
 - `run_refresh_phase` / `_build_mask`：§3.3 + §6.5 rollout 相位编排（student 生成 -> 4 logp -> D_i^abs -> append）。
+- `CacheHealthMonitor`：§4 七维监控 + rule-based health score + alert cooldown（Observe-only，不自动改训练）。
 """
 from __future__ import annotations
 
@@ -199,3 +200,90 @@ def _build_mask(responses, pad_id=0):
     cum = is_pad.cumsum(dim=1)
     mask = (cum <= 1) | (~is_pad)   # 首个 pad 位置仍算有效（EOS 场景需按实际 EOS id）
     return mask.long()
+
+
+class CacheHealthMonitor:
+    """§4 Cache Health Monitor（只 Observe->Diagnose，不自动改训练）。
+
+    七维监控（Base/Refresh 分开）+ rule-based health score + alert cooldown。
+    性能约束：batch-level aggregation，不逐 token loop，不全量扫 base pool，
+    用 counters/EMA/reservoir。经 MetricsRecorder.record() 加字段落盘。
+    """
+
+    def __init__(self, health: dict, alert_cooldown: int = 50):
+        self.thresholds = health
+        self.alert_cooldown = alert_cooldown
+        self.last_status = "HEALTHY"
+        self._last_alert_step = -1
+        self._alert_count = 0
+        # counters（EMA/reservoir，不全量扫描）
+        self._lookup = {"total": 0, "hit": 0, "miss": 0, "invalid": 0, "duplicate": 0}
+        self._reuse_counts: dict[int, int] = {}   # sample_id -> 次数
+
+    def record_lookup(self, hit: bool, invalid: bool = False, duplicate: bool = False):
+        self._lookup["total"] += 1
+        if hit:
+            self._lookup["hit"] += 1
+        else:
+            self._lookup["miss"] += 1
+        if invalid:
+            self._lookup["invalid"] += 1
+        if duplicate:
+            self._lookup["duplicate"] += 1
+
+    def record_reuse(self, sample_id: int):
+        self._reuse_counts[sample_id] = self._reuse_counts.get(sample_id, 0) + 1
+
+    def classify(self, hit_rate: float = 1.0, refresh_age_p95: float = 0,
+                 reuse_p95: float = 0, max_length_ratio: float = 0) -> str:
+        """rule-based 三级（§4.3）。任一 critical -> CRITICAL；任一 warning -> WARNING。"""
+        worst = "HEALTHY"
+        for metric, val in [("hit_rate", hit_rate), ("refresh_age_p95", refresh_age_p95),
+                            ("reuse_p95", reuse_p95), ("max_length_ratio", max_length_ratio)]:
+            th = self.thresholds.get(metric, {})
+            # 未配置阈值的指标不参与判定（视为 HEALTHY）
+            if not th:
+                continue
+            # hit_rate 越低越坏；其余越高越坏
+            bad = (val < th["critical"]) if metric == "hit_rate" else (val > th["critical"])
+            warn = (val < th["warning"]) if metric == "hit_rate" else (val > th["warning"])
+            if bad:
+                return "CRITICAL"
+            if warn:
+                worst = "WARNING"
+        return worst
+
+    def record(self, step: int, **metrics) -> dict:
+        """聚合 + 状态分类 + alert cooldown。返回待 record 的指标 dict。"""
+        status = self.classify(
+            hit_rate=metrics.get("hit_rate", 1.0),
+            refresh_age_p95=metrics.get("refresh_age_p95", 0),
+            reuse_p95=metrics.get("reuse_p95", 0),
+            max_length_ratio=metrics.get("max_length_ratio", 0))
+        reason = self._reason(status, metrics)
+        # alert cooldown：同 status 在 cooldown 内不重复记
+        if status != "HEALTHY" and (step - self._last_alert_step) < self.alert_cooldown \
+                and status == self.last_status:
+            pass
+        else:
+            self._alert_count += 1
+            self._last_alert_step = step
+        self.last_status = status
+        return {**metrics, "cache_health/status": status,
+                "cache_health/reason": reason,
+                **{f"lookup/{k}": v for k, v in self._lookup.items()},
+                "lookup/hit_rate": self._lookup["hit"] / max(1, self._lookup["total"])}
+
+    def _reason(self, status, metrics) -> str:
+        if status == "HEALTHY":
+            return ""
+        # 找首个触发的指标
+        for m in ["hit_rate", "refresh_age_p95", "reuse_p95", "max_length_ratio"]:
+            th = self.thresholds.get(m, {})
+            if not th:
+                continue
+            val = metrics.get(m, 0)
+            bad = (val < th["critical"]) if m == "hit_rate" else (val > th["critical"])
+            if bad:
+                return f"{m} critical ({val})"
+        return "unknown"
