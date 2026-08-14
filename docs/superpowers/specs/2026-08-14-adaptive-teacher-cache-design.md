@@ -75,8 +75,8 @@ Selective Rollout ──► Teacher-Student Disagreement ──► Cache Quality
 - **Base Pool**：初始 50K 离线预计算，静态不变（保 L1 锚点 + KL 同源不变式）。
 - **Refresh Pool**：动态 ring buffer，`cache.append_refresh(...)` 进新样本，满后淘汰。
 
-### Q1 何时刷新（Dynamic Refresh Ratio 驱动，详见 §5）
-- 自适应触发：`E[Δ_T]` 滑动斜率 < ε（收敛放缓）且过 `min_interval`；或过 `max_interval` 兜底。
+### Q1 何时刷新（Cache Health 信号驱动，与 §5 的 α 控制分离）
+- 自适应触发：`E[Δ_T]` 滑动斜率 < ε（收敛放缓）或 `refresh_age_p95` 超 §4 阈值，且过 `min_interval`；或过 `max_interval` 兜底。
 
 ### Q2 刷新哪些（Selective Rollout，详见 §6）
 - 难度加权温度采样 `p(i) ∝ exp(d(i)/τ)`，`d(i)` 来自 disagreement EMA。
@@ -248,11 +248,46 @@ health:
 
 ---
 
-## 5. Dynamic Refresh Ratio
+## 5. Dynamic Refresh Ratio（权威定义）
 
-- `mix_ratio` 按 `disagreement_refresh / disagreement_base` 自适应：refresh 池更 informative 则升 ratio。
-- 刷新触发：`E[Δ_T]` 滑动斜率 < ε 且过 `min_interval`；或过 `max_interval` 兜底。
-- bounded `[mix_min, mix_max]` + EMA 平滑防震荡。
+> 本节管 α（训练 batch 中 refresh 占比，**连续调整**）；**刷新触发时机**（何时进 rollout 相位生成新样本，**离散事件**）见 §2 Q1。两者是不同控制。
+
+feeder：`P_train = (1−α)P_base + α·P_refresh`，α 从固定 0.3 升级为动态。
+
+### 5.1 设计目标（三信号）
+- Base 太 stale（`Age_base↑`）-> α↑
+- Student 变化太快（`Drift_t↑`）-> α↓（防 on-policy 样本过快主导）
+- Refresh 质量高（`Quality_refresh↑`）-> α↑
+
+### 5.2 输入信号
+- `A_B = E[Age_base]`、`A_R = E[Age_refresh]`（来自 §4 Health Monitor）
+- policy drift：`D_t^policy ≈ E[logπ_θt(y) − logπ_θ(t-1)(y)]`，**优先复用已有 k3 KL / log ratio 信号，不重复 forward**
+- refresh quality：`Q_t = E[U_i | i∈Refresh]`，`U_i` 来自 §3.5 disagreement+reward utility
+
+### 5.3 Dynamic controller
+```
+α_t = clip(α_0 + λ_A·Ã_B − λ_D·D̃_t^policy + λ_Q·Q̃_t, α_min, α_max)
+```
+所有信号 normalize；EMA（`EMA_t = β·EMA_{t-1} + (1−β)·x_t`）防高频震荡。
+
+### 5.4 Safety
+- `α_min ≤ α_t ≤ α_max`，且 **`α_max < 1`**（保留 Base 作 stationary anchor，禁止 refresh 100% 占据）。
+- `max_step_change`：`|α_t − α_{t-1}|` 限幅，防 feeder ratio 突变。
+- `warmup_steps`：前 N 步用 α_0 不动态调整。
+
+### 5.5 Cold Start
+Refresh Pool 不足（`N_R < N_required`）时：`α_actual = min(α_t, N_R/N_batch)`，自动 fallback Base。
+
+### 5.6 与 Health Monitor 关系（职责分离）
+第一阶段：Health Monitor **observe only**；Dynamic Ratio Controller **consume selected metrics**。不让 Monitor 自己改 ratio。未来再考虑 Health->Controller->Ratio 闭环。
+
+### 5.7 Logging
+`refresh_ratio/{requested,actual,base,reason}` + `controller/{base_age,refresh_quality,policy_drift,raw_alpha,clipped_alpha}`。**特别记录 ratio 调整原因**（如 `alpha decreased: policy_drift > threshold`）。
+
+### 5.8 Ablation hooks（三模式共享同一 feeder）
+- `fixed`：α=0.3
+- `linear`：0.1→0.5 线性
+- `adaptive`：完整 controller
 
 ---
 
@@ -272,10 +307,18 @@ l2:
   t_train: 100
   m_refresh: 1000
   ring_buffer_capacity: 5000
-  mix_ratio: 0.3              # dynamic_ratio 关时静态值
-  dynamic_ratio: true
-  mix_ratio_min: 0.2
-  mix_ratio_max: 0.6
+  refresh:
+    ratio:
+      mode: adaptive          # fixed | linear | adaptive（§5.8 ablation）
+      initial: 0.30
+      min: 0.10
+      max: 0.60               # <1，保留 base anchor（§5.4）
+      age_weight: 0.25
+      drift_weight: 0.50
+      quality_weight: 0.25
+      ema_beta: 0.9
+      warmup_steps: 500
+      max_step_change: 0.05
   selective_rollout: true
   selection_temperature: 1.0
   health_monitor: true
@@ -340,12 +383,20 @@ l2:
 - distributed aggregation（跨 rank 一致）
 - `health_monitor: false` 时性能不退化
 
+### Dynamic Refresh Ratio 测试（§5 权威要求）
+- fixed / linear / adaptive 三模式
+- bounds（`α_min ≤ α ≤ α_max`，`α_max<1`）
+- EMA 平滑 / max_step_change 限幅
+- empty refresh pool cold start（fallback base）
+- distributed consistency
+- extreme age / drift / quality（信号极值不崩溃）
+
 ---
 
 ## 10. Ablation
 
-每能力独立开关 -> 4 组：
-- 关 selective / 关 dynamic / 仅 health-monitor 记录 / 全开
+- **Dynamic Ratio**（§5.8）：`mode=fixed/linear/adaptive` 三组共享同一 feeder，对比 adaptive 是否优于 fixed。
+- **四能力组合**：关 selective / 关 dynamic / 仅 health-monitor 记录 / 全开。
 对比 `E[Δ_T]` 收敛曲线 + AIME 分数，验证各模块贡献。
 
 ---
