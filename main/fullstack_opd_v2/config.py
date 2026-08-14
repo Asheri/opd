@@ -96,6 +96,87 @@ class Stage2Cfg(_Strict):
     optimizer: Literal["adam", "adamw_8bit"] = "adam"
 
 
+# --------------------------- L2 Adaptive Teacher Cache（§2-§7）-----------------
+# 默认全关（enabled=False 退回 L0/L1 静态路径）；每模块双 enabled 开关支持单项 ablation
+# （E0-E6 实验矩阵，见 scripts/run_l2_ablation.py）。extra="forbid" 下必须在 schema 有
+# 合法位置，否则 load_config(overrides=["l2.*=..."]) 会被当未知键拒掉。
+class L2CacheCfg(_Strict):
+    """L2 ring buffer 基础（§2 双池结构）。"""
+    base_size: int = 50000
+    refresh_size: int = 5000          # ring buffer capacity
+    max_response_length: int = 8192
+    value_protect_quantile: float = 0.9   # §2 Q3 价值保护
+    refresh_min_interval: int = 50    # §2 Q1 触发约束
+    refresh_max_interval: int = 150
+    delta_slope_eps: float = 0.001
+
+
+class L2DisagreementCfg(_Strict):
+    """§3 Teacher-Student Disagreement 开关。"""
+    enabled: bool = True
+
+
+class L2HealthMonitorCfg(_Strict):
+    """§4 Cache Health Monitor（Observe-only）。"""
+    enabled: bool = True
+    # §4.3 rule-based 阈值（嵌套 dict，extra=forbid 下用 dict 接收）
+    health: dict = Field(default_factory=lambda: {
+        "hit_rate": {"warning": 0.995, "critical": 0.98},
+        "refresh_age_p95": {"warning": 5, "critical": 10},
+        "reuse_p95": {"warning": 8, "critical": 20},
+        "max_length_ratio": {"warning": 0.10, "critical": 0.25},
+    })
+    alert_cooldown: int = 50          # §4.4 同一 warning 冷却步数
+
+
+class L2RefreshRatioCfg(_Strict):
+    """§5 dynamic refresh ratio（三信号 controller）。"""
+    enabled: bool = True
+    mode: Literal["fixed", "linear", "adaptive"] = "adaptive"
+    initial: float = 0.30
+    min: float = 0.10
+    max: float = 0.60                 # <1，保留 base anchor（§5.4）
+    age_weight: float = 0.25
+    drift_weight: float = 0.50
+    quality_weight: float = 0.25
+    ema_beta: float = 0.9
+    warmup_steps: int = 500
+    max_step_change: float = 0.05
+
+
+class L2SelectiveRolloutCfg(_Strict):
+    """§6 selective rollout（candidate pool 两阶段）。"""
+    enabled: bool = True
+    candidate_multiplier: int = 4    # M_candidate = 4·M_selected（§6.5）
+    value_fraction: float = 0.80     # §6.3 高价值占比
+    coverage_fraction: float = 0.20
+    value_weights: dict = Field(default_factory=lambda: {
+        "uncertainty": 0.4, "disagreement": 0.4, "novelty": 0.2})
+    compute_aware: bool = False      # §6.4 ELG
+    max_same_prompt_fraction: float = 0.05   # §6.8
+    exploration_fraction: float = 0.20
+
+
+class L2UtilityCfg(_Strict):
+    """§3.5 sample utility 系数。"""
+    disagreement_weight: float = 0.5
+    reward_weight: float = 0.3
+    age_penalty: float = 0.2
+
+
+class L2Cfg(_Strict):
+    """L2 Adaptive Teacher Cache 总配置（默认全关，§7）。"""
+    enabled: bool = False            # 总开关：false 退回 L0/L1
+    t_train: int = 100               # 每轮训练步数
+    m_refresh: int = 1000            # 每轮刷新量（= M_selected）
+    cache: L2CacheCfg = Field(default_factory=L2CacheCfg)
+    disagreement: L2DisagreementCfg = Field(default_factory=L2DisagreementCfg)
+    health_monitor: L2HealthMonitorCfg = Field(default_factory=L2HealthMonitorCfg)
+    refresh_ratio: L2RefreshRatioCfg = Field(default_factory=L2RefreshRatioCfg)
+    selective_rollout: L2SelectiveRolloutCfg = Field(default_factory=L2SelectiveRolloutCfg)
+    utility: L2UtilityCfg = Field(default_factory=L2UtilityCfg)
+
+
 # --------------------------- 工程化新增段 ---------------------------
 class RunCfg(_Strict):
     """run 目录与断点续跑配置。"""
@@ -183,6 +264,7 @@ class OPDConfig(_Strict):
     metrics: MetricsCfg = Field(default_factory=MetricsCfg)
     dataset: DatasetCfg = Field(default_factory=DatasetCfg)
     eval: EvalCfg = Field(default_factory=EvalCfg)
+    l2: L2Cfg = Field(default_factory=L2Cfg)
 
 
 # --------------------------- 顶层部署键下渗 ---------------------------
@@ -275,5 +357,7 @@ def load_config(path: str | None = None,
 
 
 __all__ = ["OPDConfig", "Stage0Cfg", "Stage1Cfg", "Stage2Cfg",
+           "L2Cfg", "L2CacheCfg", "L2DisagreementCfg", "L2HealthMonitorCfg",
+           "L2RefreshRatioCfg", "L2SelectiveRolloutCfg", "L2UtilityCfg",
            "RunCfg", "LoggingCfg", "MetricsCfg", "DatasetCfg", "EvalCfg",
            "load_config", "ValidationError"]

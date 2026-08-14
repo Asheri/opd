@@ -101,3 +101,29 @@ def test_load_corrupt_raises(tmp_path):
     bad.write_bytes(b"not a torch checkpoint")
     with pytest.raises(CheckpointError):
         CheckpointManager(str(tmp_path)).load(str(bad))
+
+def test_checkpoint_saves_optimizer_and_rng(tmp_path):
+    """§B 精确续跑：断点含 optimizer state + RNG（L2 任务 6.1 前置）。"""
+    m = CausalToyLM(vocab=64, d_model=48, n_layers=2)
+    cm = CheckpointManager(str(tmp_path), every=1)
+    opt = torch.optim.Adam(m.parameters())
+    opt.step()                                   # 产生 optimizer state
+    cm.save(1, m, version=1, cfg={}, optimizer=opt,
+            rng={"py": torch.get_rng_state(), "cuda": None})
+    ck = cm.resume()
+    assert "optimizer" in ck
+    assert "rng" in ck
+    # 恢复后 optimizer state 可 load 回（形状/键一致）
+    opt2 = torch.optim.Adam(m.parameters())
+    opt2.load_state_dict(ck["optimizer"])
+    assert ck["rng"]["py"].shape == torch.get_rng_state().shape
+
+
+def test_checkpoint_without_extras_backward_compatible(tmp_path):
+    """旧签名（无 optimizer/rng）仍可保存，断点无新键（向后兼容）。"""
+    m = CausalToyLM(vocab=64, d_model=48, n_layers=2)
+    cm = CheckpointManager(str(tmp_path), every=1)
+    cm.save(2, m, version=2, cfg={})
+    ck = cm.resume()
+    assert "optimizer" not in ck
+    assert "rng" not in ck

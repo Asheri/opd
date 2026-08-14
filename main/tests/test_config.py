@@ -191,3 +191,38 @@ def test_checkpoint_every_zero_rejected(tmp_path):
     bad.write_text("run:\n  checkpoint_every: 0\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(path=str(bad))
+
+
+# ---- L2 Adaptive Teacher Cache 配置（任务 1.1 / 6.1 前置）----
+
+def test_l2_cfg_defaults_off():
+    """L2Cfg 默认全关，l2.enabled=false 退回 L0/L1。"""
+    from fullstack_opd_v2.config import load_config
+    cfg = load_config()  # 无 path 用默认
+    assert cfg["l2"]["enabled"] is False
+    assert cfg["l2"]["cache"]["base_size"] == 50000
+    assert cfg["l2"]["refresh_ratio"]["mode"] == "adaptive"
+    assert cfg["l2"]["selective_rollout"]["enabled"] is True
+    assert cfg["l2"]["disagreement"]["enabled"] is True
+    assert cfg["l2"]["health_monitor"]["enabled"] is True
+
+
+def test_l2_cfg_unknown_key_rejected():
+    """extra=forbid：未知 l2 键报错。"""
+    import pytest
+    from fullstack_opd_v2.config import load_config, ConfigError
+    with pytest.raises(ConfigError):
+        load_config(overrides=["l2.bogus=1"])
+
+
+def test_l2_cfg_enable_via_override():
+    """点分覆盖可开 L2 + 传子键（E0-E6 矩阵按此生成）。"""
+    from fullstack_opd_v2.config import load_config
+    cfg = load_config(overrides=[
+        "l2.enabled=true", "l2.t_train=5", "l2.m_refresh=4",
+        "l2.cache.refresh_size=8", "l2.cache.max_response_length=8"])
+    assert cfg["l2"]["enabled"] is True
+    assert cfg["l2"]["t_train"] == 5
+    assert cfg["l2"]["m_refresh"] == 4
+    assert cfg["l2"]["cache"]["refresh_size"] == 8
+    assert cfg["l2"]["cache"]["max_response_length"] == 8

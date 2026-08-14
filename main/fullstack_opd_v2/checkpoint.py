@@ -15,6 +15,27 @@ import torch
 from .exceptions import CheckpointError
 
 
+def _opt_state_to_cpu(optimizer) -> dict:
+    """把 optimizer state 中的张量搬 CPU（§B 精确续跑，供 checkpoint 落盘）。
+
+    单卡直接读 state_dict；FSDP/分布式下应改用 `optimizer.get_state_dict()`（对称恢复
+    用 `optimizer.load_state_dict` / `set_state_dict`）。返回的结构与 torch.optim
+    state_dict 一致，仅所有 value 张量 .cpu()。
+    """
+    state = {}
+    opt_sd = getattr(optimizer, "get_state_dict", None)
+    if callable(opt_sd):
+        sd = opt_sd()
+    else:
+        sd = optimizer.state_dict()
+    state["state"] = {
+        k: {kk: (vv.detach().cpu() if torch.is_tensor(vv) else vv)
+            for kk, vv in v.items()}
+        for k, v in sd["state"].items()}
+    state["param_groups"] = sd.get("param_groups", [])
+    return state
+
+
 class CheckpointManager:
     """管理 run_dir/checkpoints/ 下的断点，支持节流保存与最新定位。"""
 
@@ -27,18 +48,23 @@ class CheckpointManager:
     # --------------------------- 保存 ---------------------------
     def save(self, step: int, student, version: int, cfg: dict,
              metrics: list | None = None, force: bool = False,
-             ref: dict | None = None) -> str | None:
+             ref: dict | None = None,
+             optimizer=None, rng: dict | None = None,
+             refresh_buffer=None) -> str | None:
         """若 step 是 every 的倍数则存断点，否则跳过（节流）。force=True 无条件存。
 
         ref: Stage 2 的 KL 锚点打包字典 `{"ref_dists"/"ref_ids"/"ref_logp"}`（初始 student
              在 fat D 上的分布）。随断点落盘，resume 时直接恢复，避免用已训练 student
              重算锚点破坏「KL 锚点 = 初始 student 分布」不变式（A3/D4）。
+
+        §B 精确续跑（L2，任务 6.1）：optimizer（optimizer state → CPU）、rng（RNG 状态）、
+        refresh_buffer（L2 ring buffer）。三者皆为可选；None 时断点不含相应键（旧断点兼容）。
         """
         if step % self.every != 0 and not force:
             return None
         path = os.path.join(self.checkpoint_dir, f"step_{step}.pt")
         tmp = path + ".tmp"
-        torch.save({
+        payload = {
             "step": step,
             "version": version,
             "state": {k: v.detach().cpu() for k, v in student.state_dict().items()},
@@ -46,7 +72,14 @@ class CheckpointManager:
             "metrics": (metrics or [])[-1:],
             "ref": {k: (v.detach().cpu() if torch.is_tensor(v) else v)
                     for k, v in (ref or {}).items()},
-        }, tmp)
+        }
+        if optimizer is not None:
+            payload["optimizer"] = _opt_state_to_cpu(optimizer)
+        if rng is not None:
+            payload["rng"] = rng
+        if refresh_buffer is not None:
+            payload["refresh_buffer"] = refresh_buffer
+        torch.save(payload, tmp)
         os.replace(tmp, path)                     # 原子替换，避免半写
         return path
 
