@@ -242,7 +242,7 @@ def main() -> None:
             for c in cols[1:]:
                 row[c] = st.get(c, "")
             w.writerow(row)
-    print(f"✅ 结果已存 {args.out}（汇总 CSV: {csv_path}）", flush=True)
+    print(f"[OK] 结果已存 {args.out}（汇总 CSV: {csv_path}）", flush=True)
 
 
 if __name__ == "__main__":

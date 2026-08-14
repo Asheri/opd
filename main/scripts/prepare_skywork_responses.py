@@ -236,10 +236,10 @@ def main() -> None:
     # 校验（reload 主 jsonl 看全局空行）
     final_rows = load_rows(args.jsonl)
     empty = sum(1 for r in final_rows if not r.get("response"))
-    print(f"✅ 完成：{len(final_rows)} 行，response 非空 {len(final_rows)-empty}，"
+    print(f"[OK] 完成：{len(final_rows)} 行，response 非空 {len(final_rows)-empty}，"
           f"仍空 {empty}", flush=True)
     if empty:
-        print(f"⚠️ {empty} 行 response 仍空，可重跑本脚本 resume 补齐", flush=True)
+        print(f"[WARN] {empty} 行 response 仍空，可重跑本脚本 resume 补齐", flush=True)
 
 
 if __name__ == "__main__":
