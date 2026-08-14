@@ -8,11 +8,12 @@
 设计原则：可解释、可监控、compute overhead 可控、可 ablation、不破坏训练。
 所有类经 l2.enabled 总开关控制，关闭时 pipeline 退回 L0/L1 静态路径。
 
-本文件当前实现（任务 2.1-2.3 + 3.1）：
+本文件当前实现（任务 2.1-2.3 + 3.1 + 4.1）：
 - `RefreshRingBuffer`：L2 refresh pool 动态 ring buffer（§2 双池结构；run_refresh_phase 依赖 append）。
 - `DisagreementComputer`：§3 Teacher-Student Disagreement（rollout 阶段计算，_train_step 保持 teacher-free）。
 - `run_refresh_phase` / `_build_mask`：§3.3 + §6.5 rollout 相位编排（student 生成 -> 4 logp -> D_i^abs -> append）。
 - `CacheHealthMonitor`：§4 七维监控 + rule-based health score + alert cooldown（Observe-only，不自动改训练）。
+- `DynamicRatioController`：§5 三信号 controller α（EMA + max_step_change + cold start + fixed/linear/adaptive）。
 """
 from __future__ import annotations
 
@@ -287,3 +288,66 @@ class CacheHealthMonitor:
             if bad:
                 return f"{m} critical ({val})"
         return "unknown"
+
+
+class DynamicRatioController:
+    """§5 Dynamic Refresh Ratio（三信号 controller）。
+
+    α_t = clip(α_0 + λA·Ã_B − λD·D̃_drift + λQ·Q̃_t, α_min, α_max)
+    所有信号 normalize（EMA + x/(1+|x|) 映射），EMA 平滑防震荡；max_step_change 限幅。
+    模式：fixed(α=initial) / linear(0.1->0.5) / adaptive(完整 controller)。
+    cold start：N_R 不足时 α_actual=min(α, N_R/N_batch) fallback base（§5.5）。
+    α_max<1：保留 base 作 stationary anchor。
+
+    纯无状态函数（update 内部推进 step/EMA），不读 CacheHealthMonitor 状态，
+    由 pipeline 在交替相位显式把监控指标喂进来（consume metrics，非 Monitor 闭环）。
+    """
+
+    def __init__(self, initial=0.30, min=0.10, max=0.60, mode="adaptive",
+                 age_weight=0.25, drift_weight=0.50, quality_weight=0.25,
+                 ema_beta=0.9, warmup_steps=500, max_step_change=0.05):
+        self.alpha0 = initial
+        self.min, self.max = min, max
+        self.mode = mode
+        self.w = dict(age=age_weight, drift=drift_weight, quality=quality_weight)
+        self.beta = ema_beta
+        self.warmup = warmup_steps
+        self.max_step = max_step_change
+        self._ema = dict(age=0.0, drift=0.0, quality=0.0)
+        self._step = 0
+        self._last_alpha = initial
+        # linear 模式起止（§5.6）
+        self._lin_start, self._lin_end = 0.1, 0.5
+
+    def _norm(self, key, x):
+        """EMA + 简单 normalize（x/(1+|x|) 映射到 [-1,1] 附近，防极值爆炸）。"""
+        self._ema[key] = self.beta * self._ema[key] + (1 - self.beta) * x
+        return self._ema[key] / (1 + abs(self._ema[key]))
+
+    def update(self, base_age, policy_drift, refresh_quality) -> float:
+        """推进一步，返回本轮 α（三信号 or 按模式降级）。"""
+        self._step += 1
+        if self.mode == "fixed":
+            return self.alpha0
+        if self.mode == "linear":
+            frac = min(1.0, self._step / 1000)
+            return self._lin_start + frac * (self._lin_end - self._lin_start)
+        # adaptive：warmup 内用 initial（§5.5 cold start）
+        if self._step <= self.warmup:
+            self._last_alpha = self.alpha0
+            return self.alpha0
+        a_b = self._norm("age", base_age)
+        d_drift = self._norm("drift", policy_drift)
+        q = self._norm("quality", refresh_quality)
+        raw = self.alpha0 + self.w["age"] * a_b - self.w["drift"] * d_drift \
+            + self.w["quality"] * q
+        raw = max(self.min, min(self.max, raw))
+        # max_step_change 限幅（§5.4）
+        raw = self._last_alpha + max(-self.max_step, min(self.max_step, raw - self._last_alpha))
+        raw = max(self.min, min(self.max, raw))
+        self._last_alpha = raw
+        return raw
+
+    def cold_start_adjust(self, alpha, n_refresh, n_batch) -> float:
+        """§5.5：refresh 不足时 α_actual=min(α, N_R/N_batch)。"""
+        return min(alpha, n_refresh / max(1, n_batch))

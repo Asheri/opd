@@ -66,3 +66,36 @@ def test_health_alert_cooldown():
     assert hm.last_status == "WARNING"
     hm.record(step=2, hit_rate=0.99)   # 同 warning，cooldown 内不重复
     assert hm._alert_count == 1
+
+
+def test_ratio_bounds():
+    """α ∈ [min, max]，α_max<1（§5.4）。"""
+    from fullstack_opd_v2.adaptive_cache import DynamicRatioController
+    c = DynamicRatioController(initial=0.3, min=0.1, max=0.6, mode="adaptive")
+    for _ in range(100):
+        a = c.update(base_age=100, policy_drift=0, refresh_quality=100)
+        assert 0.1 <= a <= 0.6
+
+
+def test_ratio_fixed_mode():
+    """fixed 模式 α 恒定（§5.8）。"""
+    from fullstack_opd_v2.adaptive_cache import DynamicRatioController
+    c = DynamicRatioController(initial=0.3, min=0.1, max=0.6, mode="fixed")
+    assert c.update(100, 0, 100) == 0.3
+
+
+def test_ratio_cold_start():
+    """refresh 不足 fallback base（§5.5）。"""
+    from fullstack_opd_v2.adaptive_cache import DynamicRatioController
+    c = DynamicRatioController(initial=0.3, min=0.1, max=0.6, mode="adaptive")
+    assert c.cold_start_adjust(alpha=0.3, n_refresh=2, n_batch=8) == 2 / 8
+
+
+def test_ratio_max_step_change():
+    """|α_t−α_{t-1}| ≤ max_step_change（§5.4）。"""
+    from fullstack_opd_v2.adaptive_cache import DynamicRatioController
+    c = DynamicRatioController(initial=0.3, min=0.1, max=0.6, mode="adaptive",
+                               max_step_change=0.05)
+    a1 = c.update(0, 0, 0)
+    a2 = c.update(100, 0, 100)
+    assert abs(a2 - a1) <= 0.05 + 1e-6
