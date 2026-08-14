@@ -63,6 +63,9 @@ DEFAULT_CONFIG_V2 = {
                 "tokenizer_path": None},
     "eval": {"model_path": None, "datasets": ["AIME24", "AIME25"],
              "max_new_tokens": 2048, "n_samples": 1, "temperature": 0.0},
+    # ---- L2 Adaptive Staleness-Aware Teacher Cache（默认全关，enabled=false 退回 L0/L1）----
+    # 完整 schema 见 config.py L2Cfg；此处仅给总开关，pipeline/测试经 load_config 读全量。
+    "l2": {"enabled": False},
     "stage0": {              # 小模型 RL（产生 post-RL weak teacher）
         "lr": 1e-3, "n_rl_steps": 40, "max_new_tokens": 8,
         "batch_size": 8, "grad_clip": 1.0,
@@ -411,16 +414,31 @@ class FullStackOPDv2:
         # 独立加载的完整模型（2×teacher 1.5B + 1×student 副本，7B 档 ≈21GB），不释放会
         # 让 Stage 2 训练白白多驻留（GPU 打包预算里没有这笔）。返回 dict 的 teacher 字段
         # 无任何消费方（_cmd_train 只读 metrics/timings/run_dir），置 None 即可。
-        del teacher_rl, teacher_ref, warmup_student
-        teacher_rl = teacher_ref = None
+        # L2（任务 6.1）：启用时【保留】teacher_rl/teacher_ref + warmup_student 供 rollout
+        # 刷新相位（§3 student_ref = 初始 student = warmup_student，P1-4 独立实例）。
+        # 非 L2 仍释放（原行为不变，L0/L1 静态路径零开销）。
+        l2_cfg = self.cfg.get("l2", {})
+        l2_enabled = bool(l2_cfg.get("enabled", False))
+        if not l2_enabled:
+            del teacher_rl, teacher_ref, warmup_student
+            teacher_rl = teacher_ref = None
 
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
         initial_version = 0
         resume_ref = None
+        # §B 精确续跑（L2，任务 6.1）：断点可含 optimizer state + RNG + L2 ring buffer
+        _resume_opt = _resume_rng = _resume_rb = None
         if resume is not None:
             student.load_state_dict(resume["state"])
             initial_version = int(resume.get("version", 0))
             resume_ref = resume.get("ref")       # A3/D4：断点内 KL 锚点（旧断点可能为 None）
+            _resume_opt = resume.get("optimizer")
+            _resume_rng = resume.get("rng")
+            _resume_rb = resume.get("refresh_buffer")
+            if _resume_rng:
+                torch.set_rng_state(_resume_rng["py"])
+                if _resume_rng.get("cuda") is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state(_resume_rng["cuda"])
             logger.info(f"resume: 已加载断点学生权重，从 version={initial_version} 续跑")
 
         logger.info("[Stage 2] Direct-OPD 训练跑在 AsyncOPD 批量调度器上")
@@ -495,6 +513,19 @@ class FullStackOPDv2:
         # 注意：cm.save 在消费线程执行时用「落盘时刻的 student 权重」——checkpoint 语义
         # = 落盘时刻的 student 状态（断点本就节流保存，权重以落盘时刻为准），与异步自洽。
         _on_step_q = queue.Queue(maxsize=64)
+        # L2（任务 6.1）：闭包引用的 scheduler / rb 在下方 else 分支才赋值，先初始化占位
+        # 避免消费线程在它们未定义时 NameError。_save_ckpt 统一封装 cm.save 增强参数。
+        _scheduler_ref = None
+        _rb_ref = None
+
+        def _save_ckpt(step, version):
+            _opt = _scheduler_ref.opt if _scheduler_ref is not None else None
+            cm.save(step, student, version, self.cfg, metrics=[], ref=ref,
+                    optimizer=_opt,
+                    rng={"py": torch.get_rng_state(),
+                         "cuda": (torch.cuda.get_rng_state()
+                                  if torch.cuda.is_available() else None)},
+                    refresh_buffer=(_rb_ref if l2_enabled else None))
 
         def _consumer_loop():
             while True:
@@ -503,8 +534,7 @@ class FullStackOPDv2:
                     break
                 try:
                     mr.record(m)
-                    cm.save(m["step"], student, m["version"], self.cfg,
-                            metrics=[], ref=ref)
+                    _save_ckpt(m["step"], m["version"])
                 except Exception:
                     logger.exception("后台 checkpoint/metrics 落盘失败，跳过该步（step=%s）",
                                      m.get("step"))
@@ -541,6 +571,7 @@ class FullStackOPDv2:
                     student, cache, fat_prompts, fat_responses,
                     ref_dists, ref_ids, ref_logp, s2cfg, self.device,
                     rollout_engine=rollout_engine, initial_version=initial_version)
+                _scheduler_ref = scheduler
 
                 # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
                 # A3/D4：断点随附 KL 锚点 ref（闭包捕获 Stage 2 已算好的 ref_dists/ids/logp）。
@@ -550,9 +581,90 @@ class FullStackOPDv2:
                         _on_step_q.put_nowait(m)
                     except queue.Full:
                         mr.record(m)
-                        cm.save(m["step"], student, m["version"], self.cfg,
-                                metrics=[], ref=ref)
-                metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
+                        _save_ckpt(m["step"], m["version"])
+
+                if l2_enabled:
+                    # ---- L2 交替相位循环（任务 6.1，§13 整合）----
+                    # 训练相位（fit T_train 步，_train_step 一行不动）↔ rollout 刷新相位
+                    # （teacher 前向在此，不在 _train_step）。关闭时走原单次 scheduler.run。
+                    from .adaptive_cache import (RefreshRingBuffer, DisagreementComputer,
+                                                 CacheHealthMonitor, DynamicRatioController,
+                                                 RefreshSelector, PromptStateStore,
+                                                 run_refresh_phase)
+                    l2c = l2_cfg.get("cache", {})
+                    rb = RefreshRingBuffer(
+                        capacity=int(l2c.get("refresh_size", 5000)),
+                        top_k=cache.top_k, vocab=cache.vocab,
+                        value_protect_quantile=l2c.get("value_protect_quantile", 0.9))
+                    _rb_ref = rb
+                    ps = PromptStateStore(n_prompts=fat_prompts.size(0))
+                    disag = DisagreementComputer()
+                    hm = CacheHealthMonitor(
+                        l2_cfg.get("health_monitor", {}).get("health", {}),
+                        alert_cooldown=int(l2_cfg.get("health_monitor", {})
+                                           .get("alert_cooldown", 50)))
+                    rc = l2_cfg.get("refresh_ratio", {})
+                    drc = DynamicRatioController(
+                        initial=rc.get("initial", 0.3), min=rc.get("min", 0.1),
+                        max=rc.get("max", 0.6), mode=rc.get("mode", "adaptive"),
+                        age_weight=rc.get("age_weight", 0.25),
+                        drift_weight=rc.get("drift_weight", 0.5),
+                        quality_weight=rc.get("quality_weight", 0.25),
+                        ema_beta=rc.get("ema_beta", 0.9),
+                        warmup_steps=rc.get("warmup_steps", 500),
+                        max_step_change=rc.get("max_step_change", 0.05))
+                    sc = l2_cfg.get("selective_rollout", {})
+                    selector = (RefreshSelector(
+                        ps, candidate_multiplier=sc.get("candidate_multiplier", 4),
+                        value_fraction=sc.get("value_fraction", 0.8),
+                        coverage_fraction=sc.get("coverage_fraction", 0.2),
+                        value_weights=sc.get("value_weights"),
+                        compute_aware=sc.get("compute_aware", False),
+                        max_same_prompt_fraction=sc.get("max_same_prompt_fraction", 0.05),
+                        exploration_fraction=sc.get("exploration_fraction", 0.2))
+                        if sc.get("enabled", True) else None)
+                    # 注入 scheduler 供双池 feeder（任务 1.4 接入点；当前 CPU toy 下只装配不消费）
+                    scheduler._l2_enabled = True
+                    scheduler._refresh_buffer = rb
+                    scheduler._drc = drc
+                    # §3 初始 student（student_ref）：warmup_student 即 P1-4 独立实例；
+                    # warmup_M=0 时未建，则新建一份初始 student 副本。
+                    student_ref = warmup_student if warmup_student is not None else \
+                        build_model(self.cfg, self.device, role="student")
+
+                    metrics = []
+                    n_total = int(s2cfg.get("n_steps", 30))
+                    t_train = int(l2_cfg.get("t_train", 100))
+                    step_done = 0
+                    while step_done < n_total:
+                        # 训练相位：跑 n_phase 步（_train_step teacher-free 不动）。
+                        # ⚠️ scheduler.run 每次会 set self.stop 且 metrics 跨相位累计——
+                        # 相位边界必须重置 stop 事件与 metrics，否则后续相位线程立即退出。
+                        scheduler.stop.clear()
+                        scheduler.metrics = []
+                        n_phase = min(t_train, n_total - step_done)
+                        metrics.extend(scheduler.run(n_phase, on_step=_on_step))
+                        step_done += n_phase
+                        # rollout 刷新相位：teacher 前向在此（不在 _train_step）
+                        if step_done < n_total and selector is not None:
+                            run_refresh_phase(
+                                student, teacher_rl, teacher_ref, student_ref,
+                                selector, rb, disag, fat_prompts, step_done,
+                                scheduler.staleness_q.current_version,
+                                int(l2_cfg.get("m_refresh", 1000)),
+                                int(l2c.get("max_response_length", 8192)),
+                                cache.top_k, self.device)
+                            # Health Monitor 观测（Observe-only，不改训练）
+                            hm_metrics = hm.record(step_done, hit_rate=1.0,
+                                                   refresh_age_p95=0, reuse_p95=0,
+                                                   max_length_ratio=0)
+                            mr.record(hm_metrics)
+                            # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）
+                            drc.update(base_age=hm_metrics.get("age/mean", 0),
+                                       policy_drift=0,
+                                       refresh_quality=rb.mean_disagreement())
+                else:
+                    metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         finally:
             # C1：drain 后台队列（成功/异常都执行），确保 metrics/checkpoint 全部落盘
             try:
@@ -568,7 +680,14 @@ class FullStackOPDv2:
             json.dump({k: round(v, 4) for k, v in timings.items()}, f, indent=2)
         # 末步断点无条件存（保证最终状态可被 AIME 蒸馏后评估），随附 KL 锚点 ref
         last_ck = cm.save(metrics[-1]["step"], student, metrics[-1]["version"],
-                          self.cfg, force=True, ref=ref) if metrics else None
+                          self.cfg, force=True, ref=ref,
+                          optimizer=(_scheduler_ref.opt if _scheduler_ref is not None
+                                     else None),
+                          rng={"py": torch.get_rng_state(),
+                               "cuda": (torch.cuda.get_rng_state()
+                                        if torch.cuda.is_available() else None)},
+                          refresh_buffer=(_rb_ref if l2_enabled else None)) \
+            if metrics else None
         logger.info(f"训练完成: {len(metrics)} 步, 总耗时 {timings['total']:.2f}s, 断点 {last_ck or '无'}")
 
         return {
