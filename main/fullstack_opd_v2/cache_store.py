@@ -267,6 +267,10 @@ class DiskTeacherCache:
     def delta_for_student_topk(self, idxs, student_topk_ids, vocab_out=None,
                                fill=0.0, mask=None):
         ids_bs, delta_bs = self._fetch(idxs)
+        # 支撑张量随 batch 行已移到 self.device；student 支撑须同设备，否则 searchsorted 报
+        # "Expected all tensors to be on the same device"（部署实测：缓存 cuda、student 支撑 cpu）。
+        if student_topk_ids.device != ids_bs.device:
+            student_topk_ids = student_topk_ids.to(ids_bs.device)
         return expand_student_topk_delta(ids_bs, delta_bs, student_topk_ids,
                                          self.vocab, vocab_out, fill, mask)
 
