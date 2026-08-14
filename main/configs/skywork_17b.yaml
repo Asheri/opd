@@ -20,20 +20,21 @@ cache_mode: topk
 offload_to_cpu: true
 # Stage 1：统一 K 存储架构（§1）——磁盘 mmap 驻留；K 实验范围 {32,64,128,256}。
 # top_k 仅允许 0/32/64/128/256（0=dense）。storage=disk：GPU/RAM 只驻当前 batch 行。
+# K=256 由 Stage 1.5 K 校准定案（完整 8192 域 ρ_64=0.51 不满足判据，需 256 才 ρ=1）。
 cache:
-  top_k: 32
+  top_k: 256
   storage: disk
 
 # ---- 数据：Skywork 50K prompt universe（response 由 prepare_skywork_responses.py 预生成）----
 # ⚠️ 规模（50K universe + 5K materialized 静态锚点）由 Stage 0 实测决定（见
-# gen_benchmark.py / stage0_scale_probe.py）：若 50K×8192 不现实，按决策报告降规模。
+# gen_benchmark.py / stage0_scale_probe.py）：K=256×4096 下盘体 ~0.4TB（S1-7 外推折半）。
 dataset:
   type: jsonl
   path: /root/autodl-tmp/datasets/skywork_50k.jsonl
   prompt_key: prompt
   response_key: response
   max_prompt_len: 1024            # 对齐论文 MAX_PROMPT_LENGTH
-  max_response_len: 8192          # 用户要求（训练序列长度；Stage 0 实测确认是否保留）
+  max_response_len: 4096          # 用户定案：response 最大长度 max tokens=4096
   tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
   prompt_universe_size: 50000     # prompt 池总规模（50K universe）
 
@@ -70,7 +71,7 @@ stage2:
   renormalize_topk_support: true  # 对齐原始 Direct-OPD 稀疏支撑归一化
   delta_clip: 2.0                 # ← Δ_T 数值护栏（真实词表 log-ratio 差 ±10 -> PG 爆炸）
   dtype: bf16
-  # top_k_student 由 cache.top_k（=32）回落驱动（scheduler.py:97-98），不再写死 256。
+  # top_k_student 由 cache.top_k（=256）回落驱动（scheduler.py:97-98），不再写死。
   offload_to_cpu: false           # 单卡 batch=8 显存够，learner 不 offload
 
 run:
