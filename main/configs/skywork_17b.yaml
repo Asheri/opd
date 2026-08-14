@@ -22,15 +22,24 @@ top_k_student: 256
 ref_topk: 256
 offload_to_cpu: true
 
-# ---- 数据：Skywork 10K jsonl（response 由 prepare_skywork_responses.py 预生成）----
+# ---- 数据：Skywork 50K prompt universe（response 由 prepare_skywork_responses.py 预生成）----
+# ⚠️ 规模（50K universe + 5K materialized 静态锚点）由 Stage 0 实测决定（见
+# gen_benchmark.py / stage0_scale_probe.py）：若 50K×8192 不现实，按决策报告降规模。
 dataset:
   type: jsonl
-  path: /root/autodl-tmp/datasets/skywork_10k.jsonl
+  path: /root/autodl-tmp/datasets/skywork_50k.jsonl
   prompt_key: prompt
   response_key: response
   max_prompt_len: 1024            # 对齐论文 MAX_PROMPT_LENGTH
-  max_response_len: 2048          # 对齐论文 MAX_RESP_LENGTH（训练短生成）
+  max_response_len: 8192          # 用户要求（训练序列长度；Stage 0 实测确认是否保留）
   tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  prompt_universe_size: 50000     # prompt 池总规模（50K universe）
+
+# ---- Stage 0 规模概念：materialized 静态锚点（仅数据结构，不接算法）----
+# 只生成 materialized_size 条 response（JsonLinesDataLoader 跳过空 response 行 →
+# 训练只看到这 5K 静态锚点），其余 45K prompt 留空待 L2 在线 refresh（本阶段不实现）。
+base:
+  materialized_size: 5000
 
 stage0:
   n_rl_steps: 20                  # hf 路径跳过 Stage0 RL（_stage0_teachers 直接用预下载教师对），仅占位

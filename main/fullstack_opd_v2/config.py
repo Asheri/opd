@@ -209,6 +209,10 @@ class DatasetCfg(_Strict):
     max_prompt_len: int = 256
     max_response_len: int = 384
     tokenizer_path: str | None = None
+    # Stage 0 规模概念（50K prompt universe + materialized 静态锚点，见 base.materialized_size）：
+    # prompt 池总规模（50K）。实际训练只读到「有 response 的」行（JsonLinesDataLoader 跳过
+    # 空 response 行），其余 prompt 留空待 L2 在线 refresh。本字段仅作数据规模声明，不接算法。
+    prompt_universe_size: int = 50000
 
 
 class EvalCfg(_Strict):
@@ -233,6 +237,16 @@ class EvalCfg(_Strict):
     chat_template: bool = False
     # attn_implementation：None=SDPA 默认；"flash_attention_2" 启用 flash_attn（长生成 decode 提速）
     attn_implementation: str | None = None
+
+
+class BaseCfg(_Strict):
+    """Stage 0「50K prompt universe + materialized 静态锚点」规模概念（仅数据结构，不接算法）。
+
+    materialized_size：初始生成 response 的条数（静态锚点）。实际训练只读到有 response 的
+    行（JsonLinesDataLoader 跳过空 response 行），其余 prompt 留空待 L2 在线 refresh（本阶段
+    不实现 L2，仅声明规模）。配合 dataset.prompt_universe_size（prompt 池总规模）。
+    """
+    materialized_size: int = 5000
 
 
 class OPDConfig(_Strict):
@@ -265,6 +279,7 @@ class OPDConfig(_Strict):
     dataset: DatasetCfg = Field(default_factory=DatasetCfg)
     eval: EvalCfg = Field(default_factory=EvalCfg)
     l2: L2Cfg = Field(default_factory=L2Cfg)
+    base: BaseCfg = Field(default_factory=BaseCfg)
 
 
 # --------------------------- 顶层部署键下渗 ---------------------------
