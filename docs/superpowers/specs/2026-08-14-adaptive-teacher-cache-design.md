@@ -194,16 +194,57 @@ utility:
 
 ---
 
-## 4. Cache Health Monitor
+## 4. Cache Health Monitor（权威定义）
 
-每刷新周期聚合（经 `MetricsRecorder.record()` 加字段，不造新 logger）：
-- refresh 池填充率、refresh 样本平均 staleness age
-- base/refresh 平均 disagreement（`disagreement_abs_mean`）
-- Δ_T clip 比例
-- 实际 vs 目标 mix_ratio
-- disagreement 分布（mean/std/p50/p90/p95/max）
-- `positive_disagreement_ratio` / `negative_disagreement_ratio`（判断 student 偏弱还是偏激）
-- `disagreement/by_length_bucket`（长度分桶）
+> 目标不是加日志，而是构建能解释训练异常的数据质量与 cache 状态监控系统。
+> 经现有 `MetricsRecorder`（CSV/WandB）落盘，不造新 logger、不增 dashboard 依赖。
+> **Health Monitor 只 Observe→Diagnose，不自动改训练**（避免难 debug 闭环；Dynamic Refresh Ratio 是独立消费方，非 Monitor 内部闭环）。
+
+### 4.1 七类监控维度（Base/Refresh 分开统计）
+
+**A. Freshness**：`Age_i = t − v_i`（t=当前 training step，v_i=generation step）。记录 `age/{mean,std,p50,p90,p95,max,over_threshold_ratio}`。
+> 口径区分：Age 用 **step**（数据新鲜度，本节）；`_train_step` 截断用 **version**（权重陈旧度，§2 Q4）。sample 同时记 `generation_step` 与 `generation_version`（req7）。
+
+**B. Pool Composition**：`r_B=N_B/N`、`r_R=N_R/N` + 实际 batch 采样比例 `pool/{base,refresh}_ratio_{requested,actual}`（发现 cache shortage / filtering / sampler bug）。
+
+**C. Cache Lookup Health**：`lookup/{total,hit,miss,hit_rate,invalid,duplicate}`。miss 记有限量 debug 信息（不无限打印）。
+
+**D. Sample Reuse**：`R_i`=sample i 被训练读取次数。记录 `reuse/{mean,p50,p95,max,high_ratio}`（发现少量样本过度 oversampling）。
+
+**E. Teacher-Student Disagreement**：接入 §3，`disagreement/{mean,p95,high_ratio}`，Base/Refresh 分开。
+
+**F. Reward / Quality**：`reward/{mean,std,p50,p95,high_ratio}` + `ΔR = E[R_refresh] − E[R_base]`。
+
+**G. Response Length**：`length/{mean,std,p50,p95,max,eos_rate,max_length_ratio}`。特别监控 `P(L=8192)`（揭示 EOS 学坏 / reasoning loop / reward length bias / rollout straggler）。
+
+### 4.2 Coverage
+
+`coverage/{unique_prompt_ratio, unique_response_ratio, category_entropy, repeated_prompt_ratio}`。无 prompt category 不硬编码，先实现 unique ratio + 重复率。
+
+### 4.3 Cache Health Score（rule-based，阈值 configurable）
+
+独立 health evaluator：`H_t = f(HitRate, Freshness, Coverage, Disagreement, Reuse, Length)`。第一版**不用 ML**，基于阈值的 `HEALTHY / WARNING / CRITICAL`：
+```yaml
+health:
+  hit_rate:        {warning: 0.995, critical: 0.98}
+  refresh_age_p95: {warning: 5,     critical: 10}
+  reuse_p95:       {warning: 8,     critical: 20}
+  max_length_ratio:{warning: 0.10,  critical: 0.25}
+```
+
+### 4.4 Alert 机制
+
+不刷屏：同一 warning 用 **cooldown**。记录 `cache_health/status`（HEALTHY/WARNING/CRITICAL）+ `cache_health/reason`（如 `refresh_age_p95 too high`）。
+
+### 4.5 Dashboard（现有 WandB/CSV）
+
+时间序列：refresh ratio / refresh age / disagreement / reward / hit rate / response length / cache health score。分布直方图：age / disagreement / reward / reuse / response length（采样统计）。
+
+### 4.6 Performance Requirement（不许降吞吐）
+
+- batch-level aggregation，**不逐 token loop**，**不全量扫描 50K Base Pool**。
+- 用 counters / EMA / reservoir statistics；histogram 只采样统计。
+- `health_monitor: false` 时性能不应明显退化。
 
 ---
 
@@ -238,6 +279,12 @@ l2:
   selective_rollout: true
   selection_temperature: 1.0
   health_monitor: true
+  health:                     # §4.3 rule-based 阈值（configurable）
+    hit_rate:         {warning: 0.995, critical: 0.98}
+    refresh_age_p95:  {warning: 5,     critical: 10}
+    reuse_p95:        {warning: 8,     critical: 20}
+    max_length_ratio: {warning: 0.10,  critical: 0.25}
+  alert_cooldown: 50          # §4.4 同一 warning 冷却步数
   refresh_min_interval: 50
   refresh_max_interval: 150
   delta_slope_eps: 0.001
@@ -263,6 +310,7 @@ l2:
 | Disagreement 计算 | rollout 相位（新 `adaptive_cache.py`） | _train_step 不动 |
 | 配置 | `config.py` 新 `L2Cfg` + seep | 默认关 |
 | 指标 | `metrics.py` 无改动 | `record()` 加字段即可 |
+| Lookup/Reuse 计数器 | `cache.py`/`scheduler.py` 埋点 | 最小侵入：lookup hit/miss + reuse count 仅 increment 计数器，聚合逻辑在 `CacheHealthMonitor` |
 
 ---
 
@@ -283,6 +331,14 @@ l2:
 - 双池 feeder mix_ratio 采样比例
 - base 样本不被版本截断
 - `l2.enabled: false` 退回原行为（回归）
+
+### Cache Health Monitor 测试（§4 权威要求）
+- empty refresh pool / ring buffer rollover
+- cache miss / duplicate / invalid entry
+- age calculation / reuse counting
+- threshold classification（HEALTHY/WARNING/CRITICAL）
+- distributed aggregation（跨 rank 一致）
+- `health_monitor: false` 时性能不退化
 
 ---
 
