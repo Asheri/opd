@@ -21,7 +21,7 @@ def _write_cfg(tmp_path, n_steps=3):
 def test_parser_has_subcommands():
     p = build_parser()
     sub = next(a for a in p._actions if a.dest == "command")
-    assert set(sub.choices) == {"train", "cache", "eval", "info", "eval-aime"}
+    assert set(sub.choices) == {"train", "cache", "eval", "info", "eval-aime", "eval-budget"}
 
 
 def test_cli_info(tmp_path, capsys):

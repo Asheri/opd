@@ -274,11 +274,11 @@ def test_cache_cfg_unknown_subkey_rejected(tmp_path):
 
 
 def test_skywork_yaml_uses_cache_topk():
-    """skywork_17b.yaml 应已删 256、用 cache.top_k=32 + stage2 无 top_k_student。"""
+    """skywork_17b.yaml：cache.top_k=256（S1.5 K 校准定案）+ disk + stage2 无 top_k_student。"""
     cfg = load_config(path=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "configs", "skywork_17b.yaml"))
-    assert cfg["cache"]["top_k"] == 32
+    assert cfg["cache"]["top_k"] == 256
     assert cfg["cache"]["storage"] == "disk"
-    # stage2 不再写死 top_k_student=256（yaml 已删，回落 0 → scheduler 用 cache.top_k=32）
+    # stage2 不再写死 top_k_student（yaml 已删，回落 0 → scheduler 用 cache.top_k=256）
     assert cfg["stage2"]["top_k_student"] == 0

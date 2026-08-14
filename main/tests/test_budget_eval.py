@@ -310,3 +310,41 @@ def test_write_report_creates_md_and_plots(tmp_path):
         assert len(pngs) >= 4
     except Exception:
         pass                # matplotlib 未装则图跳过（md 加注）
+
+
+# --------------------------- CLI eval-budget（任务5） ---------------------------
+def test_cli_eval_budget_parses_models():
+    from fullstack_opd_v2.cli import build_parser
+    ap = build_parser()
+    args = ap.parse_args(["eval-budget", "--models", "Base=/m", "--models", "L0=",
+                          "--budgets", "256,512"])
+    assert args.command == "eval-budget"
+    assert args.models == ["Base=/m", "L0="]
+    assert args.budgets == "256,512"
+    assert args.scoring == "sympy"          # 默认数学等价判定（支持 MATH-500/GSM8K 分数小数）
+
+
+def test_cli_eval_budget_requires_models():
+    from argparse import Namespace
+    from fullstack_opd_v2.cli import _cmd_eval_budget
+    args = Namespace(models=None)
+    with pytest.raises(ConfigError) as ei:
+        _cmd_eval_budget(args)
+    assert "--models" in str(ei.value)
+
+
+def test_cli_eval_budget_skips_empty_path(tmp_path):
+    from argparse import Namespace
+    from fullstack_opd_v2.cli import _cmd_eval_budget
+    args = Namespace(
+        models=["L0="], budgets="256,512", datasets=None, out=str(tmp_path),
+        n_samples=1, seed=42, temperature=0.0, top_p=None, scoring="sympy",
+        prompt_style="boxed", chat_template=False, attn_impl=None,
+        batch_size=8, dtype="auto", completion_max_tokens=64, device="cpu")
+    with mock.patch("fullstack_opd_v2.budget_eval.run_matrix",
+                    return_value=[]) as mr:
+        rc = _cmd_eval_budget(args)
+    assert rc == 0
+    assert mr.called
+    # 空路径占位 → run_matrix 返回 [] → 报告写出（仅表头）
+    assert (tmp_path / "2026-08-15-budget-aware-eval.md").exists()

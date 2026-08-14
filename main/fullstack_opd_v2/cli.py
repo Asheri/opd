@@ -161,6 +161,33 @@ def build_parser() -> argparse.ArgumentParser:
                    help="attention 实现：None(SDPA 默认) | flash_attention_2(长生成提速,需装flash_attn) | sdpa | eager")
     p.add_argument("--dtype", default=None, help="fp32 | bf16 | float16 | auto（默认 auto）")
     p.add_argument("--device", default=None)
+
+    p = sub.add_parser(
+        "eval-budget",
+        help="Budget-Aware Evaluation：统一 reasoning budget 下公平比较 Base/L0/L2")
+    p.add_argument("--models", action="append", metavar="LABEL=PATH",
+                   help="模型矩阵，可重复：--models Base=... --models L0=... --models L2=..."
+                        "（空路径=占位跳过）")
+    p.add_argument("--budgets", default="256,512,1024,2048,4096",
+                   help="reasoning budget 档位（逗号分隔）")
+    p.add_argument("--datasets", nargs="+", default=None,
+                   help="如 GSM8K MATH500 AIME24 AIME25（默认按三档：GSM8K 基础泛化 / "
+                        "MATH-500 主结果 / AIME 补充）")
+    p.add_argument("--out", default=None, help="报告/落盘目录（默认 results/budget_eval）")
+    p.add_argument("--n-samples", type=int, default=1)     # 默认1，保留>1接口
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=None)
+    p.add_argument("--prompt-style", default="boxed")
+    p.add_argument("--scoring", default="sympy",
+                   help="sympy（默认，论文数学等价判定，支持 MATH-500/GSM8K 分数小数）| int")
+    p.add_argument("--chat-template", action="store_true", default=False)
+    p.add_argument("--attn-impl", default=None,
+                   help="attention：flash_attention_2 | sdpa | eager（长生成提速用 flash）")
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--dtype", default="auto")
+    p.add_argument("--completion-max-tokens", type=int, default=64)
+    p.add_argument("--device", default=None)
     return ap
 
 
@@ -177,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_info(args)
         if args.command == "eval-aime":
             return _cmd_eval_aime(args)
+        if args.command == "eval-budget":
+            return _cmd_eval_budget(args)
         raise ConfigError(f"未知子命令: {args.command}")
     except (OPDError, ValidationError) as e:
         print(f"[error] {type(e).__name__}: {e}")
@@ -294,4 +323,37 @@ def _cmd_eval_aime(args) -> int:
                     print(f"[eval-aime] {ds}: {res.correct}/{res.total} "
                           f"= {res.accuracy * 100:.2f}%  → {out_path}")
     print("[eval-aime] 汇总：teacher 基线 / 学生蒸馏前后对比见 benchmarks/aime24_25/aggregate.py")
+    return 0
+
+
+def _cmd_eval_budget(args) -> int:
+    """Budget-Aware Evaluation 矩阵：Base/L0/L2 × B，写报告 + 4 图。"""
+    from .budget_eval import run_matrix, write_report, DEFAULT_BUDGETS
+
+    if not args.models:
+        raise ConfigError("eval-budget 需要 --models LABEL=PATH（可重复；空路径=占位跳过）")
+    models = []
+    for spec in args.models:
+        if "=" not in spec:
+            raise ConfigError(f"--models 须为 LABEL=PATH 形式，收到 {spec!r}")
+        label, path = spec.split("=", 1)
+        models.append((label.strip(), path.strip()))
+    budgets = [int(x) for x in args.budgets.split(",") if x.strip()]
+    if not budgets:
+        raise ConfigError(f"--budgets 解析为空：{args.budgets!r}")
+    # 数据集三档：GSM8K 基础泛化 → MATH-500 主结果 → AIME 补充（默认全跑）
+    datasets = args.datasets or ["GSM8K", "MATH500", "AIME24", "AIME25"]
+    device = _device_arg(args)
+    out_dir = args.out or "results/budget_eval"
+    res = run_matrix(models, budgets, datasets, out_dir, device=device,
+                     temperature=args.temperature, top_p=args.top_p,
+                     n_samples=args.n_samples, seed=args.seed, scoring=args.scoring,
+                     prompt_style=args.prompt_style, chat_template=args.chat_template,
+                     attn_implementation=args.attn_impl, batch_size=args.batch_size,
+                     dtype=args.dtype, completion_max_tokens=args.completion_max_tokens)
+    report_path = os.path.join(out_dir, "2026-08-15-budget-aware-eval.md")
+    write_report(res, report_path)
+    n_skip = sum(1 for _, p in models if not p)
+    print(f"[budget-eval] 报告写至 {report_path}（{len(res)} 个 model×budget×dataset 结果，"
+          f"{n_skip} 个占位模型跳过）")
     return 0
