@@ -378,9 +378,107 @@ class AsyncBatchedScheduler:
             "reward": rew_v,
         }
 
-    def _train_dispatcher(self, n_steps: int, on_step=None):
-        done = 0
-        while done < n_steps:
+    # --------------------------- L2 双池 feeder：refresh 训练步（G1，闭环核心） ---------------------------
+    def _train_step_refresh(self, done, rb_idxs, rb, on_step=None):
+        """L2 refresh 池样本的 teacher-free 稀疏 top-K PG + KL（§2 双池，G1 闭环）。
+
+        refresh 样本的 Δ_T（教师 top-K）与行为策略 s_old（生成时学生 top-K）都已在
+        rollout 相位存进 ring buffer；这里按 s_cur 当前 top-K 支撑展开，做稀疏支持
+        重归一 PG + KL（与 base 稀疏路径同内核对齐 Direct-OPD）。全程无 teacher 前向。
+
+        rb_idxs: (B,) ring buffer 局部槽位。token_mask 处理变长（真实 EOS padding）。
+        """
+        batch = rb.get(rb_idxs)
+        p_b = self.prompts[batch["prompt_idx"]].to(self.device)
+        r_b = batch["responses"].to(self.device)
+        mask = batch["token_masks"].to(self.device)
+        self.student.train()
+        with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
+                                enabled=self.amp):
+            s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
+            s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
+            # Δ_T 展开到 s_cur top-K（教师 top-K 命中处取 delta_k，未命中=0）
+            delta_at = rb.delta_at_student_topk(
+                rb_idxs, s_topk.indices, self.device)          # (B,T,Ks)
+            # 行为策略 s_old 展开到 s_cur top-K（未命中填 ref_tail_logp≈log 0）
+            s_old_at = rb.s_old_at_student_topk(
+                rb_idxs, s_topk.indices, self.device,
+                tail_logp=self.ref_tail_logp)                  # (B,T,Ks)
+            # KL 锚点：dense 模式从 ref_dists 取，稀疏模式从 ref_top-K 取（同 base 路径）
+            if self.kl_mode == "dense":
+                ref_at = self.ref_dists[batch["prompt_idx"]].gather(
+                    -1, s_topk.indices)                        # (B,T,Ks)
+            else:
+                ref_at = self._ref_logp_at_student_topk(
+                    batch["prompt_idx"], s_topk.indices)       # (B,T,Ks)
+            # 支撑 = 完整 s_cur top-K（ones），与 KL 同源重归一（对齐原始 Direct-OPD）
+            sup = torch.ones_like(s_topk.values, dtype=torch.bool)
+            loss_pg = pg_loss(s_topk.values, s_old_at, delta_at, mask, self.clip_eps,
+                              p_old=s_old_at.exp(), log_ratio_max=LOG_RATIO_MAX,
+                              renormalize_support=True, support=sup,
+                              delta_clip=self.delta_clip)
+            loss_kl = low_var_kl_support(s_topk.values, ref_at, mask,
+                                         renormalize_support=True)
+            loss = loss_pg + self.kl_coef * loss_kl
+
+        self.opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.student.parameters(), self.grad_clip)
+        self.opt.step()
+        version = self._publish()
+        with torch.no_grad():
+            p_cur = s_topk.values.exp()
+            reward = (p_cur * delta_at).sum(-1) * mask
+            adv = (s_old_at.exp() * delta_at).sum(-1) * mask
+            reward = reward.sum() / mask.sum()
+            adv = adv.sum() / mask.sum()
+        scalars = [loss, loss_pg, loss_kl, adv, reward]
+        scalars = [s.float() if s.dtype != torch.float32 else s for s in scalars]
+        loss_v, pg_v, kl_v, adv_v, rew_v = torch.stack(scalars).detach().cpu().tolist()
+        # 标量从标量张量转 float（reward/adv 已是标量）
+        return {
+            "step": done,
+            "version": version,
+            "age": 0,
+            "pool": "refresh",
+            "batch": int(r_b.size(0)),
+            "loss": loss_v,
+            "pg_loss": pg_v,
+            "kl_loss": kl_v,
+            "adv_mean": float(adv_v),
+            "reward": float(rew_v),
+        }
+
+    def train_refresh_phase(self, rb, alpha: float, n_refresh_steps: int,
+                            start_step: int, on_step=None) -> int:
+        """L2 双池 feeder：从 ring buffer 采 n_refresh_steps 批做 refresh 训练。
+
+        α 已由 DynamicRatioController 决定（G3 应用）；n_refresh_steps 由 pipeline 按
+        α/(1-α)·n_base 折算。采样带确定性 generator（可复现）。返回实际完成步数。
+        """
+        if rb.size == 0 or n_refresh_steps <= 0:
+            return 0
+        gen = torch.Generator().manual_seed(42)
+        done = start_step
+        completed = 0
+        for _ in range(n_refresh_steps):
+            rb_idxs = rb.sample(self.batch, gen)
+            if rb_idxs.numel() == 0:
+                break
+            m = self._train_step_refresh(done, rb_idxs, rb)
+            self.metrics.append(m)
+            if on_step is not None:
+                try:
+                    on_step(m)
+                except Exception:
+                    pass
+            done += 1
+            completed += 1
+        return completed
+
+    def _train_dispatcher(self, n_steps: int, on_step=None, start_step: int = 0):
+        done = start_step
+        while done < start_step + n_steps:
             try:
                 (idxs, s_old, delta), ver, _ = self.staleness_q.get(timeout=_DISPATCH_GET_TIMEOUT)
             except queue.Empty:
@@ -399,7 +497,7 @@ class AsyncBatchedScheduler:
         self.stop.set()
 
     # --------------------------- 入口 ---------------------------
-    def run(self, n_steps: int, on_step=None):
+    def run(self, n_steps: int, on_step=None, start_step: int = 0):
         self._pq: "queue.Queue" = queue.Queue(maxsize=self.cfg.get("queue_size", 8))
         self._rq: "queue.Queue" = queue.Queue(maxsize=self.cfg.get("queue_size", 8))
 
@@ -411,7 +509,7 @@ class AsyncBatchedScheduler:
         for t in threads:
             t.start()
 
-        self._train_dispatcher(n_steps, on_step=on_step)
+        self._train_dispatcher(n_steps, on_step=on_step, start_step=start_step)
 
         for t in threads:
             t.join(timeout=5)

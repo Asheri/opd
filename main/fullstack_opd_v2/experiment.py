@@ -23,40 +23,59 @@ import torch
 
 from .config import load_config
 
-# 每模块 enabled 开关作实验变量（E0-E6 矩阵定义，§10）
+# 每模块 enabled 开关作实验变量（E0-E6 矩阵定义，§10 — 累积构建语义）。
+# ⚠️ G6 修正：早期版本是「全开然后逐个关」，与 §10 的「累加」矛盾，且因 feeder 未接、
+# E1-E6 训练信号完全相同。现改为 §10 累加：E1 只加 fixed refresh，逐步叠加
+# disagreement→health monitor→dynamic ratio→selective rollout，E6 用 random rollout
+# 对照验证 selective 本身贡献。双池 feeder 已接（G1），E1-E6 训练信号真实可区分。
+#
+# 注：disagreement.enabled 目前仅作配置开关（run_refresh_phase 恒算 D），
+# E1↔E2 的差异由「D 是否参与后续信号」体现——E2 起 D 喂给 PromptState/selector，
+# 是 Deterministic 的模块职责边界（见 docs/superpowers/specs/...design.md §10）。
 EXPERIMENT_MATRIX: dict[str, dict] = {
-    # E0 基线：L2 完全关闭，退回 L0/L1 静态路径
-    "E0_baseline_off": {
+    # E0 基线：L2 完全关闭，退回 L0/L1 静态路径（无 refresh，无 on-policy 注入）
+    "E0_base_only": {
         "l2.enabled": "false",
     },
-    # E1 全量 L2：四能力全开
-    "E1_full_l2": {
-        "l2.enabled": "true",
-    },
-    # E2 关 selective rollout：候选池两阶段退化为 uniform 随机选 prompt
-    "E2_no_selective_rollout": {
-        "l2.enabled": "true",
-        "l2.selective_rollout.enabled": "false",
-    },
-    # E3 关 health monitor：不观测/告警（Observe-only 关闭，不影响训练）
-    "E3_no_health_monitor": {
-        "l2.enabled": "true",
-        "l2.health_monitor.enabled": "false",
-    },
-    # E4 关 dynamic ratio：refresh 比例固定为 initial（无三信号自适应）
-    "E4_fixed_refresh_ratio": {
+    # E1 Base + fixed Refresh：L2 开，固定 α=initial，无 disagreement/selective/health
+    "E1_base_fixed_refresh": {
         "l2.enabled": "true",
         "l2.refresh_ratio.mode": "fixed",
-    },
-    # E5 关 disagreement：刷新质量信号不喂给 ratio controller（D=0）
-    "E5_no_disagreement": {
-        "l2.enabled": "true",
         "l2.disagreement.enabled": "false",
+        "l2.health_monitor.enabled": "false",
+        "l2.selective_rollout.enabled": "false",
     },
-    # E6 关 value protection：ring buffer 纯 FIFO，无高价值样本保护
-    "E6_no_value_protect": {
+    # E2 E1 + Disagreement：D 参与刷新质量信号（selector 历史 / ratio quality）
+    "E2_add_disagreement": {
         "l2.enabled": "true",
-        "l2.cache.value_protect_quantile": "1.0",
+        "l2.refresh_ratio.mode": "fixed",
+        "l2.health_monitor.enabled": "false",
+        "l2.selective_rollout.enabled": "false",
+    },
+    # E3 E2 + Health Monitor：七维观测 + 告警（Observe-only，不影响训练信号）
+    "E3_add_health_monitor": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "fixed",
+        "l2.selective_rollout.enabled": "false",
+    },
+    # E4 E3 + Dynamic Ratio：adaptive α 三信号控制器（替代固定 initial）
+    "E4_add_dynamic_ratio": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "adaptive",
+        "l2.selective_rollout.enabled": "false",
+    },
+    # E5 E4 + Selective Rollout：候选池两阶段价值选择（80% value + 20% coverage）
+    "E5_add_selective_rollout": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "adaptive",
+        "l2.selective_rollout.enabled": "true",
+    },
+    # E6 全部模块 + Random Rollout：selective 关闭=uniform 随机选 prompt，
+    # 与 E5 对照，验证 selective 本身的 compute/quality 贡献（§10 Q4）
+    "E6_random_rollout": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "adaptive",
+        "l2.selective_rollout.enabled": "false",
     },
 }
 

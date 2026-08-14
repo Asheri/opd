@@ -27,39 +27,79 @@ class RefreshRingBuffer:
 
     base 池（TensorTeacherCache 原 ids/delta_k）不动；refresh 池独立张量，
     append 进新样本，满后 FIFO 淘汰最旧，高 disagreement 样本价值保护免淘汰一轮。
-    持久化字段：ids/delta_k（训练查表）+ generation_step/response_length/token_mask/disagreement_abs。
+    持久化字段：ids/delta_k（训练查表）+ s_old_ids/s_old_logp（行为策略学生 top-K，
+    供 refresh 训练 PG 用）+ prompt_idx/response（定位生成上下文）+ 标量元数据。
+
+    ★双池 feeder（G1，闭环核心）：refresh 样本【进训练】——`_train_step_refresh` 从
+    ring buffer 取 teacher Δ_T（delta_at_student_topk）与行为策略 s_old
+    （s_old_at_student_topk），按 s_cur 当前 top-K 支撑展开做稀疏 top-K PG + KL，
+    全程 teacher-free（teacher 前向只在 run_refresh_phase）。
 
     索引：refresh 样本用局部 idx [0, size)；双池 feeder 负责 base/refresh 混合。
+    支持 state_dict/load_state_dict 断点续跑（G8）。
     """
 
     def __init__(self, capacity: int, top_k: int, vocab: int,
+                 student_top_k: int | None = None,
                  value_protect_quantile: float = 0.9):
         self.capacity = capacity
-        self.top_k = top_k
+        self.top_k = top_k                 # 教师 top-K（Δ_T 支撑）
+        self.student_top_k = student_top_k or top_k   # 行为策略学生 top-K（s_old 支撑）
         self.vocab = vocab
         self.value_protect_quantile = value_protect_quantile
         # ring buffer 槽位（预分配 capacity，append 原地写）
-        self.ids: torch.Tensor | None = None        # (cap, T, K)
-        self.delta_k: torch.Tensor | None = None    # (cap, T, K)
+        self.ids: torch.Tensor | None = None        # (cap, T, Kt)  教师 top-K id
+        self.delta_k: torch.Tensor | None = None    # (cap, T, Kt)  Δ_T on 教师 top-K
+        self.ids_sorted: torch.Tensor | None = None       # 每槽按 id 升序（searchsorted）
+        self.delta_k_sorted: torch.Tensor | None = None
+        self.s_old_ids: torch.Tensor | None = None        # (cap, T, Ks) 行为策略学生 top-K id
+        self.s_old_logp: torch.Tensor | None = None       # (cap, T, Ks) 行为策略学生 top-K logp
+        self.s_old_ids_sorted: torch.Tensor | None = None # 每槽按 id 升序
+        self.s_old_logp_sorted: torch.Tensor | None = None
         self._gen_steps: list[int] = []             # 每槽 generation_step
         self._resp_lens: list[int] = []
         self._token_masks: list[torch.Tensor] = []
         self._disagreements: list[float] = []       # 价值保护用
         self._protected: list[bool] = []            # 价值保护标记
+        self._prompt_idx: list[int] = []            # fat_prompts 索引（定位 prompt）
+        self._response: list[torch.Tensor] = []     # (T,) 生成 response
         self._write_pos = 0     # 环形写指针
         self.size = 0           # 当前有效样本数
 
     def _ensure_alloc(self, T: int, device, dtype):
         if self.ids is None:
+            Ks = self.student_top_k
             self.ids = torch.zeros(self.capacity, T, self.top_k,
                                    dtype=torch.long, device=device)
             self.delta_k = torch.zeros(self.capacity, T, self.top_k,
                                        dtype=dtype, device=device)
+            self.ids_sorted = self.ids.clone()
+            self.delta_k_sorted = self.delta_k.clone()
+            self.s_old_ids = torch.zeros(self.capacity, T, Ks,
+                                         dtype=torch.long, device=device)
+            self.s_old_logp = torch.zeros(self.capacity, T, Ks,
+                                          dtype=dtype, device=device)
+            self.s_old_ids_sorted = self.s_old_ids.clone()
+            self.s_old_logp_sorted = self.s_old_logp.clone()
+
+    def _sort_slot(self, pos: int):
+        """按 token id 升序重排教师 top-K 与行为策略学生 top-K（供 searchsorted）。"""
+        o = torch.argsort(self.ids[pos], dim=-1)
+        self.ids_sorted[pos] = self.ids[pos].gather(-1, o)
+        self.delta_k_sorted[pos] = self.delta_k[pos].gather(-1, o)
+        so = torch.argsort(self.s_old_ids[pos], dim=-1)
+        self.s_old_ids_sorted[pos] = self.s_old_ids[pos].gather(-1, so)
+        self.s_old_logp_sorted[pos] = self.s_old_logp[pos].gather(-1, so)
 
     def append(self, ids: torch.Tensor, delta_k: torch.Tensor,
                generation_step: int, response_length: int,
-               token_mask: torch.Tensor, disagreement_abs: float):
-        """append 一条样本（ids/delta_k: (T,K)）。满则 FIFO 淘汰（价值保护除外）。"""
+               token_mask: torch.Tensor, disagreement_abs: float,
+               prompt_idx: int, response: torch.Tensor,
+               s_old_ids: torch.Tensor, s_old_logp: torch.Tensor) -> int:
+        """append 一条样本（ids/delta_k/s_old_ids/s_old_logp: (T,K)）。满则 FIFO 淘汰。
+
+        返回写入的槽位 pos（供 run_refresh_phase 估计 reward）。
+        """
         T = ids.size(0)
         self._ensure_alloc(T, ids.device, delta_k.dtype)
         # 满且当前写指针指向的样本非受保护 -> 淘汰；受保护则跳过该槽（顺延）
@@ -73,6 +113,9 @@ class RefreshRingBuffer:
         pos = self._write_pos
         self.ids[pos] = ids
         self.delta_k[pos] = delta_k
+        self.s_old_ids[pos] = s_old_ids
+        self.s_old_logp[pos] = s_old_logp
+        self._sort_slot(pos)
         # 列表按 pos 索引（ring buffer 槽位复用）
         if pos < len(self._gen_steps):
             self._gen_steps[pos] = generation_step
@@ -80,17 +123,22 @@ class RefreshRingBuffer:
             self._token_masks[pos] = token_mask
             self._disagreements[pos] = disagreement_abs
             self._protected[pos] = False
+            self._prompt_idx[pos] = prompt_idx
+            self._response[pos] = response
         else:
             self._gen_steps.append(generation_step)
             self._resp_lens.append(response_length)
             self._token_masks.append(token_mask)
             self._disagreements.append(disagreement_abs)
             self._protected.append(False)
+            self._prompt_idx.append(prompt_idx)
+            self._response.append(response)
         # 价值保护：高于分位的样本标记
         if disagreement_abs > self._value_threshold():
             self._protected[pos] = True
         self._write_pos = (pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+        return pos
 
     def _value_threshold(self) -> float:
         """当前 disagreement 的价值保护分位（无样本时 inf）。"""
@@ -100,20 +148,126 @@ class RefreshRingBuffer:
             self.value_protect_quantile).item())
 
     def get(self, idxs: torch.Tensor) -> dict:
-        """(B,) 局部 idx -> {ids, delta_k, gen_steps, resp_lens, token_masks, disagreements}。"""
+        """(B,) 局部 idx -> 训练所需字段（teacher Δ_T + 行为 s_old + 上下文 + 标量）。"""
         if self.size == 0:
             T = self.ids.size(1) if self.ids is not None else 0
             K = self.top_k
             return {"ids": torch.empty(0, T, K, dtype=torch.long),
                     "delta_k": torch.empty(0, T, K)}
+        il = idxs.tolist()
         return {
             "ids": self.ids[idxs],
             "delta_k": self.delta_k[idxs],
-            "gen_steps": [self._gen_steps[i] for i in idxs.tolist()],
-            "resp_lens": [self._resp_lens[i] for i in idxs.tolist()],
-            "token_masks": torch.stack([self._token_masks[i] for i in idxs.tolist()]),
-            "disagreements": [self._disagreements[i] for i in idxs.tolist()],
+            "ids_sorted": self.ids_sorted[idxs],
+            "delta_k_sorted": self.delta_k_sorted[idxs],
+            "s_old_ids": self.s_old_ids[idxs],
+            "s_old_logp": self.s_old_logp[idxs],
+            "s_old_ids_sorted": self.s_old_ids_sorted[idxs],
+            "s_old_logp_sorted": self.s_old_logp_sorted[idxs],
+            "gen_steps": [self._gen_steps[i] for i in il],
+            "resp_lens": [self._resp_lens[i] for i in il],
+            "token_masks": torch.stack([self._token_masks[i] for i in il]),
+            "disagreements": [self._disagreements[i] for i in il],
+            "prompt_idx": torch.tensor([self._prompt_idx[i] for i in il], dtype=torch.long),
+            "responses": torch.stack([self._response[i] for i in il]),
         }
+
+    def sample(self, n: int, generator: torch.Generator) -> torch.Tensor:
+        """随机取 n 个局部 idx（≤ size）。"""
+        if self.size == 0:
+            return torch.empty(0, dtype=torch.long)
+        return torch.randint(0, self.size, (min(n, self.size),), generator=generator)
+
+    def delta_at_student_topk(self, idxs: torch.Tensor,
+                              student_topk_ids: torch.Tensor,
+                              device) -> torch.Tensor:
+        """把教师 Δ_T 展开到【s_cur 当前 top-K】支撑（searchsorted 二分，省 O(K²)）。
+
+        idxs: (B,) 局部槽位；student_topk_ids: (B,T,Ks) s_cur top-K id。
+        返回 (B,T,Ks)：教师 top-K 命中处取 delta_k，未命中填 0（Δ=0 贡献 0）。
+        与 base 缓存的 delta_for_student_topk 同口径（跨词表 student 超出教师词表 → 0）。
+        """
+        ids_s = self.ids_sorted[idxs]                 # (B,T,Kt) 已升序
+        delta_s = self.delta_k_sorted[idxs]           # (B,T,Kt)
+        Kt = ids_s.size(-1)
+        pos = torch.searchsorted(ids_s, student_topk_ids.contiguous()).clamp(max=Kt - 1)
+        found = ids_s.gather(-1, pos) == student_topk_ids
+        return delta_s.gather(-1, pos).where(found, torch.zeros_like(delta_s.gather(-1, pos)))
+
+    def s_old_at_student_topk(self, idxs: torch.Tensor,
+                              student_topk_ids: torch.Tensor,
+                              device, tail_logp: float = -1e2) -> torch.Tensor:
+        """把行为策略 s_old 展开到【s_cur 当前 top-K】支撑（searchsorted）。
+
+        返回 (B,T,Ks)：行为策略学生 top-K 命中处取 logp，未命中（生成时几乎为 0）
+        填 tail_logp（≈log 0），使 ratio 给出强约束（与 base 稀疏路径的 ref_tail_logp 同向）。
+        """
+        ids_s = self.s_old_ids_sorted[idxs]           # (B,T,Ks) 已升序
+        logp_s = self.s_old_logp_sorted[idxs]
+        Ks = ids_s.size(-1)
+        pos = torch.searchsorted(ids_s, student_topk_ids.contiguous()).clamp(max=Ks - 1)
+        found = ids_s.gather(-1, pos) == student_topk_ids
+        return logp_s.gather(-1, pos).where(
+            found, torch.full_like(logp_s.gather(-1, pos), tail_logp))
+
+    def reward_estimate(self, pos: int, device=None) -> float:
+        """E_{π_cur}[Δ_T] 估计（行为策略 top-K 支撑，monitor 用，非训练信号）。
+
+        s_cur=生成时 student（行为），π_cur≈s_old_logp.exp()；Δ_T 在教师 top-K 上，
+        用 s_old_ids_sorted 匹配 delta_k_sorted。供 PromptStateStore.reward_ema 更新。
+        """
+        s_ids = self.s_old_ids_sorted[pos]            # (T,Ks)
+        s_logp = self.s_old_logp_sorted[pos]
+        d_s = self.delta_k_sorted[pos]                # (T,Kt)
+        Kt = d_s.size(-1)
+        pos2 = torch.searchsorted(self.ids_sorted[pos], s_ids.contiguous()).clamp(max=Kt - 1)
+        found = self.ids_sorted[pos].gather(-1, pos2) == s_ids
+        delta_at = d_s.gather(-1, pos2).where(found, torch.zeros_like(d_s.gather(-1, pos2)))
+        p = s_logp.exp()
+        return float((p * delta_at).sum(-1).mean())
+
+    def state_dict(self) -> dict:
+        """序列化（断点续跑 G8）：张量切片 + 标量列表。"""
+        return {
+            "capacity": self.capacity,
+            "top_k": self.top_k,
+            "student_top_k": self.student_top_k,
+            "vocab": self.vocab,
+            "value_protect_quantile": self.value_protect_quantile,
+            "size": self.size,
+            "write_pos": self._write_pos,
+            "ids": (self.ids[:self.size].detach().cpu() if self.ids is not None else None),
+            "delta_k": (self.delta_k[:self.size].detach().cpu() if self.delta_k is not None else None),
+            "s_old_ids": (self.s_old_ids[:self.size].detach().cpu() if self.s_old_ids is not None else None),
+            "s_old_logp": (self.s_old_logp[:self.size].detach().cpu() if self.s_old_logp is not None else None),
+            "gen_steps": self._gen_steps[:self.size],
+            "resp_lens": self._resp_lens[:self.size],
+            "token_masks": [m.detach().cpu() for m in self._token_masks[:self.size]],
+            "disagreements": self._disagreements[:self.size],
+            "protected": self._protected[:self.size],
+            "prompt_idx": self._prompt_idx[:self.size],
+            "responses": [r.detach().cpu() for r in self._response[:self.size]],
+        }
+
+    def load_state_dict(self, sd: dict):
+        """从断点恢复（G8）。注意：capacity/top_k 以构造时为准，仅恢复内容。"""
+        self.size = int(sd["size"])
+        self._write_pos = int(sd["write_pos"])
+        if self.size > 0:
+            self._ensure_alloc(sd["ids"].size(1), sd["ids"].device, sd["delta_k"].dtype)
+            self.ids[:self.size] = sd["ids"]
+            self.delta_k[:self.size] = sd["delta_k"]
+            self.s_old_ids[:self.size] = sd["s_old_ids"]
+            self.s_old_logp[:self.size] = sd["s_old_logp"]
+            for i in range(self.size):
+                self._sort_slot(i)
+        self._gen_steps = list(sd["gen_steps"][:self.size])
+        self._resp_lens = list(sd["resp_lens"][:self.size])
+        self._token_masks = list(sd["token_masks"][:self.size])
+        self._disagreements = list(sd["disagreements"][:self.size])
+        self._protected = list(sd["protected"][:self.size])
+        self._prompt_idx = list(sd["prompt_idx"][:self.size])
+        self._response = list(sd["responses"][:self.size])
 
     def mean_disagreement(self) -> float:
         """池内平均 disagreement（§5 刷新质量信号 / §4 监控）。"""
@@ -163,18 +317,33 @@ class DisagreementComputer:
 
 def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       selector, ring_buffer, disag, prompts, step, version,
-                      m_selected, max_resp_len, top_k, device):
+                      m_selected, max_resp_len, top_k, device,
+                      prompt_state=None):
     """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 生成
     -> 4 个 chosen logp -> D_i^abs -> append_refresh。teacher 前向在此（_train_step 不动）。
 
-    返回 refresh 样本数。per-token logp 算完即弃（§11），只存标量。
+    返回 refresh 样本数。除了标量块控，还存行为策略 s_old（学生生成时完整分布 top-K，
+    供后续 refresh 训练 PG 用——G1 闭环）与 prompt_idx/response（G2 PromptState 闭环）。
+
+    G9：max_resp_len 是【新增】token 数，超出位置编码最大长度会越界（toy max_len=64 vs
+    默认 8192）。总序列长 = prompt_len + max_resp_len 必须 ≤ max_len，故 clamp 到
+    (max_len - prompt_len)，保证 CPU smoke 与 GPU 长序列都安全。
     """
     from .model import generate_batch, token_logprobs, response_dists
+    _max_seq = int(getattr(student, "max_len", max_resp_len))
+    max_resp_len = min(int(max_resp_len), max(1, _max_seq - prompts.size(1)))
     cand = selector.select(m_selected, prompts.size(0)) if selector else \
         torch.randint(0, prompts.size(0), (m_selected,))
     p_b = prompts[cand].to(device)
     responses = generate_batch(student, p_b, max_new=max_resp_len)
-    student_logp = token_logprobs(student, p_b, responses)        # (M,T)
+    # 行为策略：生成完立即取当前 student 完整分布 top-K（s_old，精确行为策略 §2）。
+    # 同一相位内 student 权重未变，因此 refresh 训练第一步 ratio≈1（纯 on-policy）。
+    with torch.no_grad():
+        s_full = response_dists(student, p_b, responses)          # (M,T,V)
+    Ks = ring_buffer.student_top_k
+    s_old_ids = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).indices
+    s_old_logp = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).values
+    student_logp = token_logprobs(student, p_b, responses)        # (M,T) chosen
     with torch.no_grad():
         student_ref.eval()
         ref_logp = token_logprobs(student_ref, p_b, responses)
@@ -188,9 +357,17 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     mask = _build_mask(responses)    # EOS 之后 padding=0（§3.4）
     D = disag.compute(rl_chosen, ref_chosen, student_logp, ref_logp, mask)
     for i in range(responses.size(0)):
-        ring_buffer.append(ids_k[i], delta_k[i], generation_step=step,
+        pos = ring_buffer.append(ids_k[i], delta_k[i], generation_step=step,
             response_length=int(mask[i].sum()), token_mask=mask[i],
-            disagreement_abs=float(D["abs"][i].detach()))
+            disagreement_abs=float(D["abs"][i].detach()),
+            prompt_idx=int(cand[i]), response=responses[i],
+            s_old_ids=s_old_ids[i], s_old_logp=s_old_logp[i])
+        # G2：写回 PromptState（rollout 结果 -> prompt 历史 -> 下次 selection 闭环）。
+        if prompt_state is not None:
+            rew = ring_buffer.reward_estimate(pos)
+            prompt_state.update(int(cand[i]), reward=rew,
+                                disagreement=float(D["abs"][i].detach()),
+                                resp_len=int(mask[i].sum()), step=step)
     return responses.size(0)
 
 

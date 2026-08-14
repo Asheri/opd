@@ -525,7 +525,8 @@ class FullStackOPDv2:
                     rng={"py": torch.get_rng_state(),
                          "cuda": (torch.cuda.get_rng_state()
                                   if torch.cuda.is_available() else None)},
-                    refresh_buffer=(_rb_ref if l2_enabled else None))
+                    refresh_buffer=((_rb_ref.state_dict() if _rb_ref is not None else None)
+                                    if l2_enabled else None))
 
         def _consumer_loop():
             while True:
@@ -572,6 +573,14 @@ class FullStackOPDv2:
                     ref_dists, ref_ids, ref_logp, s2cfg, self.device,
                     rollout_engine=rollout_engine, initial_version=initial_version)
                 _scheduler_ref = scheduler
+                # G8：resume 精确续跑——恢复 optimizer 状态（scheduler 刚新建 self.opt，
+                # 从断点 load_state_dict 还原 Adam 动量/方差，否则续跑动量丢失）。
+                if _resume_opt is not None:
+                    try:
+                        scheduler.opt.load_state_dict(_resume_opt)
+                        logger.info("resume: 已恢复 optimizer 状态（精确续跑）")
+                    except Exception as e:   # pragma: no cover —— 旧断点/形状失配降级
+                        logger.warning(f"resume: optimizer 恢复失败（降级新建）：{e}")
 
                 # T8/T10：每成功一步 → 指标落盘 + 按 checkpoint_every 存学生断点（供 AIME 蒸馏后评估）
                 # A3/D4：断点随附 KL 锚点 ref（闭包捕获 Stage 2 已算好的 ref_dists/ids/logp）。
@@ -595,8 +604,17 @@ class FullStackOPDv2:
                     rb = RefreshRingBuffer(
                         capacity=int(l2c.get("refresh_size", 5000)),
                         top_k=cache.top_k, vocab=cache.vocab,
+                        student_top_k=int(s2cfg.get("top_k_student", 0) or cache.top_k),
                         value_protect_quantile=l2c.get("value_protect_quantile", 0.9))
                     _rb_ref = rb
+                    # G8：resume 恢复 L2 ring buffer 内容（含行为策略 s_old + 元数据），
+                    # 使续跑后 refresh 池保留、可继续被双池 feeder 消费。
+                    if _resume_rb:
+                        try:
+                            rb.load_state_dict(_resume_rb)
+                            logger.info(f"resume: 已恢复 L2 refresh ring buffer（{rb.size} 样本）")
+                        except Exception as e:   # pragma: no cover —— 旧断点/形状失配降级
+                            logger.warning(f"resume: ring buffer 恢复失败（空池重来）：{e}")
                     ps = PromptStateStore(n_prompts=fat_prompts.size(0))
                     disag = DisagreementComputer()
                     hm = CacheHealthMonitor(
@@ -635,34 +653,65 @@ class FullStackOPDv2:
                     metrics = []
                     n_total = int(s2cfg.get("n_steps", 30))
                     t_train = int(l2_cfg.get("t_train", 100))
+                    # G4：refresh 触发时机由 min/max_interval 约束（§2 Q1），非无条件每相位。
+                    # 初始 last_refresh 置负，保证首个相位必触发一次 refresh（冷启动）。
+                    refresh_min = max(1, int(l2c.get("refresh_min_interval", 50)))
+                    refresh_max = max(refresh_min, int(l2c.get("refresh_max_interval", 150)))
+                    last_refresh = -refresh_min
+                    # base_done 只计 base 训练步（=n_total 口径）；step_done 全局单调（含 refresh
+                    # 补充步），供 step 编号与 checkpoint 文件名递增不冲突。
+                    base_done = 0
                     step_done = 0
-                    while step_done < n_total:
+                    while base_done < n_total:
                         # 训练相位：跑 n_phase 步（_train_step teacher-free 不动）。
                         # ⚠️ scheduler.run 每次会 set self.stop 且 metrics 跨相位累计——
                         # 相位边界必须重置 stop 事件与 metrics，否则后续相位线程立即退出。
                         scheduler.stop.clear()
                         scheduler.metrics = []
-                        n_phase = min(t_train, n_total - step_done)
-                        metrics.extend(scheduler.run(n_phase, on_step=_on_step))
+                        n_phase = min(t_train, n_total - base_done)
+                        metrics.extend(scheduler.run(n_phase, on_step=_on_step,
+                                                     start_step=step_done))
                         step_done += n_phase
-                        # rollout 刷新相位：teacher 前向在此（不在 _train_step）
-                        if step_done < n_total and selector is not None:
+                        base_done += n_phase
+                        # rollout 刷新相位：teacher 前向在此（不在 _train_step）。
+                        # G4：距上次刷新 >= min_interval 才触发（max_interval 强制），
+                        # 否则本相位纯训练、跳过 refresh 与 α 更新。
+                        elapsed = base_done - last_refresh
+                        if (elapsed >= refresh_min or elapsed >= refresh_max) \
+                                and selector is not None:
                             run_refresh_phase(
                                 student, teacher_rl, teacher_ref, student_ref,
                                 selector, rb, disag, fat_prompts, step_done,
                                 scheduler.staleness_q.current_version,
                                 int(l2_cfg.get("m_refresh", 1000)),
                                 int(l2c.get("max_response_length", 8192)),
-                                cache.top_k, self.device)
+                                cache.top_k, self.device, prompt_state=ps)
+                            last_refresh = base_done
                             # Health Monitor 观测（Observe-only，不改训练）
                             hm_metrics = hm.record(step_done, hit_rate=1.0,
                                                    refresh_age_p95=0, reuse_p95=0,
                                                    max_length_ratio=0)
                             mr.record(hm_metrics)
                             # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）
-                            drc.update(base_age=hm_metrics.get("age/mean", 0),
-                                       policy_drift=0,
-                                       refresh_quality=rb.mean_disagreement())
+                            alpha = drc.update(
+                                base_age=hm_metrics.get("age/mean", 0),
+                                policy_drift=0,
+                                refresh_quality=rb.mean_disagreement())
+                            # G3：α 真实应用——refresh 训练步数 = α/(1-α)·n_base（双池 feeder）。
+                            # cold start：refresh 池不足时 α_actual 收缩（§5.5）。
+                            alpha_act = drc.cold_start_adjust(
+                                alpha, rb.size, max(1, n_phase * scheduler.batch))
+                            n_refresh = int(round(alpha_act / max(1e-6, 1 - alpha_act) * n_phase))
+                            n_refresh = max(0, min(n_refresh, n_phase))  # 不超 base 步数
+                            if n_refresh > 0:
+                                scheduler.metrics = []
+                                done = scheduler.train_refresh_phase(
+                                    rb, alpha_act, n_refresh, step_done, _on_step)
+                                metrics.extend(scheduler.metrics)
+                                step_done += done
+                                logger.info(
+                                    f"[L2] α={alpha:.3f}→实际{alpha_act:.3f}，"
+                                    f"refresh 训练 {done} 步（池 {rb.size}）")
                 else:
                     metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         finally:
@@ -686,7 +735,8 @@ class FullStackOPDv2:
                           rng={"py": torch.get_rng_state(),
                                "cuda": (torch.cuda.get_rng_state()
                                         if torch.cuda.is_available() else None)},
-                          refresh_buffer=(_rb_ref if l2_enabled else None)) \
+                          refresh_buffer=((_rb_ref.state_dict() if _rb_ref is not None else None)
+                                          if l2_enabled else None)) \
             if metrics else None
         logger.info(f"训练完成: {len(metrics)} 步, 总耗时 {timings['total']:.2f}s, 断点 {last_ck or '无'}")
 
