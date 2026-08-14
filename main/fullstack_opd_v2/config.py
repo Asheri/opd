@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .exceptions import ConfigError
 from .pipeline import DEFAULT_CONFIG_V2
@@ -249,6 +249,26 @@ class BaseCfg(_Strict):
     materialized_size: int = 5000
 
 
+class CacheCfg(_Strict):
+    """Stage 1 统一 K 存储架构（解决 50K×8192 cache memory wall）。
+
+    top_k：统一 K（teacher/student/ref 支撑默认同源）。用户指定实验取值范围
+      K∈{32,64,128,256}（磁盘 mmap 驻留下可选）；0 = dense 模式。
+    storage：磁盘 mmap 驻留（本阶段目标，§3）——GPU/RAM 只驻当前 batch 行；
+      "memory" 显式保留原全量驻留路径（直接构造 TensorTeacherCache 的测试不受影响）。
+      dense 模式忽略 storage。
+    """
+    top_k: int = 32
+    storage: Literal["memory", "disk"] = "disk"
+
+    @field_validator("top_k")
+    @classmethod
+    def _topk_allowed(cls, v: int) -> int:
+        if v not in (0, 32, 64, 128, 256):
+            raise ValueError(f"cache.top_k 仅允许 0/32/64/128/256（0=dense），收到 {v}")
+        return v
+
+
 class OPDConfig(_Strict):
     vocab_size: int = 64
     d_model: int = 48
@@ -280,6 +300,7 @@ class OPDConfig(_Strict):
     eval: EvalCfg = Field(default_factory=EvalCfg)
     l2: L2Cfg = Field(default_factory=L2Cfg)
     base: BaseCfg = Field(default_factory=BaseCfg)
+    cache: CacheCfg = Field(default_factory=CacheCfg)
 
 
 # --------------------------- 顶层部署键下渗 ---------------------------

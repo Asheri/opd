@@ -17,10 +17,12 @@ teacher_ref_path: /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-1.5B
 
 dtype: bf16
 cache_mode: topk
-top_k_teacher: 256
-top_k_student: 256
-ref_topk: 256
 offload_to_cpu: true
+# Stage 1：统一 K 存储架构（§1）——磁盘 mmap 驻留；K 实验范围 {32,64,128,256}。
+# top_k 仅允许 0/32/64/128/256（0=dense）。storage=disk：GPU/RAM 只驻当前 batch 行。
+cache:
+  top_k: 32
+  storage: disk
 
 # ---- 数据：Skywork 50K prompt universe（response 由 prepare_skywork_responses.py 预生成）----
 # ⚠️ 规模（50K universe + 5K materialized 静态锚点）由 Stage 0 实测决定（见
@@ -68,7 +70,7 @@ stage2:
   renormalize_topk_support: true  # 对齐原始 Direct-OPD 稀疏支撑归一化
   delta_clip: 2.0                 # ← Δ_T 数值护栏（真实词表 log-ratio 差 ±10 -> PG 爆炸）
   dtype: bf16
-  top_k_student: 256
+  # top_k_student 由 cache.top_k（=32）回落驱动（scheduler.py:97-98），不再写死 256。
   offload_to_cpu: false           # 单卡 batch=8 显存够，learner 不 offload
 
 run:

@@ -226,3 +226,59 @@ def test_l2_cfg_enable_via_override():
     assert cfg["l2"]["m_refresh"] == 4
     assert cfg["l2"]["cache"]["refresh_size"] == 8
     assert cfg["l2"]["cache"]["max_response_length"] == 8
+
+
+# ---- Stage 1 统一 K 存储架构（任务 S1-2：cache.top_k + cache.storage）----
+
+def test_cache_cfg_defaults():
+    """cache 段默认：top_k=32（稀疏下限）、storage=disk（本阶段目标）。"""
+    cfg = load_config()
+    assert cfg["cache"]["top_k"] == 32
+    assert cfg["cache"]["storage"] == "disk"
+
+
+def test_cache_cfg_topk_allowed():
+    """top_k 允许 0（dense）/32/64/128/256（用户指定实验范围）。"""
+    from fullstack_opd_v2.config import load_config
+    for k in (0, 32, 64, 128, 256):
+        assert load_config(overrides=[f"cache.top_k={k}"])["cache"]["top_k"] == k
+
+
+def test_cache_cfg_storage_via_override():
+    """storage 可切回 memory（显式保留原全量驻留路径）。"""
+    cfg = load_config(overrides=["cache.storage=memory"])
+    assert cfg["cache"]["storage"] == "memory"
+
+
+def test_cache_cfg_rejects_bad_topk():
+    """非 0/32/64/128/256 的 K 一律拒绝（固定 K，不做 adaptive K）。"""
+    from fullstack_opd_v2.config import load_config
+    for k in (1, 4, 8, 16, 33):
+        with pytest.raises(ConfigError):
+            load_config(overrides=[f"cache.top_k={k}"])
+
+
+def test_cache_cfg_rejects_bad_storage():
+    """storage 仅 memory/disk。"""
+    from fullstack_opd_v2.config import load_config
+    with pytest.raises(ConfigError):
+        load_config(overrides=["cache.storage=ram"])
+
+
+def test_cache_cfg_unknown_subkey_rejected(tmp_path):
+    """cache 段 extra=forbid：未知子键报错。"""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("cache:\n  top_k: 16\n  bogus: 1\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(path=str(bad))
+
+
+def test_skywork_yaml_uses_cache_topk():
+    """skywork_17b.yaml 应已删 256、用 cache.top_k=32 + stage2 无 top_k_student。"""
+    cfg = load_config(path=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "configs", "skywork_17b.yaml"))
+    assert cfg["cache"]["top_k"] == 32
+    assert cfg["cache"]["storage"] == "disk"
+    # stage2 不再写死 top_k_student=256（yaml 已删，回落 0 → scheduler 用 cache.top_k=32）
+    assert cfg["stage2"]["top_k_student"] == 0

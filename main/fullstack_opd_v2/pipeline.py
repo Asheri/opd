@@ -206,7 +206,11 @@ def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
 
     返回 `(cache, fat_prompts, fat_responses)`。
     """
-    top_k = cfg.get("top_k_teacher", 0) if cfg.get("cache_mode", "dense") == "topk" else 0
+    # Stage 1 统一 K：新口径以 cache.top_k 为准；兼容旧 top_k_teacher（下渗后仍在顶层）。
+    cache_block = cfg.get("cache") or {}
+    top_k = (cache_block.get("top_k")
+             if cfg.get("cache_mode", "dense") == "topk"
+             else 0) or cfg.get("top_k_teacher", 0) or 0
     cache = TensorTeacherCache(cfg.get("enforce_teacher_consistency", True), top_k=top_k)
 
     warmup_M = int(cfg.get("warmup_M", 0) or 0)
@@ -471,7 +475,12 @@ class FullStackOPDv2:
                 anchor_model = build_model(self.cfg, self.device, role="student")
                 logger.info("resume: 断点无 ref 锚点，重建初始 student 重算 KL 锚点（旧断点兼容）")
             anchor_model.eval()
+            # Stage 1 统一 K：ref_topk 显式给出时优先；cache_mode=topk 且未显式给 ref_topk 时
+            # 回落 cache.top_k（与 student 支撑同源）。dense 场景保持 ref_topk=0 → 精确 KL，
+            # 绝不因 cache.top_k 默认值把默认 dense 路径改成稀疏 KL 锚点（回归防护）。
             ref_topk = self.cfg.get("ref_topk", 0)
+            if not ref_topk and self.cfg.get("cache_mode", "dense") == "topk":
+                ref_topk = int((self.cfg.get("cache") or {}).get("top_k") or 0)
             if ref_topk and ref_topk > 0:
                 # 真实词表（V≈152k）：KL 锚点必须【逐 chunk topk】，绝不先 cat 出完整
                 # (N_fat,T,V) dense——N=2000,T=384,V=151936 时 = 233GB 必 OOM（部署实测）。
