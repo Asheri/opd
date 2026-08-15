@@ -774,16 +774,26 @@ class RefreshSelector:
         self.exploration = exploration_fraction
         self.gen = torch.Generator().manual_seed(seed)
 
-    def _value(self) -> torch.Tensor:
-        """§6.3 cheap value：V = λU·U + λD·D + λN·N（可选 compute-aware 除 cost）。"""
+    def _value(self, budget_cost: torch.Tensor | None = None) -> torch.Tensor:
+        """§6.3 cheap value：V = λU·U + λD·D + λN·N（+ λR·R，可选 compute-aware 除 cost）。
+
+        budget_cost: 可选 per-prompt 期望 token 成本（§四 U'(p)=V/(ExpectedTokens+ε)），
+        传入时覆盖 compute-aware 的默认 cost（last_response_length）。
+        "reward" in self.vw 保证旧 config 无 reward 键时零回归（R 恒 0、不加项）。
+        """
         U = self.ps.reward_var                        # uncertainty
         D = self.ps.disagreement_ema
         N = self.ps.novelty()
+        # reward 项：仅当 config 显式给了 reward 权重才纳入（旧 config 零回归）
+        R = self.ps.reward_ema if "reward" in self.vw else torch.zeros_like(U)
         v = (self.vw["uncertainty"] * U + self.vw["disagreement"] * D
              + self.vw["novelty"] * N)
+        if "reward" in self.vw:
+            v = v + self.vw["reward"] * R
         if self.compute_aware:
-            cost = self.ps.last_response_length.float() + 1e-8
-            v = v / cost
+            cost = budget_cost if budget_cost is not None \
+                else self.ps.last_response_length.float()
+            v = v / (cost + 1e-8)
         return v
 
     def select(self, n_selected: int, n_prompts: int) -> torch.Tensor:
@@ -820,3 +830,23 @@ class RefreshSelector:
         while len(filtered) < n_selected:
             filtered.append(torch.randint(0, n_prompts, (1,), generator=self.gen).item())
         return torch.tensor(filtered[:n_selected])
+
+    def select_with_budget(self, n_selected: int, n_prompts: int,
+                           budget_set=(256, 512, 1024, 2048),
+                           quantiles=(0.25, 0.5, 0.75),
+                           fixed_budget: int = 1024,
+                           budget_mode: str = "fixed") -> tuple:
+        """Stage 3：Select(p, B_p)——选 prompt + 分配 reasoning budget。
+
+        复用 self.select()（冷启动/两阶段选择不变，零回归）。
+        budget_mode='fixed' → 全 fixed_budget（单预算，等价旧行为）；
+        'adaptive' → 按选中集内 V 分位数映射到 4 档（assign_budgets）。
+        返回 (indices, budgets) 两个 (M,) long tensor。
+        """
+        indices = self.select(n_selected, n_prompts)
+        if budget_mode == "fixed":
+            budgets = torch.full_like(indices, fixed_budget, dtype=torch.long)
+        else:
+            v_sel = self._value()[indices]
+            budgets = assign_budgets(v_sel, budget_set, quantiles)
+        return indices, budgets

@@ -11,7 +11,8 @@ import torch
 from fullstack_opd_v2.config import load_config
 from fullstack_opd_v2.exceptions import ConfigError
 from fullstack_opd_v2.adaptive_cache import (
-    assign_budgets, enforce_budget, compute_rollout_metrics, group_by_budget)
+    assign_budgets, enforce_budget, compute_rollout_metrics, group_by_budget,
+    PromptStateStore, RefreshSelector)
 
 
 def test_l2_budget_defaults():
@@ -133,3 +134,74 @@ def test_group_by_budget():
     budgets = torch.tensor([256, 1024, 256, 512])
     buckets = group_by_budget(cand, budgets)
     assert buckets == {256: [0, 2], 1024: [1], 512: [3]}
+
+
+# ---- Stage 3：RefreshSelector.select_with_budget + _value 补 reward ----
+
+
+def _make_selector(n_prompts: int, updates: dict) -> PromptStateStore:
+    """构造带历史的 PromptStateStore + 默认 RefreshSelector。
+
+    updates: {prompt_id: (reward, disagreement, resp_len)} 逐 prompt 喂历史。
+    """
+    ps = PromptStateStore(n_prompts)
+    for pid, (reward, disagreement, resp_len) in updates.items():
+        ps.update(pid, reward, disagreement, resp_len, step=1)
+    return ps
+
+
+def test_select_with_budget_fixed():
+    ps = _make_selector(20, {0: (1.0, 0.5, 100), 1: (0.2, 0.1, 50)})
+    sel = RefreshSelector(ps)
+    indices, budgets = sel.select_with_budget(n_selected=8, n_prompts=20)
+    assert indices.shape == (8,)
+    assert budgets.shape == (8,)
+    assert budgets.dtype == torch.long
+    assert (budgets == 1024).all().item()      # fixed 默认单预算 1024
+
+
+def test_select_with_budget_adaptive_4buckets():
+    # 喂足历史，reward/disagreement 差异明显 → 选中集内 V 有分位数区分
+    updates = {i: (float(i) / 19, float(i % 5) / 5, 100 + i * 10) for i in range(20)}
+    ps = _make_selector(20, updates)
+    sel = RefreshSelector(ps)
+    indices, budgets = sel.select_with_budget(
+        n_selected=8, n_prompts=20, budget_mode="adaptive")
+    assert indices.shape == (8,)
+    assert budgets.shape == (8,)
+    assert budgets.dtype == torch.long
+    for b in budgets.tolist():
+        assert b in (256, 512, 1024, 2048)      # 都来自 budget_set
+
+
+def test_select_with_budget_cold_start():
+    # times_seen 全 0 → select() 走 uniform，_value() 全 0（无历史）
+    # → assign_budgets 全等 → 中档 1024 fallback
+    ps = PromptStateStore(n_prompts=20)
+    sel = RefreshSelector(ps)
+    indices, budgets = sel.select_with_budget(
+        n_selected=6, n_prompts=20, budget_mode="adaptive")
+    assert indices.shape == (6,)
+    assert budgets.shape == (6,)
+    assert (budgets == 1024).all().item()       # 全等 v → 中档 1024
+
+
+def test_value_includes_reward():
+    # 构造 reward_ema 差异：高 reward prompt vs 低 reward（其余信号相同）。
+    # 直接设 store 字段，保证 reward_var/disagreement/times_seen 完全一致（否则无 reward
+    # 权重时两 prompt 也会因 uncertainty 差异而不同，无法隔离 reward 项）。
+    ps = PromptStateStore(n_prompts=2)
+    ps.times_seen[:] = 1
+    ps.reward_var[:] = 0.0
+    ps.disagreement_ema[:] = 0.0
+    ps.reward_ema[0] = 0.9      # 高 reward
+    ps.reward_ema[1] = 0.1      # 低 reward
+    # 不含 reward 权重（旧 config）→ 两 prompt 值相同
+    sel_no_r = RefreshSelector(ps)   # 默认无 reward 键
+    v_no_r = sel_no_r._value()
+    assert v_no_r[0].item() == pytest.approx(v_no_r[1].item(), abs=1e-6)
+    # 含 reward 权重 → 高 reward prompt 值更高
+    sel_r = RefreshSelector(ps, value_weights={
+        "uncertainty": 0.4, "disagreement": 0.4, "novelty": 0.2, "reward": 0.5})
+    v_r = sel_r._value()
+    assert v_r[0].item() > v_r[1].item()
