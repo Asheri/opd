@@ -684,6 +684,7 @@ class FullStackOPDv2:
                         alert_cooldown=int(l2_cfg.get("health_monitor", {})
                                            .get("alert_cooldown", 50)))
                     rc = l2_cfg.get("refresh_ratio", {})
+                    sc_tok = l2_cfg.get("selective_rollout", {})
                     drc = DynamicRatioController(
                         initial=rc.get("initial", 0.3), min=rc.get("min", 0.1),
                         max=rc.get("max", 0.6), mode=rc.get("mode", "adaptive"),
@@ -692,7 +693,9 @@ class FullStackOPDv2:
                         quality_weight=rc.get("quality_weight", 0.25),
                         ema_beta=rc.get("ema_beta", 0.9),
                         warmup_steps=rc.get("warmup_steps", 500),
-                        max_step_change=rc.get("max_step_change", 0.05))
+                        max_step_change=rc.get("max_step_change", 0.05),
+                        token_aware=sc_tok.get("token_aware", False),
+                        token_weight=sc_tok.get("token_weight", 0.1))
                     sc = l2_cfg.get("selective_rollout", {})
                     selector = (RefreshSelector(
                         ps, candidate_multiplier=sc.get("candidate_multiplier", 4),
@@ -812,10 +815,10 @@ class FullStackOPDv2:
                                 **(roll_metrics or {}))
                             mr.record(hm_metrics)
                             # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）
-                            # 任务 5：传 rollout_efficiency（expected/actual tokens，§五）。
-                            # drc.update 目前只接收不参与 α（token_aware 第 4 信号在任务 6 接入）。
-                            _eff = (rollout_summary.get("rollout_tokens") / max(
-                                1e-6, rollout_summary.get("expected_rollout_tokens", 1))
+                            # 任务 6：传 rollout_efficiency（expected/actual tokens，§五）。
+                            # >1 省 token → 放宽 α；<1 超用 → 收紧。方向修正（此前写反）。
+                            _eff = (rollout_summary.get("expected_rollout_tokens") / max(
+                                1, rollout_summary.get("rollout_tokens", 1))
                                 if isinstance(rollout_summary, dict) else None)
                             alpha = drc.update(
                                 base_age=hm_metrics.get("age/mean", 0),

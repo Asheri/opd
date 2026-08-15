@@ -12,7 +12,7 @@ from fullstack_opd_v2.config import load_config
 from fullstack_opd_v2.exceptions import ConfigError
 from fullstack_opd_v2.adaptive_cache import (
     assign_budgets, enforce_budget, compute_rollout_metrics, group_by_budget,
-    PromptStateStore, RefreshSelector)
+    PromptStateStore, RefreshSelector, DynamicRatioController)
 
 
 def test_l2_budget_defaults():
@@ -377,3 +377,46 @@ def test_pipeline_s3_e2_adaptive_budget_smoke(tmp_path):
     assert "rollout/rollout_tokens" in headers
     assert "rollout/budget_utilization" in headers
     assert "rollout/useful_per_token" in headers
+
+
+# ---- Stage 3：任务 6 DynamicRatioController token 感知（第 4 信号）----
+
+
+def _drc_past_warmup(token_aware, token_weight=0.1):
+    """构造 adaptive + token_aware 的 controller，并直接推进 _step 越过 warmup。"""
+    c = DynamicRatioController(
+        mode="adaptive", token_aware=token_aware, token_weight=token_weight,
+        warmup_steps=5)
+    c._step = c.warmup + 1   # 绕过 warmup（warmup 内提前 return alpha0，不参与第 4 信号）
+    return c
+
+
+def test_drc_token_aware():
+    """token_aware=True 时 rollout_efficiency 生效：
+    省 token（eff>1，即 expected>actual）→ α 相对 baseline 升高（放宽）；
+    超用（eff<1）→ α 相对 baseline 降低（收紧）。"""
+    base_args = dict(base_age=0.5, policy_drift=0.3, refresh_quality=0.2)
+    # 三个独立 controller，仅 rollout_efficiency 不同（其余信号一致）
+    c_base = _drc_past_warmup(True)
+    c_save = _drc_past_warmup(True)
+    c_over = _drc_past_warmup(True)
+    a_base = c_base.update(rollout_efficiency=None, **base_args)
+    a_save = c_save.update(rollout_efficiency=1.5, **base_args)   # expected>actual，省 token
+    a_over = c_over.update(rollout_efficiency=0.5, **base_args)   # expected<actual，超用
+    assert a_save > a_base     # 省 token → 放宽 α
+    assert a_over < a_base     # 超用 → 收紧 α
+    # 第 4 信号确实被 EMA 记入（避免"只接收不参与"的假回归）
+    assert c_save._ema["efficiency"] > 0
+    assert c_over._ema["efficiency"] < 0
+
+
+def test_drc_token_aware_off():
+    """token_aware=False 时传 rollout_efficiency 与不传的 α 完全一致（零回归断言）。"""
+    base_args = dict(base_age=0.5, policy_drift=0.3, refresh_quality=0.2)
+    c_off_none = _drc_past_warmup(False)
+    c_off_eff = _drc_past_warmup(False)
+    a_none = c_off_none.update(rollout_efficiency=None, **base_args)
+    a_eff = c_off_eff.update(rollout_efficiency=1.5, **base_args)
+    assert a_none == a_eff
+    # 且效率信号未被消费（EMA 保持 0）
+    assert c_off_eff._ema["efficiency"] == 0.0

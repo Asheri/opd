@@ -708,7 +708,8 @@ class DynamicRatioController:
 
     def __init__(self, initial=0.30, min=0.10, max=0.60, mode="adaptive",
                  age_weight=0.25, drift_weight=0.50, quality_weight=0.25,
-                 ema_beta=0.9, warmup_steps=500, max_step_change=0.05):
+                 ema_beta=0.9, warmup_steps=500, max_step_change=0.05,
+                 token_aware=False, token_weight=0.1):
         self.alpha0 = initial
         self.min, self.max = min, max
         self.mode = mode
@@ -716,7 +717,9 @@ class DynamicRatioController:
         self.beta = ema_beta
         self.warmup = warmup_steps
         self.max_step = max_step_change
-        self._ema = dict(age=0.0, drift=0.0, quality=0.0)
+        self.token_aware = token_aware
+        self.token_weight = token_weight
+        self._ema = dict(age=0.0, drift=0.0, quality=0.0, efficiency=0.0)
         self._step = 0
         self._last_alpha = initial
         # linear 模式起止（§5.6）
@@ -749,6 +752,12 @@ class DynamicRatioController:
         q = self._norm("quality", refresh_quality)
         raw = self.alpha0 + self.w["age"] * a_b - self.w["drift"] * d_drift \
             + self.w["quality"] * q
+        # §五 第 4 信号：token 感知（任务 6）。eff = rollout_efficiency - 1（>0 省 token
+        # → 放宽 α；<0 超用 → 收紧）。token_aware=False / rollout_efficiency=None /
+        # 非 adaptive 分支（此处已排除）时完全不参与（零回归）。
+        if self.token_aware and rollout_efficiency is not None:
+            eff = self._norm("efficiency", rollout_efficiency - 1.0)
+            raw += self.token_weight * eff
         raw = max(self.min, min(self.max, raw))
         # max_step_change 限幅（§5.4）
         raw = self._last_alpha + max(-self.max_step, min(self.max_step, raw - self._last_alpha))
