@@ -356,10 +356,17 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     cand = selector.select(m_selected, prompts.size(0)) if selector else \
         torch.randint(0, prompts.size(0), (m_selected,))
     p_b = prompts[cand].to(device)
-    # Stage 2：短 rollout（带 status）。默认 toy 生成器；可注入 vLLM 端。
-    gen = rollout_generator or _default_gen
-    out = gen(student, p_b, max_new=max_resp_len, eos_token_id=eos_token_id,
-              loop_detection=loop_detection, pad_id=pad_id)
+    # Stage 2：短 rollout（带 status）。默认 toy 生成器；可注入 vLLM/HF 端。
+    # ⚠️ 调用约定：注入的 rollout_generator 是【绑定方法】（self 已绑），签名
+    # generate_with_status(prompts, max_new=..., ...)；而 _default_gen 是模块级函数，
+    # 签名 generate_with_status(model, prompts, ...)。两者必须分开调用，否则把 student
+    # 当 self 传入绑定方法会静默错乱（P2 修复：此前 vLLM 注入路径就是此 bug）。
+    if rollout_generator is not None:
+        out = rollout_generator(p_b, max_new=max_resp_len, eos_token_id=eos_token_id,
+                                loop_detection=loop_detection, pad_id=pad_id)
+    else:
+        out = _default_gen(student, p_b, max_new=max_resp_len, eos_token_id=eos_token_id,
+                           loop_detection=loop_detection, pad_id=pad_id)
     responses, statuses, lengths = out["responses"], out["statuses"], out["lengths"]
     # loop/invalid 样本跳过 teacher 前向与 append（需求 4），仍计入 summary
     valid = [i for i in range(len(statuses)) if statuses[i] not in ("loop", "invalid")]

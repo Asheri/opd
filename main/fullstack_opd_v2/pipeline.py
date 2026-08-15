@@ -739,10 +739,19 @@ class FullStackOPDv2:
                             max_new = int(rollcfg.get("max_new_tokens")
                                           or l2c.get("max_response_length", 8192))
                             eos_id = rollcfg.get("eos_token_id")
-                            # 注入 rollout_generator：vLLM 引擎优先，否则 None → toy 默认
-                            # model.generate_with_status（run_refresh_phase 内部回落）。
-                            _rollout_gen = getattr(rollout_engine, "generate_with_status", None) \
-                                if rollout_engine is not None else None
+                            # 注入 rollout_generator（绑定方法，run_refresh_phase 按
+                            # GenerateWithStatus(prompts, max_new=...) 约定调用）：
+                            #   vLLM 引擎优先；真实 HF 学生用 KV-cached 快速路径
+                            #   generate_with_status_kv（152k 词表/长序列下 ~35 tok/s，
+                            #   朴素逐 token 前向慢 1-2 个数量级）；否则 None → run_refresh_phase
+                            #   内部回落 toy 模块级 generate_with_status。
+                            if rollout_engine is not None:
+                                _rollout_gen = getattr(rollout_engine,
+                                                       "generate_with_status", None)
+                            elif hasattr(student, "generate_with_status_kv"):
+                                _rollout_gen = student.generate_with_status_kv
+                            else:
+                                _rollout_gen = None
                             rollout_summary = run_refresh_phase(
                                 student, teacher_rl, teacher_ref, student_ref,
                                 selector, rb, disag, fat_prompts, step_done,

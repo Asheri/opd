@@ -188,9 +188,13 @@ def _make_toy(vocab=8, d_model=8, n_layers=1):
 
 
 def _fake_rollout(responses, statuses, lengths, eos_pos, looped):
-    """注入式 rollout_generator：返回固定合成 dict（不用真实采样，确定性）。"""
-    def gen(student, prompts, max_new, eos_token_id=None,
-            loop_detection=True, pad_id=0):
+    """注入式 rollout_generator：返回固定合成 dict（不用真实采样，确定性）。
+
+    ⚠️ 契约（P2 修复后）：注入的 rollout_generator 是【绑定方法】，签名
+    gen(prompts, max_new, ...)；run_refresh_phase 以 prompts 为第一实参调用，
+    不再把 student 当 self 传入（模块级 generate_with_status 才收 (model, prompts)）。
+    """
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0):
         return {"responses": responses, "statuses": statuses, "lengths": lengths,
                 "eos_pos": eos_pos, "looped": looped}
     return gen
@@ -222,6 +226,37 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
     assert rb.size == 2
     # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
     assert sorted(rb._status) == ["budget_stop", "eos"]
+
+
+def test_run_refresh_phase_injected_gen_called_with_prompts_not_student():
+    """P2 修复：注入式 rollout_generator（绑定方法）以 prompts 为第一实参调用，
+    不得把 student 当 self 传入（否则绑定方法 self 错乱）。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.arange(V * 5).view(V, 5) % V    # 可辨识的 prompt 张量 (V,5)
+    seen = {}
+
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0):
+        seen["first_arg_is_prompts"] = prompts is not None
+        seen["first_arg_shape"] = tuple(prompts.shape)
+        seen["max_new"] = max_new
+        # 全 budget_stop，valid，全部 append
+        n = prompts.size(0)
+        return {"responses": torch.ones(n, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * n,
+                "lengths": [max_new] * n,
+                "eos_pos": [None] * n, "looped": [False] * n}
+
+    m_selected = 3
+    run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag, prompts,
+                      step=1, version=1, m_selected=m_selected, max_resp_len=6,
+                      top_k=3, device="cpu", rollout_generator=gen)
+    # 第一实参必须是 prompts（shape==(m_selected, P)），不是 student
+    assert seen["first_arg_shape"] == (m_selected, prompts.size(1))
+    assert seen["max_new"] == 6
 
 
 def test_refresh_ring_buffer_status_roundtrip():

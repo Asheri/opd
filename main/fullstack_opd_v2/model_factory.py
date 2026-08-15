@@ -149,6 +149,58 @@ class HFCausalLM:
         return {"responses": responses, "statuses": statuses, "lengths": lengths,
                 "eos_pos": eos_pos, "looped": looped}
 
+    @torch.no_grad()
+    def generate_with_status_kv(self, prompts: torch.Tensor, max_new: int,
+                                eos_token_id=None, temperature: float = 1.0,
+                                pad_id: int = 0, loop_detection: bool = True,
+                                loop_periods=(2, 3, 4)) -> dict:
+        """Stage 2 真实 HF 大规模 rollout：KV-cached 快速路径，与 generate_with_status 同构。
+
+        ⚠️ 性能边界：`generate_with_status`（无 KV cache 的逐 token 前向）在真实 152k 词表 +
+        长序列下慢 1-2 个数量级（每 token 重算全前缀）。本方法用 HF `generate` 的 KV cache
+        加速（~35 tok/s），采样后按 `detect_loop`/EOS 后处理，返回与 toy 完全同构的 dict。
+
+        eos_token_id=None → 传 -1 让 HF 永不因 EOS 停（撞 max_new 才停，全 budget_stop，
+        除非 loop），faithful 到协议「预算截断是常态」。末尾 pad_id 去除后再判 loop/EOS。
+        """
+        from .model import detect_loop
+        B = prompts.size(0)
+        device = prompts.device
+        eos = int(eos_token_id) if eos_token_id is not None else -1   # -1 永不匹配
+        out = self.model.generate(
+            prompts, max_new_tokens=int(max_new), do_sample=True,
+            temperature=max(float(temperature), 1e-6), top_p=0.95,
+            pad_token_id=pad_id, eos_token_id=eos)
+        new = out[:, prompts.size(1):]                       # (B, T_实际) 右 pad
+        responses = torch.full((B, int(max_new)), pad_id, dtype=torch.long, device=device)
+        responses[:, :new.size(1)] = new
+        statuses: list[str] = []
+        lengths: list[int] = []
+        eos_pos: list[int | None] = []
+        looped: list[bool] = []
+        for i in range(B):
+            seq = responses[i].tolist()
+            L = int(max_new)
+            while L > 0 and seq[L - 1] == pad_id:            # 去尾部 pad
+                L -= 1
+            ep = None
+            if eos_token_id is not None and eos_token_id in seq[:L]:
+                ep = seq.index(eos_token_id)
+                L = ep + 1
+            loop = loop_detection and detect_loop(
+                torch.tensor(seq[:max(1, L)]), loop_periods)
+            if loop:
+                statuses.append("loop"); looped.append(True)
+            elif L == 0:
+                statuses.append("invalid"); looped.append(False)
+            elif ep is not None:
+                statuses.append("eos"); looped.append(False)
+            else:
+                statuses.append("budget_stop"); looped.append(False)
+            lengths.append(L); eos_pos.append(ep)
+        return {"responses": responses, "statuses": statuses, "lengths": lengths,
+                "eos_pos": eos_pos, "looped": looped}
+
     def response_dists(self, prompts: torch.Tensor, responses: torch.Tensor):
         from .model import response_dists
         return response_dists(self, prompts, responses)

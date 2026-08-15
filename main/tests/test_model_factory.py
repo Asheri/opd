@@ -244,3 +244,55 @@ def test_hf_generate_with_status_loop_detected(monkeypatch):
     out = m.generate_with_status(pr, max_new=9, eos_token_id=None, loop_periods=(3,))
     assert out["statuses"] == ["loop"]
     assert out["looped"] == [True]
+
+
+# --------------------------- Stage 2：KV-cached 快速 rollout（真实 HF 大规模，152k 词表）-------------------
+def _hf_m_with_generate(monkeypatch, gen_out):
+    """构造带 model.generate 的 HFCausalLM（generate_with_status_kv 走 HF generate 路径）。"""
+    import fullstack_opd_v2.model_factory as MF
+    mod = _fake_hf_module(vocab=152)
+    mod.generate = mock.Mock(return_value=gen_out)
+    factory = mock.Mock()
+    factory.from_pretrained.return_value = mod
+    monkeypatch.setattr(MF, "_HF_AutoModelForCausalLM", factory)
+    return HFCausalLM("fake", "cpu")
+
+
+def test_hf_generate_with_status_kv_budget_stop(monkeypatch):
+    """KV 路径 eos=None → HF generate（eos=-1）+ 全 budget_stop，length==max_new。
+
+    HF generate 返回【prompt+生成】拼接（out[:, prompt_len:] 剥 prompt），故合成
+    gen_out 需含 prompt 前缀段。
+    """
+    pr = torch.randint(1, 152, (2, 5))
+    gen = torch.ones(2, 8, dtype=torch.long)                 # 8 个非 pad 生成 token
+    m = _hf_m_with_generate(monkeypatch, torch.cat([pr, gen], dim=1))
+    out = m.generate_with_status_kv(pr, max_new=8, eos_token_id=None, pad_id=0,
+                                    loop_detection=False)    # 全 1 会触发 loop，先关检测
+    args, kw = m.model.generate.call_args
+    assert kw["eos_token_id"] == -1                           # 永不 EOS
+    assert kw["max_new_tokens"] == 8
+    assert out["statuses"] == ["budget_stop", "budget_stop"]
+    assert out["lengths"] == [8, 8]
+    assert out["eos_pos"] == [None, None]
+
+
+def test_hf_generate_with_status_kv_eos(monkeypatch):
+    """KV 路径 eos=0 → 序列含 0 时判 eos，length=eos_pos+1。"""
+    pr = torch.ones(1, 5, dtype=torch.long)
+    gen = torch.tensor([[5, 0, 9, 9]])                        # 生成段 [5, eos=0, pad, pad]
+    m = _hf_m_with_generate(monkeypatch, torch.cat([pr, gen], dim=1))
+    out = m.generate_with_status_kv(pr, max_new=4, eos_token_id=0, pad_id=9)
+    assert out["statuses"] == ["eos"]
+    assert out["lengths"] == [2]
+    assert out["eos_pos"] == [1]
+
+
+def test_hf_generate_with_status_kv_pad_stripped(monkeypatch):
+    """KV 路径 budget 撞满补 pad → 去尾部 pad 再判，不误判 invalid。"""
+    pr = torch.ones(1, 5, dtype=torch.long)
+    gen = torch.tensor([[1, 2, 9, 9]])                        # 尾部 2 个 pad=9
+    m = _hf_m_with_generate(monkeypatch, torch.cat([pr, gen], dim=1))
+    out = m.generate_with_status_kv(pr, max_new=4, eos_token_id=None, pad_id=9,
+                                    loop_detection=False)
+    assert out["statuses"] == ["budget_stop"]
