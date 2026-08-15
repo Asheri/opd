@@ -376,6 +376,14 @@ class FullStackOPDv2:
         # 避免 cache.storage 默认 disk 把默认 dense 配置错误导向磁盘。
         if self.cfg.get("cache_mode", "dense") != "topk":
             storage = "memory"
+        # P-回归修复：stage1_build_cache 收到的是 s1cfg（stage1 子字典），读不到顶层
+        # cache 块的 top_k（S1-4 统一 K 后参数改为 cache:{top_k,storage} 块，old 下渗槽位
+        # top_k_teacher 恒为 0），导致 top_k 恒解析为 0 → 恒走 dense build → 真实词表下
+        # 累积完整 (N,T,V) 两个列表（rl_full/ref_full）→ 80GB OOM。
+        # 把顶层 cache.top_k 注入 s1cfg["top_k_teacher"]（stage1_build_cache 的回落槽位）。
+        if self.cfg.get("cache_mode", "dense") == "topk":
+            s1cfg["top_k_teacher"] = int(
+                cache_block.get("top_k") or s1cfg.get("top_k_teacher") or 0)
         if storage == "disk":
             prebuilt_exists = bool(cache_path and os.path.isfile(f"{cache_path}.metadata.json"))
         else:
@@ -653,7 +661,7 @@ class FullStackOPDv2:
                     from .adaptive_cache import (RefreshRingBuffer, DisagreementComputer,
                                                  CacheHealthMonitor, DynamicRatioController,
                                                  RefreshSelector, PromptStateStore,
-                                                 run_refresh_phase)
+                                                 run_refresh_phase, compute_rollout_metrics)
                     l2c = l2_cfg.get("cache", {})
                     rb = RefreshRingBuffer(
                         capacity=int(l2c.get("refresh_size", 5000)),
@@ -752,6 +760,27 @@ class FullStackOPDv2:
                                 _rollout_gen = student.generate_with_status_kv
                             else:
                                 _rollout_gen = None
+                            # Stage 3：Budget-Aware Selective Rollout 接线（任务 5）。
+                            # 仅当 budget_mode≠fixed 或显式设了 token_budget_per_refresh 才走
+                            # per-sample budget 分桶；默认（budget_mode=fixed 且无 token_budget）
+                            # → budgets=None 走原单预算路径，保证 Stage 2 零回归（任务 8 断言）。
+                            use_budget = (sc.get("budget_mode", "fixed") != "fixed"
+                                          or rollcfg.get("token_budget_per_refresh") is not None)
+                            indices = budgets = None
+                            budget_t = rollcfg.get("token_budget_per_refresh")
+                            if use_budget:
+                                _m_sel = int(l2_cfg.get("m_refresh", 1000))
+                                if sc.get("budget_mode", "fixed") == "adaptive":
+                                    indices, budgets = selector.select_with_budget(
+                                        _m_sel, fat_prompts.size(0),
+                                        budget_mode="adaptive",
+                                        budget_set=sc.get("budget_set"),
+                                        quantiles=sc.get("budget_quantiles"))
+                                else:   # fixed 但显式设了 token_budget → 单档 fixed_budget
+                                    indices, budgets = selector.select_with_budget(
+                                        _m_sel, fat_prompts.size(0),
+                                        budget_mode="fixed",
+                                        fixed_budget=sc.get("fixed_budget", 1024))
                             rollout_summary = run_refresh_phase(
                                 student, teacher_rl, teacher_ref, student_ref,
                                 selector, rb, disag, fat_prompts, step_done,
@@ -761,22 +790,38 @@ class FullStackOPDv2:
                                 cache.top_k, self.device, prompt_state=ps,
                                 rollout_generator=_rollout_gen,
                                 eos_token_id=eos_id,
-                                loop_detection=rollcfg.get("loop_detection", True))
+                                loop_detection=rollcfg.get("loop_detection", True),
+                                cand=indices, budgets=budgets, budget_t=budget_t)
                             # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
+                            roll_metrics = None
                             if isinstance(rollout_summary, dict):
                                 mr.record({f"rollout/{k}": v
                                            for k, v in rollout_summary.items()})
+                                # Stage 3：token 效率指标（键已带 rollout/ 前缀）落盘 mr。
+                                roll_metrics = compute_rollout_metrics(
+                                    rollout_summary, budgets, budget_t)
+                                mr.record(roll_metrics)
                             last_refresh = base_done
-                            # Health Monitor 观测（Observe-only，不改训练）
-                            hm_metrics = hm.record(step_done, hit_rate=1.0,
-                                                   refresh_age_p95=0, reuse_p95=0,
-                                                   max_length_ratio=0)
+                            # Health Monitor 观测（Observe-only，不改训练）。
+                            # hm.record 只按 4 个已知键（hit_rate/refresh_age_p95/reuse_p95/
+                            # max_length_ratio）做分类，其余 kwargs 原样透传，故把 rollout/ 键
+                            # 并入 hm.record 顶层安全、不破坏既有分类逻辑（任务 5 谨慎要求）。
+                            hm_metrics = hm.record(
+                                step_done, hit_rate=1.0,
+                                refresh_age_p95=0, reuse_p95=0, max_length_ratio=0,
+                                **(roll_metrics or {}))
                             mr.record(hm_metrics)
                             # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）
+                            # 任务 5：传 rollout_efficiency（expected/actual tokens，§五）。
+                            # drc.update 目前只接收不参与 α（token_aware 第 4 信号在任务 6 接入）。
+                            _eff = (rollout_summary.get("rollout_tokens") / max(
+                                1e-6, rollout_summary.get("expected_rollout_tokens", 1))
+                                if isinstance(rollout_summary, dict) else None)
                             alpha = drc.update(
                                 base_age=hm_metrics.get("age/mean", 0),
                                 policy_drift=0,
-                                refresh_quality=rb.mean_disagreement())
+                                refresh_quality=rb.mean_disagreement(),
+                                rollout_efficiency=_eff)
                             # G3：α 真实应用——refresh 训练步数 = α/(1-α)·n_base（双池 feeder）。
                             # cold start：refresh 池不足时 α_actual 收缩（§5.5）。
                             alpha_act = drc.cold_start_adjust(

@@ -479,7 +479,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       budgets=None,                # Stage 3：per-sample budget (M,) long；None→单预算
                       budget_t=None,               # Stage 3：全局 token 预算；None→无上限
                       budget_set=(256, 512, 1024, 2048),
-                      exploration_fraction=0.20):
+                      exploration_fraction=0.20,
+                      cand=None):                  # Stage 3：预选 prompt 索引 (M,)；None→内部 select
     """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 短 rollout（带 status）
     -> 4 个 chosen logp -> D_i^abs -> append_refresh。teacher 前向在此（_train_step 不动）。
 
@@ -500,8 +501,11 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     from .model import generate_with_status as _default_gen
     _max_seq = int(getattr(student, "max_len", max_resp_len))
     max_resp_len = min(int(max_resp_len), max(1, _max_seq - prompts.size(1)))
-    cand = selector.select(m_selected, prompts.size(0)) if selector else \
-        torch.randint(0, prompts.size(0), (m_selected,))
+    # Stage 3：cand 可由外部传入（select_with_budget 的 indices，与 budgets 配对），
+    # 保证预算桶与选中 prompt 一一对应；None → 内部 select（零回归，单预算路径）。
+    if cand is None:
+        cand = selector.select(m_selected, prompts.size(0)) if selector else \
+            torch.randint(0, prompts.size(0), (m_selected,))
     # Stage 2：短 rollout（带 status）。默认 toy 生成器；可注入 vLLM/HF 端。
     # ⚠️ 调用约定：注入的 rollout_generator 是【绑定方法】（self 已绑），签名
     # generate_with_status(prompts, max_new=..., ...)；而 _default_gen 是模块级函数，
@@ -723,8 +727,13 @@ class DynamicRatioController:
         self._ema[key] = self.beta * self._ema[key] + (1 - self.beta) * x
         return self._ema[key] / (1 + abs(self._ema[key]))
 
-    def update(self, base_age, policy_drift, refresh_quality) -> float:
-        """推进一步，返回本轮 α（三信号 or 按模式降级）。"""
+    def update(self, base_age, policy_drift, refresh_quality,
+               rollout_efficiency=None) -> float:
+        """推进一步，返回本轮 α（三信号 or 按模式降级）。
+
+        rollout_efficiency: 可选 rollout token 效率（expected/actual，§五）。任务 5 只
+        接收该参数、尚不参与 α（token_aware 第 4 信号接入留给任务 6）；None 默认零回归。
+        """
         self._step += 1
         if self.mode == "fixed":
             return self.alpha0

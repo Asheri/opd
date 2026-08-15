@@ -286,3 +286,94 @@ def test_run_refresh_phase_no_budget_regression():
     assert summary["rollout_tokens"] == 6 * m_selected
     assert summary["expected_rollout_tokens"] == 6 * m_selected
     assert summary["budgets_used"] == 6 * m_selected
+
+
+# ---- Stage 3：任务 5 pipeline 接线 smoke（adaptive 全链路：select_with_budget
+#      → cand/budgets/budget_t 传入 run_refresh_phase → compute_rollout_metrics）----
+
+
+def test_pipeline_adaptive_budget_smoke():
+    """adaptive budget_mode + token_budget_per_refresh 端到端：cand/budgets 配对、
+    per-sample 分桶生成、token 指标产生并（7 键）可落盘。"""
+    torch.manual_seed(0)
+    V = 8
+    # max_len 需 ≥ prompt(5)+max budget(2048)，否则 teacher 前向越界
+    stu, t_rl, t_ref, s_ref = (_toy(V, max_len=4096),) * 4
+    rb = RefreshRingBuffer(capacity=16, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    n_prompts, m = 12, 6
+    prompts = torch.randint(0, V, (n_prompts, 5))
+    # 喂差异历史使选中集内 V 有分位数区分 → 4 档 budget 都出现
+    ps = PromptStateStore(n_prompts)
+    for i in range(n_prompts):
+        ps.update(i, reward=float(i) / (n_prompts - 1), disagreement=float(i % 4) / 4,
+                  resp_len=100 + i * 50, step=1)
+    sel = RefreshSelector(ps)
+    # 模拟 pipeline 接线：adaptive 预算 + 全局 token 预算。
+    # budget_t 取大值避免触发 enforce_budget 降档（降档逻辑已由 test_enforce_budget_*
+    # 覆盖），此处专注验证 cand/budgets 配对的 adaptive 全链路接线。
+    budget_set = (256, 512, 1024, 2048)
+    budget_t = 1 << 30
+    indices, budgets = sel.select_with_budget(
+        m, n_prompts, budget_mode="adaptive", budget_set=budget_set,
+        quantiles=(0.25, 0.5, 0.75))
+    assert indices.shape == (m,)
+    assert budgets.shape == (m,)
+    log = []
+    gen = _recording_gen(log)
+    # cand=indices：与 budgets 配对（改动 A），不再内部二次 select
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, sel, rb, disag, prompts,
+                                step=1, version=1, m_selected=m,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen,
+                                cand=indices, budgets=budgets, budget_t=budget_t)
+    # summary 带 token 指标
+    assert summary["rollout_tokens"] > 0
+    assert summary["expected_rollout_tokens"] == summary["budgets_used"]
+    assert summary["rollout_tokens"] == summary["budgets_used"]
+    # per-sample budget 分桶生效：gen 调用次数 = 选中集内不同 budget 档数
+    assert sorted(set(log)) == sorted(set(budgets.tolist()))
+    # token 效率指标：7 键 + useful_per_token 合法 float
+    rm = compute_rollout_metrics(summary, budgets, budget_t)
+    assert len(rm) == 7
+    assert all(k.startswith("rollout/") for k in rm)
+    assert isinstance(rm["rollout/useful_per_token"], float)
+    assert rm["rollout/rollout_tokens"] == summary["rollout_tokens"]
+    assert rm["rollout/budget_utilization"] >= 0.0
+
+
+# ---- Stage 3：任务 5 S3_E2 FullStackOPDv2 全链路 smoke（selector 构造 →
+#      run_refresh_phase(cand/budgets/budget_t) → compute_rollout_metrics →
+#      hm.record 并入 rollout/ 键 → drc.update 传 rollout_efficiency）----
+
+from fullstack_opd_v2.config import load_config
+from fullstack_opd_v2.pipeline import FullStackOPDv2
+import csv as _csv
+
+
+def _read_csv_headers(csv_path):
+    with open(csv_path, encoding="utf-8") as f:
+        return next(_csv.reader(f))
+
+
+def test_pipeline_s3_e2_adaptive_budget_smoke(tmp_path):
+    """S3_E2：FullStackOPDv2 adaptive 预算全链路不崩 + rollout/* token 指标落盘。
+
+    toy 模型 max_len=64，budget 必须 ≤ 剩余上下文（否则 generate_with_status 的
+    ctx=prompt+已生成 越界位置编码）。故用 toy 友好 budget_set=(4,8,12,16)，
+    预算语义链路（select_with_budget 分位数 → 分桶 → 记账）不变，仅值域压到 toy 内存。
+    """
+    cfg = load_config(overrides=[
+        "l2.enabled=true", "l2.t_train=3", "stage2.n_steps=6",
+        "stage2.batch_size=4", "l2.m_refresh=4",
+        "l2.cache.refresh_size=8", "l2.cache.max_response_length=4"])
+    sr = cfg["l2"]["selective_rollout"]
+    sr["budget_mode"] = "adaptive"
+    sr["budget_set"] = (4, 8, 12, 16)          # toy max_len=64 内，防位置编码越界
+    cfg["l2"]["rollout"]["token_budget_per_refresh"] = 100   # 有限全局预算（不触发降档）
+    out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
+    # 全链路不崩 + token 指标落盘（rollout/rollout_tokens 等，compute_rollout_metrics 产出）
+    headers = _read_csv_headers(out["metrics_csv"])
+    assert "rollout/rollout_tokens" in headers
+    assert "rollout/budget_utilization" in headers
+    assert "rollout/useful_per_token" in headers
