@@ -26,10 +26,11 @@ def test_refresh_phase_produces_disagreement():
     rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
     disag = DisagreementComputer()
     prompts = torch.randint(0, V, (4, 5))
-    n = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
-                          prompts, step=1, version=1, m_selected=4,
-                          max_resp_len=6, top_k=3, device="cpu")
-    assert n == 4
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=4,
+                                max_resp_len=6, top_k=3, device="cpu")
+    assert summary["n_total"] == 4
+    assert summary["n_appended"] == 4
     assert rb.size == 4
     # D_i^abs 为绝对值聚合，必非负
     assert all(d >= 0.0 for d in rb._disagreements)

@@ -175,3 +175,97 @@ def test_parse_vllm_outputs_loop_disabled():
     r = parse_vllm_outputs(outs, max_new=16, eos_token_id=None,
                            loop_detection=False)
     assert r["statuses"] == ["budget_stop"]          # 关闭 loop 检测 → 不判 loop
+
+
+# --------------------------- 任务4：run_refresh_phase 短 rollout + ring buffer status ---------------------------
+from fullstack_opd_v2.adaptive_cache import (
+    RefreshRingBuffer, DisagreementComputer, run_refresh_phase)
+from fullstack_opd_v2.model import CausalToyLM
+
+
+def _make_toy(vocab=8, d_model=8, n_layers=1):
+    return CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers)
+
+
+def _fake_rollout(responses, statuses, lengths, eos_pos, looped):
+    """注入式 rollout_generator：返回固定合成 dict（不用真实采样，确定性）。"""
+    def gen(student, prompts, max_new, eos_token_id=None,
+            loop_detection=True, pad_id=0):
+        return {"responses": responses, "statuses": statuses, "lengths": lengths,
+                "eos_pos": eos_pos, "looped": looped}
+    return gen
+
+
+def test_run_refresh_phase_inject_generator_and_status_roundtrip():
+    """注入固定 rolloll rollout_generator → summary 计数正确 + ring buffer 存 status。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (4, 5))
+    n = 4
+    # 4 样本：0=eos, 1=budget_stop, 2=loop, 3=invalid
+    resp = torch.randint(1, V, (n, 6))
+    statuses = ["eos", "budget_stop", "loop", "invalid"]
+    lengths = [3, 6, 6, 0]
+    eos_pos = [2, None, None, None]
+    looped = [False, False, True, False]
+    gen = _fake_rollout(resp, statuses, lengths, eos_pos, looped)
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen)
+    # summary：loop/invalid 跳过 append，只 2 个进池
+    assert summary == {"n_total": 4, "n_appended": 2, "n_eos": 1,
+                       "n_budget": 1, "n_loop": 1, "n_invalid": 1}
+    assert rb.size == 2
+    # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
+    assert sorted(rb._status) == ["budget_stop", "eos"]
+
+
+def test_refresh_ring_buffer_status_roundtrip():
+    """append 带 status → state_dict/load_state_dict 往返保留 status。"""
+    V = 8
+    rb = RefreshRingBuffer(capacity=4, top_k=3, vocab=V)
+    rb.append(torch.zeros(3, 3, dtype=torch.long), torch.zeros(3, 3),
+              generation_step=1, response_length=3,
+              token_mask=torch.ones(3, dtype=torch.long),
+              disagreement_abs=0.5, prompt_idx=0,
+              response=torch.zeros(3, dtype=torch.long),
+              s_old_ids=torch.zeros(3, 3, dtype=torch.long),
+              s_old_logp=torch.zeros(3, 3), status="eos")
+    rb.append(torch.zeros(3, 3, dtype=torch.long), torch.zeros(3, 3),
+              generation_step=2, response_length=3,
+              token_mask=torch.ones(3, dtype=torch.long),
+              disagreement_abs=0.6, prompt_idx=1,
+              response=torch.ones(3, dtype=torch.long),
+              s_old_ids=torch.zeros(3, 3, dtype=torch.long),
+              s_old_logp=torch.zeros(3, 3), status="budget_stop")
+    sd = rb.state_dict()
+    rb2 = RefreshRingBuffer(capacity=4, top_k=3, vocab=V)
+    rb2.load_state_dict(sd)
+    assert rb2._status == ["eos", "budget_stop"]
+    # get() 也带 status
+    g = rb2.get(torch.tensor([0, 1]))
+    assert g["status"] == ["eos", "budget_stop"]
+
+
+def test_run_refresh_phase_all_loop_no_append():
+    """全部 loop → 无样本进池，summary 计数正确（teacher 前向不触发）。"""
+    torch.manual_seed(1)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    n = 2
+    resp = torch.randint(1, V, (n, 6))
+    gen = _fake_rollout(resp, ["loop", "loop"], [6, 6], [None, None], [True, True])
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen)
+    assert summary == {"n_total": 2, "n_appended": 0, "n_eos": 0,
+                       "n_budget": 0, "n_loop": 2, "n_invalid": 0}
+    assert rb.size == 0

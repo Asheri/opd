@@ -11,7 +11,9 @@
 本文件当前实现（任务 2.1-2.3 + 3.1 + 4.1 + 5.1）：
 - `RefreshRingBuffer`：L2 refresh pool 动态 ring buffer（§2 双池结构；run_refresh_phase 依赖 append）。
 - `DisagreementComputer`：§3 Teacher-Student Disagreement（rollout 阶段计算，_train_step 保持 teacher-free）。
-- `run_refresh_phase` / `_build_mask`：§3.3 + §6.5 rollout 相位编排（student 生成 -> 4 logp -> D_i^abs -> append）。
+- `run_refresh_phase`：§3.3 + §6.5 rollout 相位编排（student 短 rollout -> 4 logp -> D_i^abs -> append）。
+  Stage 2：短预算（默认 generate_with_status，可注入 vLLM）+ loop/invalid 跳过 + 长度式 mask
+  （build_length_mask，取代原 _build_mask 的 pad 扫描）。
 - `CacheHealthMonitor`：§4 七维监控 + rule-based health score + alert cooldown（Observe-only，不自动改训练）。
 - `DynamicRatioController`：§5 三信号 controller α（EMA + max_step_change + cold start + fixed/linear/adaptive）。
 - `PromptStateStore`：§6.1 per-prompt 轻量历史状态（times_seen/reward_ema/disagreement_ema/resp_len）。
@@ -63,6 +65,7 @@ class RefreshRingBuffer:
         self._protected: list[bool] = []            # 价值保护标记
         self._prompt_idx: list[int] = []            # fat_prompts 索引（定位 prompt）
         self._response: list[torch.Tensor] = []     # (T,) 生成 response
+        self._status: list[str] = []                # Stage 2：rollout status（eos/budget_stop）
         self._write_pos = 0     # 环形写指针
         self.size = 0           # 当前有效样本数
 
@@ -95,9 +98,11 @@ class RefreshRingBuffer:
                generation_step: int, response_length: int,
                token_mask: torch.Tensor, disagreement_abs: float,
                prompt_idx: int, response: torch.Tensor,
-               s_old_ids: torch.Tensor, s_old_logp: torch.Tensor) -> int:
+               s_old_ids: torch.Tensor, s_old_logp: torch.Tensor,
+               status: str = "budget_stop") -> int:
         """append 一条样本（ids/delta_k/s_old_ids/s_old_logp: (T,K)）。满则 FIFO 淘汰。
 
+        status：Stage 2 rollout 状态（eos/budget_stop），默认 budget_stop 兼容旧调用。
         返回写入的槽位 pos（供 run_refresh_phase 估计 reward）。
         """
         T = ids.size(0)
@@ -125,6 +130,7 @@ class RefreshRingBuffer:
             self._protected[pos] = False
             self._prompt_idx[pos] = prompt_idx
             self._response[pos] = response
+            self._status[pos] = status
         else:
             self._gen_steps.append(generation_step)
             self._resp_lens.append(response_length)
@@ -133,6 +139,7 @@ class RefreshRingBuffer:
             self._protected.append(False)
             self._prompt_idx.append(prompt_idx)
             self._response.append(response)
+            self._status.append(status)
         # 价值保护：高于分位的样本标记
         if disagreement_abs > self._value_threshold():
             self._protected[pos] = True
@@ -170,6 +177,7 @@ class RefreshRingBuffer:
             "disagreements": [self._disagreements[i] for i in il],
             "prompt_idx": torch.tensor([self._prompt_idx[i] for i in il], dtype=torch.long),
             "responses": torch.stack([self._response[i] for i in il]),
+            "status": [self._status[i] for i in il],
         }
 
     def sample(self, n: int, generator: torch.Generator) -> torch.Tensor:
@@ -247,6 +255,7 @@ class RefreshRingBuffer:
             "protected": self._protected[:self.size],
             "prompt_idx": self._prompt_idx[:self.size],
             "responses": [r.detach().cpu() for r in self._response[:self.size]],
+            "status": self._status[:self.size],
         }
 
     def load_state_dict(self, sd: dict):
@@ -268,6 +277,7 @@ class RefreshRingBuffer:
         self._protected = list(sd["protected"][:self.size])
         self._prompt_idx = list(sd["prompt_idx"][:self.size])
         self._response = list(sd["responses"][:self.size])
+        self._status = list(sd.get("status", ["budget_stop"] * self.size)[:self.size])  # 兼容旧断点
 
     def mean_disagreement(self) -> float:
         """池内平均 disagreement（§5 刷新质量信号 / §4 监控）。"""
@@ -318,68 +328,85 @@ class DisagreementComputer:
 def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       selector, ring_buffer, disag, prompts, step, version,
                       m_selected, max_resp_len, top_k, device,
-                      prompt_state=None):
-    """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 生成
+                      prompt_state=None,
+                      rollout_generator=None,      # Stage 2：短 rollout 生成器
+                      eos_token_id=None,           # Stage 2：None=不判 EOS（全 budget_stop）
+                      loop_detection=True,         # Stage 2：周期重复判 loop
+                      pad_id=0):
+    """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 短 rollout（带 status）
     -> 4 个 chosen logp -> D_i^abs -> append_refresh。teacher 前向在此（_train_step 不动）。
 
-    返回 refresh 样本数。除了标量块控，还存行为策略 s_old（学生生成时完整分布 top-K，
-    供后续 refresh 训练 PG 用——G1 闭环）与 prompt_idx/response（G2 PromptState 闭环）。
+    Stage 2：改用 generate_with_status（默认 model.generate_with_status，可经
+    rollout_generator 注入 vLLM 端）。每 rollout 记录 status（eos/budget_stop/loop/invalid）；
+    loop/invalid 样本跳过 teacher 前向与 append（不进 refresh cache，§短 rollout），
+    仍计入返回 summary。响应按有效长度构建长度式 mask（m_t=1 当 t<length）。
+
+    返回 summary dict：{n_total, n_appended, n_eos, n_budget, n_loop, n_invalid}。
+    除标量块控，还存行为策略 s_old（学生生成时完整分布 top-K，G1 闭环）与
+    prompt_idx/response（G2 PromptState 闭环）。
 
     G9：max_resp_len 是【新增】token 数，超出位置编码最大长度会越界（toy max_len=64 vs
     默认 8192）。总序列长 = prompt_len + max_resp_len 必须 ≤ max_len，故 clamp 到
     (max_len - prompt_len)，保证 CPU smoke 与 GPU 长序列都安全。
     """
-    from .model import generate_batch, token_logprobs, response_dists
+    from .model import token_logprobs, response_dists, build_length_mask
+    from .model import generate_with_status as _default_gen
     _max_seq = int(getattr(student, "max_len", max_resp_len))
     max_resp_len = min(int(max_resp_len), max(1, _max_seq - prompts.size(1)))
     cand = selector.select(m_selected, prompts.size(0)) if selector else \
         torch.randint(0, prompts.size(0), (m_selected,))
     p_b = prompts[cand].to(device)
-    responses = generate_batch(student, p_b, max_new=max_resp_len)
+    # Stage 2：短 rollout（带 status）。默认 toy 生成器；可注入 vLLM 端。
+    gen = rollout_generator or _default_gen
+    out = gen(student, p_b, max_new=max_resp_len, eos_token_id=eos_token_id,
+              loop_detection=loop_detection, pad_id=pad_id)
+    responses, statuses, lengths = out["responses"], out["statuses"], out["lengths"]
+    # loop/invalid 样本跳过 teacher 前向与 append（需求 4），仍计入 summary
+    valid = [i for i in range(len(statuses)) if statuses[i] not in ("loop", "invalid")]
+    n_loop = statuses.count("loop"); n_invalid = statuses.count("invalid")
+    n_eos = statuses.count("eos"); n_budget = statuses.count("budget_stop")
+    if not valid:
+        return {"n_total": len(statuses), "n_appended": 0, "n_eos": n_eos,
+                "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid}
+    p_b_v = p_b[valid]
+    resp_v = responses[valid]
     # 行为策略：生成完立即取当前 student 完整分布 top-K（s_old，精确行为策略 §2）。
     # 同一相位内 student 权重未变，因此 refresh 训练第一步 ratio≈1（纯 on-policy）。
     with torch.no_grad():
-        s_full = response_dists(student, p_b, responses)          # (M,T,V)
+        s_full = response_dists(student, p_b_v, resp_v)          # (M,T,V)
     Ks = ring_buffer.student_top_k
     s_old_ids = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).indices
     s_old_logp = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).values
-    student_logp = token_logprobs(student, p_b, responses)        # (M,T) chosen
+    student_logp = token_logprobs(student, p_b_v, resp_v)        # (M,T) chosen
     with torch.no_grad():
         student_ref.eval()
-        ref_logp = token_logprobs(student_ref, p_b, responses)
-        rl_dist = response_dists(teacher_rl, p_b, responses)      # (M,T,V)
-        ref_dist = response_dists(teacher_ref, p_b, responses)
-        rl_chosen = disag.gather_chosen_logp(rl_dist, responses)
-        ref_chosen = disag.gather_chosen_logp(ref_dist, responses)
+        ref_logp = token_logprobs(student_ref, p_b_v, resp_v)
+        rl_dist = response_dists(teacher_rl, p_b_v, resp_v)      # (M,T,V)
+        ref_dist = response_dists(teacher_ref, p_b_v, resp_v)
+        rl_chosen = disag.gather_chosen_logp(rl_dist, resp_v)
+        ref_chosen = disag.gather_chosen_logp(ref_dist, resp_v)
         tk = rl_dist.topk(top_k, dim=-1)
         ids_k, rl_k = tk.indices, tk.values
         delta_k = rl_k - ref_dist.gather(-1, tk.indices)
-    mask = _build_mask(responses)    # EOS 之后 padding=0（§3.4）
+    # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）
+    mask = build_length_mask(resp_v, [lengths[i] for i in valid],
+                             [out["eos_pos"][i] for i in valid])
     D = disag.compute(rl_chosen, ref_chosen, student_logp, ref_logp, mask)
-    for i in range(responses.size(0)):
-        pos = ring_buffer.append(ids_k[i], delta_k[i], generation_step=step,
-            response_length=int(mask[i].sum()), token_mask=mask[i],
-            disagreement_abs=float(D["abs"][i].detach()),
-            prompt_idx=int(cand[i]), response=responses[i],
-            s_old_ids=s_old_ids[i], s_old_logp=s_old_logp[i])
+    for j, i in enumerate(valid):
+        pos = ring_buffer.append(ids_k[j], delta_k[j], generation_step=step,
+            response_length=int(mask[j].sum()), token_mask=mask[j],
+            disagreement_abs=float(D["abs"][j].detach()),
+            prompt_idx=int(cand[i]), response=resp_v[j],
+            s_old_ids=s_old_ids[j], s_old_logp=s_old_logp[j],
+            status=statuses[i])
         # G2：写回 PromptState（rollout 结果 -> prompt 历史 -> 下次 selection 闭环）。
         if prompt_state is not None:
             rew = ring_buffer.reward_estimate(pos)
             prompt_state.update(int(cand[i]), reward=rew,
-                                disagreement=float(D["abs"][i].detach()),
-                                resp_len=int(mask[i].sum()), step=step)
-    return responses.size(0)
-
-
-def _build_mask(responses, pad_id=0):
-    """§3.4：EOS 计入（mask=1），其后的 padding 不计入（mask=0）。
-    toy 等长时全 1；真实变长按 pad_token_id 判定（首个 pad 之后置 0）。"""
-    # 简化：找到每行首个 pad，其后置 0（真实场景用 tokenizer.pad_token_id）
-    is_pad = (responses == pad_id)
-    # 首个 pad 之后全 pad
-    cum = is_pad.cumsum(dim=1)
-    mask = (cum <= 1) | (~is_pad)   # 首个 pad 位置仍算有效（EOS 场景需按实际 EOS id）
-    return mask.long()
+                                disagreement=float(D["abs"][j].detach()),
+                                resp_len=int(mask[j].sum()), step=step)
+    return {"n_total": len(statuses), "n_appended": len(valid), "n_eos": n_eos,
+            "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid}
 
 
 class CacheHealthMonitor:
