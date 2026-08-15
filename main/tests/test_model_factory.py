@@ -4,7 +4,7 @@ import unittest.mock as mock
 import pytest
 import torch
 
-from fullstack_opd_v2.model import CausalToyLM
+from fullstack_opd_v2.model import CausalToyLM, build_length_mask
 from fullstack_opd_v2.model_factory import build_model, HFCausalLM
 from fullstack_opd_v2.exceptions import ModelError
 
@@ -187,3 +187,60 @@ def test_hf_generate_batch_delegates(monkeypatch):
     assert args[0] is prompts
     assert kw["max_new_tokens"] == 3
     assert kw["do_sample"] is True
+
+
+# --------------------------- Stage 2：HFCausalLM.generate_with_status（真实 HF rollout 解阻塞）------------------
+def _hf_m(monkeypatch):
+    """构造 HFCausalLM（fake HF 模块，active 前向，generate_with_status 可跑）。"""
+    import fullstack_opd_v2.model_factory as MF
+    mod = _fake_hf_module(vocab=152)
+    factory = mock.Mock()
+    factory.from_pretrained.return_value = mod
+    monkeypatch.setattr(MF, "_HF_AutoModelForCausalLM", factory)
+    return HFCausalLM("fake", "cpu")
+
+
+def test_hf_generate_with_status_no_eos_all_budget(monkeypatch):
+    """eos_token_id=None → 永不判 EOS，全 budget_stop，mask 全有效。"""
+    m = _hf_m(monkeypatch)
+    pr = torch.randint(0, 152, (2, 5))
+    out = m.generate_with_status(pr, max_new=8, eos_token_id=None)
+    assert out["statuses"] == ["budget_stop", "budget_stop"]
+    assert out["lengths"] == [8, 8]
+    assert out["eos_pos"] == [None, None]
+    assert out["looped"] == [False, False]
+    mask = build_length_mask(out["responses"], out["lengths"], out["eos_pos"])
+    assert mask.size() == (2, 8)
+    assert mask.sum(1).tolist() == [8, 8]
+
+
+def test_hf_generate_with_status_eos_stops(monkeypatch):
+    """首步采到 eos=0 → 提前停，length=eos_pos+1，mask eos 后全 0。"""
+    import torch as _t
+    m = _hf_m(monkeypatch)
+    pr = torch.randint(0, 152, (1, 5))
+    calls = {"n": 0}
+    def fake_multinomial(probs, num_samples=1):
+        calls["n"] += 1
+        return _t.tensor([[0]]) if calls["n"] == 1 else _t.tensor([[1]])
+    monkeypatch.setattr(_t, "multinomial", fake_multinomial)
+    out = m.generate_with_status(pr, max_new=8, eos_token_id=0)
+    assert out["statuses"] == ["eos"]
+    assert out["lengths"] == [1]
+    assert out["eos_pos"] == [0]
+    mask = build_length_mask(out["responses"], out["lengths"], out["eos_pos"])
+    assert mask.sum(1).tolist() == [1]
+
+
+def test_hf_generate_with_status_loop_detected(monkeypatch):
+    """周期 3 重复尾部 → 判 loop，looped=True。"""
+    import torch as _t
+    m = _hf_m(monkeypatch)
+    pr = torch.randint(0, 152, (1, 5))
+    seq = [1, 2, 3, 1, 2, 3, 1, 2, 3]
+    it = iter(seq)
+    monkeypatch.setattr(_t, "multinomial",
+                        lambda probs, num_samples=1: _t.tensor([[next(it)]]))
+    out = m.generate_with_status(pr, max_new=9, eos_token_id=None, loop_periods=(3,))
+    assert out["statuses"] == ["loop"]
+    assert out["looped"] == [True]

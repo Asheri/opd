@@ -92,6 +92,63 @@ class HFCausalLM:
             top_p=0.95)
         return out[:, prompts.size(1):]
 
+    @torch.no_grad()
+    def generate_with_status(self, prompts: torch.Tensor, max_new: int,
+                             eos_token_id=None, temperature: float = 1.0,
+                             pad_id: int = 0, loop_detection: bool = True,
+                             loop_periods=(2, 3, 4)) -> dict:
+        """Stage 2：HF 短预算 rollout，与 model.generate_with_status 返回同构 dict。
+
+        ⚠️ 骨架边界：无 KV cache，逐 token 前向 O(T²) —— 校准/小批量验证用；真实大规模
+        rollout 应走 vLLM（rollout_engine='vllm'，瓶颈在 vLLM 端）。语义与 toy/vLLM 端
+        完全对齐：eos_token_id=None → 永不判 EOS（全 budget_stop，除非 loop）；loop/invalid
+        判定优先级 loop > invalid > eos > budget_stop。pad_id 只填变长空白，不参与判定。
+        """
+        from .model import detect_loop, build_length_mask as _blm
+        B, P = prompts.size(0), prompts.size(1)
+        device = prompts.device
+        responses = torch.full((B, max_new), pad_id, dtype=torch.long, device=device)
+        eos_pos: list[int | None] = [None] * B
+        alive = torch.ones(B, dtype=torch.bool, device=device)
+        was_training = self.training
+        self.eval()
+        for t in range(max_new):
+            if not alive.any():
+                break
+            idx = alive.nonzero(as_tuple=False).squeeze(-1)   # (n_a,) alive 样本同长
+            ctx = torch.cat([prompts[idx], responses[idx, :t]], dim=1)
+            logits = self(ctx)[:, -1]                          # (n_a, V)
+            probs = torch.softmax(logits / max(temperature, 1e-6), dim=-1)
+            tok = torch.multinomial(probs, 1).squeeze(-1)      # (n_a,)
+            responses[idx, t] = tok
+            if eos_token_id is not None:
+                hit = (tok == eos_token_id)
+                for j, i in enumerate(idx.tolist()):
+                    if bool(hit[j]):
+                        eos_pos[i] = t
+                        alive[i] = False
+        if was_training:
+            self.train()
+        lengths = [max_new] * B
+        for i in range(B):
+            if eos_pos[i] is not None:
+                lengths[i] = eos_pos[i] + 1
+        statuses: list[str] = []
+        looped: list[bool] = []
+        for i in range(B):
+            eff = responses[i, :max(1, lengths[i])]
+            loop = loop_detection and detect_loop(eff, loop_periods)
+            if loop:
+                statuses.append("loop"); looped.append(True)
+            elif lengths[i] == 0:
+                statuses.append("invalid"); looped.append(False)
+            elif eos_pos[i] is not None:
+                statuses.append("eos"); looped.append(False)
+            else:
+                statuses.append("budget_stop"); looped.append(False)
+        return {"responses": responses, "statuses": statuses, "lengths": lengths,
+                "eos_pos": eos_pos, "looped": looped}
+
     def response_dists(self, prompts: torch.Tensor, responses: torch.Tensor):
         from .model import response_dists
         return response_dists(self, prompts, responses)
