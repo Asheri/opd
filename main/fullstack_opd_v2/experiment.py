@@ -32,8 +32,47 @@ from .config import load_config
 # 注：disagreement.enabled 目前仅作配置开关（run_refresh_phase 恒算 D），
 # E1↔E2 的差异由「D 是否参与后续信号」体现——E2 起 D 喂给 PromptState/selector，
 # 是 Deterministic 的模块职责边界（见 docs/superpowers/specs/...design.md §10）。
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2：短 rollout 预算消融矩阵（§8，任务 6）。独立 S2_E* 命名，不覆盖 E0-E6。
+# E0 静态基线（L2 关，同 E0_base_only 语义但独立 key）；E1/E2/E3 = OPD + 短 rollout
+# 512/1024/2048。真实 512/1024/2048 是 GPU 上真实模型的事；toy/CPU 实验经
+# build_config 尾端覆盖把 max_new_tokens 压到小值验证协议抽象（不跑真实长预算）。
+STAGE2_ROLLOUT_MATRIX: dict[str, dict] = {
+    # S2_E0 静态基线：L2 完全关闭（独立命名，同 E0_base_only）
+    "S2_E0_static": {
+        "l2.enabled": "false",
+    },
+    # S2_E1 OPD + 短 rollout 512
+    "S2_E1_opd512": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "fixed",
+        "l2.disagreement.enabled": "false",
+        "l2.health_monitor.enabled": "false",
+        "l2.selective_rollout.enabled": "false",
+        "l2.rollout.max_new_tokens": "512",
+    },
+    # S2_E2 OPD + 短 rollout 1024（主实验）
+    "S2_E2_opd1024": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "fixed",
+        "l2.disagreement.enabled": "false",
+        "l2.health_monitor.enabled": "false",
+        "l2.selective_rollout.enabled": "false",
+        "l2.rollout.max_new_tokens": "1024",
+    },
+    # S2_E3 OPD + 短 rollout 2048
+    "S2_E3_opd2048": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "fixed",
+        "l2.disagreement.enabled": "false",
+        "l2.health_monitor.enabled": "false",
+        "l2.selective_rollout.enabled": "false",
+        "l2.rollout.max_new_tokens": "2048",
+    },
+}
+
+
 EXPERIMENT_MATRIX: dict[str, dict] = {
-    # E0 基线：L2 完全关闭，退回 L0/L1 静态路径（无 refresh，无 on-policy 注入）
     "E0_base_only": {
         "l2.enabled": "false",
     },
@@ -81,16 +120,20 @@ EXPERIMENT_MATRIX: dict[str, dict] = {
 
 
 def build_config(name: str, base_overrides: list[str] | None = None,
-                 n_steps: int = 30, **extra) -> dict:
-    """按实验名生成可运行配置（E0-E6 矩阵 + 调用方追加覆盖）。
+                 n_steps: int = 30, matrix: dict[str, dict] | None = None,
+                 **extra) -> dict:
+    """按实验名生成可运行配置（E0-E6 或 S2_E0-E3 矩阵 + 调用方追加覆盖）。
 
-    默认给出 toy/CPU 可跑的轻量规模（小 n_steps、小 max_response_length），
-    使整条 pipeline 在秒级完成。extra 可覆盖任意键（如 batch_size）。
+    matrix 参数化：传 STAGE2_ROLLOUT_MATRIX 即建 Stage 2 短 rollout 实验；默认
+    EXPERIMENT_MATRIX（E0-E6）。默认给出 toy/CPU 可跑的轻量规模（小 n_steps、
+    小 max_response_length），使整条 pipeline 在秒级完成。extra 可覆盖任意键
+    （如把真实 512/1024/2048 压到 toy 预算验证协议抽象）。
     """
-    if name not in EXPERIMENT_MATRIX:
-        raise KeyError(f"未知实验 {name!r}，可选 {list(EXPERIMENT_MATRIX)}")
+    matrix = matrix or EXPERIMENT_MATRIX
+    if name not in matrix:
+        raise KeyError(f"未知实验 {name!r}，可选 {list(matrix)}")
     overrides = list(base_overrides or [])
-    for k, v in EXPERIMENT_MATRIX[name].items():
+    for k, v in matrix[name].items():
         overrides.append(f"{k}={v}")
     # toy/CPU 友好默认（避免长 rollout 拖慢实验）
     overrides += [
@@ -106,13 +149,14 @@ def build_config(name: str, base_overrides: list[str] | None = None,
 
 
 def run_experiment(name: str, run_dir: str, n_steps: int = 30,
-                   device: str = "cpu", **cfg_extra) -> dict:
-    """跑单个 E0-E6 实验，返回 {name, metrics, timings, run_dir, summary}。
+                   device: str = "cpu", matrix: dict[str, dict] | None = None,
+                   **cfg_extra) -> dict:
+    """跑单个 E0-E6 或 S2_E0-E3 实验，返回 {name, metrics, timings, run_dir, summary}。
 
-    summary 聚合四类统一记录字段（Training/Efficiency/Cache/Selector）。
+    matrix 透传 build_config（默认 EXPERIMENT_MATRIX）。summary 聚合四类统一记录字段。
     """
     from .pipeline import FullStackOPDv2
-    cfg = build_config(name, n_steps=n_steps, **cfg_extra)
+    cfg = build_config(name, n_steps=n_steps, matrix=matrix, **cfg_extra)
     out = FullStackOPDv2(cfg, device=device).run(run_dir=run_dir)
     metrics = out["metrics"]
     summary = {
@@ -131,14 +175,21 @@ def run_experiment(name: str, run_dir: str, n_steps: int = 30,
 
 
 def run_matrix(run_dir: str, n_steps: int = 30, device: str = "cpu",
-               names: list[str] | None = None) -> list[dict]:
-    """跑 E0-E6 全矩阵（或 names 子集），返回每实验结果。"""
-    names = names or list(EXPERIMENT_MATRIX)
+               names: list[str] | None = None,
+               matrix: dict[str, dict] | None = None,
+               **cfg_extra) -> list[dict]:
+    """跑 E0-E6 或 S2_E0-E3 全矩阵（或 names 子集），返回每实验结果。
+
+    cfg_extra 透传 build_config（如把真实长预算压到 toy 预算验证协议）。
+    """
+    matrix = matrix or EXPERIMENT_MATRIX
+    names = names or list(matrix)
     results = []
     for name in names:
         d = os.path.join(run_dir, name)
         os.makedirs(d, exist_ok=True)
-        results.append(run_experiment(name, d, n_steps=n_steps, device=device))
+        results.append(run_experiment(name, d, n_steps=n_steps, device=device,
+                                      matrix=matrix, **cfg_extra))
     return results
 
 
@@ -229,5 +280,5 @@ def _mean(xs):
     return float(sum(xs) / len(xs)) if xs else 0.0
 
 
-__all__ = ["EXPERIMENT_MATRIX", "build_config", "run_experiment", "run_matrix",
-           "save_results", "plot_experiments"]
+__all__ = ["EXPERIMENT_MATRIX", "STAGE2_ROLLOUT_MATRIX", "build_config",
+           "run_experiment", "run_matrix", "save_results", "plot_experiments"]

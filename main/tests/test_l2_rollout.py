@@ -305,3 +305,33 @@ def test_pipeline_l2_rollout_fallback_cache_max_resp(tmp_path):
     out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
     headers = _read_csv_headers(out["metrics_csv"])
     assert any(h.startswith("rollout/") for h in headers)
+
+
+# --------------------------- 任务6：Stage 2 实验矩阵（S2_E0-E3） ---------------------------
+from fullstack_opd_v2.experiment import (
+    STAGE2_ROLLOUT_MATRIX, build_config, run_matrix)
+
+
+def test_build_config_stage2_matrix():
+    """S2 矩阵建配置：rollout 预算语义保留；extra 可压到 toy 预算验证协议。"""
+    c = build_config("S2_E2_opd1024", n_steps=4, matrix=STAGE2_ROLLOUT_MATRIX,
+                     **{"l2.rollout.max_new_tokens": 8})
+    assert c["l2"]["rollout"]["max_new_tokens"] == 8    # extra 覆盖（toy 压速）
+    assert c["l2"]["refresh_ratio"]["mode"] == "fixed"
+    assert c["l2"]["rollout"]["loop_detection"] is True
+    # 不传 extra 时矩阵语义值保留（真实 512/1024/2048 声明）
+    c1 = build_config("S2_E1_opd512", n_steps=2, matrix=STAGE2_ROLLOUT_MATRIX)
+    assert c1["l2"]["rollout"]["max_new_tokens"] == 512
+    # 未知名报错
+    with pytest.raises(KeyError):
+        build_config("S2_E9_unknown", matrix=STAGE2_ROLLOUT_MATRIX)
+
+
+def test_run_matrix_stage2_runs(tmp_path):
+    """S2 矩阵跑通：4 实验（E0-E3）n_steps 对齐，rollout 预算覆盖到 toy 速跑。"""
+    res = run_matrix(str(tmp_path), n_steps=4, device="cpu",
+                     matrix=STAGE2_ROLLOUT_MATRIX,
+                     **{"l2.rollout.max_new_tokens": 8})
+    assert len(res) == 4
+    assert all(r["summary"]["n_steps"] == 4 for r in res)
+    assert {r["name"] for r in res} == set(STAGE2_ROLLOUT_MATRIX)
