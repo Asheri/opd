@@ -599,3 +599,142 @@ sample_id, prompt_id, generation_step, generation_version, response_length, toke
 ### 13.8 Implementation Report（9 项）
 
 1. 架构变化 2. 文件变化 3. 数据流 4. 配置 5. 测试结果 6. 性能变化 7. Ablation 结果 8. 已知问题 9. 下一阶段建议
+
+---
+
+## 14. 待办任务清单（TODO Backlog）
+
+> 状态截止：2026-08-16。本地代码（Stage 2/3 Selective Rollout 与 Budget-Aware 分配）已实现并
+> 全量回归通过（363 passed）；剩余待办分为四类：**本地代码收尾 / 服务器实验实跑 / 正式训练前置 /
+> 历史遗留验证**。每项含状态、详细描述、依赖与验证方式。
+
+### 14.1 本地代码收尾（当前工作区）
+
+**14.1.1 并发 agent 未提交改动审查与提交**
+
+- **状态**：待办（工作区存在未提交改动）
+- **详细描述**：`git status` 显示以下文件被另一条工作线（服务器正式训练前置修复）改动但未提交：
+  `fullstack_opd_v2/scheduler.py`（显存修复：`s_old` autocast 转 bf16 砍半、`BASE_LOG_RATIO_CLIP=5.0` /
+  `REFRESH_LOG_RATIO_MAX=3.0` ratio 硬化）、`fullstack_opd_v2/model_factory.py`（HF 接入传
+  `attn_implementation=flash_attention_2`）、`fullstack_opd_v2/losses.py`、`budget_eval.py`、
+  `cache_store.py`、`scripts/run_s2_real.py` + 若干 `scripts/_probe*.py` 探针。
+  这些改动是部署实测（pg 爆炸 / OOM）的根因修复，合理且必要，但需独立审查后提交。
+- **依赖**：无
+- **验证**：审查后逐文件 commit；提交后全量回归重跑（见 14.1.3）
+
+**14.1.2 修复被并发改动破坏的 2 个 spy 测试**
+
+- **状态**：待办（当前全量 2 个失败，均非 Stage 3 引入）
+- **详细描述**：
+  1. `tests/test_scheduler.py::test_scheduler_topk_renormalize_wires_through` —
+     `spy_pg()` 不接收新参数 `log_ratio_clip`（scheduler.py 新增 ratio 硬化后调用 loss 时多传了该参数）。
+  2. `tests/test_pipeline.py::test_stage0_teachers_hf_skips_rl` —
+     `fake_hf()` 不接收新参数 `attn_implementation`（model_factory.py 新增 HF attention 参数）。
+  修复方式：给两个 spy mock 加 `**kwargs`（或显式补对应参数），使其与并发改动后的生产签名对齐。
+  **注意**：只改测试文件，不碰并发 agent 的代码。
+- **依赖**：14.1.1 的并发改动（先确认其签名）
+- **验证**：单测通过后全量回归（见 14.1.3）
+
+**14.1.3 并发改动提交后重跑全量回归**
+
+- **状态**：待办
+- **详细描述**：Stage 3 全量回归基线为 **363 passed, 2 deselected**（跳过 14.1.2 的两个并发破坏项）。
+  14.1.1/14.1.2 完成后应重跑 `python -m pytest tests/ -q`，目标全绿（0 failed）。注意全量含大量 L2
+  集成测试（每条跑完整 pipeline），本地约 161s；历史上出现过偶发卡死（~2h），若复现需按文件分批定位。
+- **依赖**：14.1.1、14.1.2
+- **验证**：`cd main && python -m pytest tests/ -q` 0 failed
+
+### 14.2 服务器：Stage 2/3 实验实跑与报告
+
+**14.2.1 E1/E3 评估结果并入 Q1-Q4 报告与 TECHNICAL_REPORT.md**
+
+- **状态**：待办（服务器已产出 B4096 结果，尚未并入文档）
+- **详细描述**：Stage 2 预算评估（`eval-budget` CLI，`--datasets AIME24`，B4096）实测结果：
+  E0=1/30=3.3%、E1=2/30=6.7%（四档最佳）、E2=1/30=3.3%、E3=0/30=0%。全部 budget_stop、avgRT=4096
+  （B4096 对 1.7B 是预算下限，无 EOS）。需标注为 smoke 训练 + 噪声，不过分解读。需把这些数值并入
+  `docs/superpowers/reports/2026-08-15-stage2-rollout.md` 的 Q1-Q4 解读，以及
+  `main/fullstack_opd_v2/TECHNICAL_REPORT.md` §5（benchmark 分数）/§8（数据构成）。
+- **依赖**：无（数据已就绪）
+- **验证**：报告含 B4096 四实验数值与"smoke 训练 + 噪声"标注
+
+**14.2.2 S3 真实矩阵 GPU 实跑（S3_E0 / S3_E1 / S3_E2）**
+
+- **状态**：待办（代码本地全绿，需 GPU；对应任务 #161 收尾后）
+- **详细描述**：用 `STAGE3_MATRIX` 在服务器双卡跑 S3_E0（random 单预算 1024 对照）/ S3_E1（selective
+  单预算）/ S3_E2（selective + adaptive 预算），统一经 pipeline 无条件产 `rollout/*` 指标，经
+  `aggregate_stage3` 对比 Performance / RolloutTokens / Eff。**验收目标**：`budget_mode="adaptive"`
+  下 `useful_per_token`（UsefulSamples/RolloutTokens）相对 `"fixed"` 不降，token 指标落盘。
+- **依赖**：14.1 本地收尾；14.2.3 校准
+- **验证**：三实验 `run_dir/metrics.json` 含 `rollout/` 键；adaptive vs fixed 的 Eff 对比结论写出
+
+**14.2.3 校准 eos_token_id + loop_periods（真实模型）**
+
+- **状态**：待办（对应任务 #152）
+- **详细描述**：真实 1.7B 模型的 `eos_token_id` 与 `loop_periods`（周期检测参数）尚未校准。当前
+  `l2.rollout.eos_token_id` 默认 None（不判 EOS），真实 rollout 需显式设置；loop 周期需按真实生成
+  行为标定，避免误判 loop 丢弃有效样本或漏判。需在真实模型上做短 rollout 采样校准。
+- **依赖**：服务器环境
+- **验证**：真实采样中 eos/budget_stop/loop 状态分布合理，无效丢弃率不异常
+
+**14.2.4 评估数据路径决策（S2 实验数据）**
+
+- **状态**：待办（对应任务 #153）
+- **详细描述**：S2 实验的评估数据路径曾被数据加载阻塞（`openai/gsm8k` 缓存 config 缺失，`DataError`）。
+  已改用 `--datasets AIME24`（Maxwell-Jia/AIME_2024，缓存 config 'default' 存在）。需确认 S2/S3 实验
+  统一走 AIME24，避免缓存 config 不匹配；其余数据集（DAPO 等）按需补充。
+- **依赖**：服务器
+- **验证**：`eval-budget --datasets AIME24` 全链路跑通
+
+### 14.3 正式训练前置与启动
+
+**14.3.1 定案 max_response_len（4096 vs 8192）**
+
+- **状态**：待办（存在歧义，需用户确认）
+- **详细描述**：`configs/skywork_17b.yaml` 现为 `max_response_len=4096`，但曾有 8192 的讨论。需确认正式
+  训练的响应长度上限（影响显存与预算曲线）。toy 侧已 clamp 到 `student.max_len` 防越界（G9 修复）。
+- **依赖**：用户决策
+- **验证**：配置定案并写入 `configs/skywork_17b.yaml` + TECHNICAL_REPORT.md §8
+
+**14.3.2 正式训练启动（Skywork 50K / 双卡 FSDP / colocated 交替相位）**
+
+- **状态**：待办（配置就绪，GPU 空闲）
+- **详细描述**：正式 OPD 训练，Skywork 50K（`/root/autodl-tmp/datasets/skywork_50k.jsonl`，20MB 已落地），
+  `configs/skywork_17b.yaml`（n_steps=200, batch=8, top_k=256）。双卡 FSDP + colocated 交替相位 + L2
+  周期刷新。需先完成 14.3.1、14.2.3 校准，并确认 14.1 并发改动（含显存修复）已部署到服务器。
+- **依赖**：14.3.1、14.2.3、14.1.1；服务器 GPU 空闲
+- **验证**：训练启动日志健康（E[Δ_T] 单调上升、无 OOM、无 pg 爆炸）
+
+**14.3.3 服务器关机策略**
+
+- **状态**：待办（仅在训练结束或用户超时 10 分钟未回复时触发）
+- **详细描述**：正式训练结束后（或用户 10 分钟无响应）执行 `sudo shutdown -h now`。需在训练脚本尾部
+  加关机钩子，避免训练未完成就关机。
+- **依赖**：14.3.2
+- **验证**：训练完成后服务器按预期关机
+
+### 14.4 历史遗留验证项
+
+**14.4.1 ave@32 重评估验证 step120 最优性 + 对齐论文数字**
+
+- **状态**：待办（对应任务 #89）
+- **详细描述**：用论文协议（`avg@32, n=32, T=0.7, top_p=0.95, max_new_tokens=32768, boxed 模板,
+  sympy 评分`）重评估，验证 step120 checkpoint 的最优性，并核对与论文报告数字的对齐。
+  注意协议混报教训：短生成（2048）数字必须显式标注"非论文协议"。
+- **依赖**：服务器 + 四模型基准下载（已完成，任务 #22/#23）
+- **验证**：报告数字标注所用协议，与论文数字逐项对齐
+
+**14.4.2 ave@32 改动后全量测试回归**
+
+- **状态**：待办（对应任务 #90）
+- **详细描述**：ave@32 重评估相关的代码改动（如有）完成后，跑全量测试回归确认无破坏。
+- **依赖**：14.4.1
+- **验证**：`cd main && python -m pytest tests/ -q` 全绿
+
+**14.4.3 Skywork 训练数据落地收尾**
+
+- **状态**：部分完成（对应任务 #100）
+- **详细描述**：`skywork_50k.jsonl`（20MB）已下载转换落地到服务器；`prepare_skywork_jsonl.py` /
+  `prepare_skywork_responses.py`（含 resume）已写好。剩余：数据路径接入正式训练配置（已验证指向
+  50K 文件）、response 预生成落地（可选）。
+- **依赖**：服务器
+- **验证**：`configs/skywork_17b.yaml` 数据路径指向存在的 50K 文件，训练可读取
