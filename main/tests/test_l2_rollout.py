@@ -335,3 +335,30 @@ def test_run_matrix_stage2_runs(tmp_path):
     assert len(res) == 4
     assert all(r["summary"]["n_steps"] == 4 for r in res)
     assert {r["name"] for r in res} == set(STAGE2_ROLLOUT_MATRIX)
+
+
+# --------------------------- 任务7：报告 Q1-Q4（report_stage2.py） ---------------------------
+from fullstack_opd_v2.report_stage2 import write_stage2_report
+
+
+def test_write_stage2_report_placeholder(tmp_path):
+    """无数据占位报告：文件生成 + 4 段 Q 标题齐全 + 表格占位。"""
+    md = write_stage2_report([], [], str(tmp_path / "s2.md"))
+    assert (tmp_path / "s2.md").exists()
+    for q in ("Q1", "Q2", "Q3", "Q4"):
+        assert f"## {q}" in md
+    assert "（无数据）" in md          # 空结果优雅降级
+    assert "—" in md or "待服务器" in md
+
+
+def test_write_stage2_report_with_data(tmp_path):
+    """喂占位结果 dict：表格渲染指标、4 段 Q 解读含数值。"""
+    train = [{"name": "S2_E0_static", "summary": {"experiment": "S2_E0_static",
+             "reward_mean": 1.2, "pg_loss_mean": 0.5, "kl_loss_mean": 0.1,
+             "n_steps": 4}}]
+    evalres = [{"name": "S2_E2_opd1024",
+                "metrics": {"budget": 4096, "accuracy": 0.42}}]
+    md = write_stage2_report(train, evalres, str(tmp_path / "s2_data.md"))
+    assert "S2_E0_static" in md
+    assert "1.2000" in md or "1.2" in md
+    assert "4096" in md and "0.42" in md
