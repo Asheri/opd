@@ -220,9 +220,12 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
                                 prompts, step=1, version=1, m_selected=n,
                                 max_resp_len=6, top_k=3, device="cpu",
                                 rollout_generator=gen)
-    # summary：loop/invalid 跳过 append，只 2 个进池
+    # summary：loop/invalid 跳过 append，只 2 个进池（budgets=None 单预算路径，
+    # 新增 token 记账：actual=sum(lengths)=3+6+6+0=15，budgets_used=6*4=24）
     assert summary == {"n_total": 4, "n_appended": 2, "n_eos": 1,
-                       "n_budget": 1, "n_loop": 1, "n_invalid": 1}
+                       "n_budget": 1, "n_loop": 1, "n_invalid": 1,
+                       "rollout_tokens": 15, "expected_rollout_tokens": 15,
+                       "budgets_used": 24}
     assert rb.size == 2
     # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
     assert sorted(rb._status) == ["budget_stop", "eos"]
@@ -302,7 +305,9 @@ def test_run_refresh_phase_all_loop_no_append():
                                 max_resp_len=6, top_k=3, device="cpu",
                                 rollout_generator=gen)
     assert summary == {"n_total": 2, "n_appended": 0, "n_eos": 0,
-                       "n_budget": 0, "n_loop": 2, "n_invalid": 0}
+                       "n_budget": 0, "n_loop": 2, "n_invalid": 0,
+                       "rollout_tokens": 12, "expected_rollout_tokens": 12,
+                       "budgets_used": 12}
     assert rb.size == 0
 
 

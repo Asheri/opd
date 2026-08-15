@@ -475,7 +475,11 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       rollout_generator=None,      # Stage 2：短 rollout 生成器
                       eos_token_id=None,           # Stage 2：None=不判 EOS（全 budget_stop）
                       loop_detection=True,         # Stage 2：周期重复判 loop
-                      pad_id=0):
+                      pad_id=0,
+                      budgets=None,                # Stage 3：per-sample budget (M,) long；None→单预算
+                      budget_t=None,               # Stage 3：全局 token 预算；None→无上限
+                      budget_set=(256, 512, 1024, 2048),
+                      exploration_fraction=0.20):
     """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 短 rollout（带 status）
     -> 4 个 chosen logp -> D_i^abs -> append_refresh。teacher 前向在此（_train_step 不动）。
 
@@ -498,26 +502,63 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     max_resp_len = min(int(max_resp_len), max(1, _max_seq - prompts.size(1)))
     cand = selector.select(m_selected, prompts.size(0)) if selector else \
         torch.randint(0, prompts.size(0), (m_selected,))
-    p_b = prompts[cand].to(device)
     # Stage 2：短 rollout（带 status）。默认 toy 生成器；可注入 vLLM/HF 端。
     # ⚠️ 调用约定：注入的 rollout_generator 是【绑定方法】（self 已绑），签名
     # generate_with_status(prompts, max_new=..., ...)；而 _default_gen 是模块级函数，
     # 签名 generate_with_status(model, prompts, ...)。两者必须分开调用，否则把 student
     # 当 self 传入绑定方法会静默错乱（P2 修复：此前 vLLM 注入路径就是此 bug）。
-    if rollout_generator is not None:
-        out = rollout_generator(p_b, max_new=max_resp_len, eos_token_id=eos_token_id,
-                                loop_detection=loop_detection, pad_id=pad_id)
+    def _gen(pb, max_new):
+        if rollout_generator is not None:
+            return rollout_generator(pb, max_new=max_new, eos_token_id=eos_token_id,
+                                     loop_detection=loop_detection, pad_id=pad_id)
+        return _default_gen(student, pb, max_new=max_new, eos_token_id=eos_token_id,
+                            loop_detection=loop_detection, pad_id=pad_id)
+
+    M = cand.size(0)
+    if budgets is not None:
+        # Stage 3：per-sample budget 分桶。先 enforce（超全局预算降级）。
+        if budget_t is not None:
+            v_vals = selector._value()[cand] if selector is not None \
+                else torch.zeros(M, device=cand.device)
+            cand, budgets = enforce_budget(cand, budgets, v_vals, budget_t,
+                                           budget_set, exploration_fraction)
+        p_b = prompts[cand].to(device)
+        groups = group_by_budget(cand, budgets)          # {budget: [global_prompt_idx,...]}
+        max_b = int(budgets.max().item())
+        resp_all = torch.full((M, max_b), pad_id, dtype=torch.long, device=device)
+        statuses = [None] * M; lengths = [0] * M; eos_pos = [None] * M
+        expected = int(budgets.sum().item()); actual = 0
+        cand_list = cand.tolist()
+        for b, idxs in groups.items():
+            # 映射：每个 bucket 元素（全局 prompt idx）在 cand 中的行位置。
+            pos_in_cand = [cand_list.index(int(i)) for i in idxs]
+            p_bucket = prompts[torch.tensor(idxs, device=prompts.device)].to(device)
+            out = _gen(p_bucket, max_new=int(b))
+            for k, pc in enumerate(pos_in_cand):
+                rk = out["responses"][k]
+                resp_all[pc, :rk.size(0)] = rk
+                statuses[pc] = out["statuses"][k]
+                lengths[pc] = out["lengths"][k]
+                eos_pos[pc] = out["eos_pos"][k]
+                actual += int(out["lengths"][k])
+        responses = resp_all
+        budgets_used = int(budgets.sum().item())
     else:
-        out = _default_gen(student, p_b, max_new=max_resp_len, eos_token_id=eos_token_id,
-                           loop_detection=loop_detection, pad_id=pad_id)
-    responses, statuses, lengths = out["responses"], out["statuses"], out["lengths"]
+        p_b = prompts[cand].to(device)
+        out = _gen(p_b, max_new=max_resp_len)
+        responses, statuses, lengths = out["responses"], out["statuses"], out["lengths"]
+        eos_pos = out["eos_pos"]
+        expected = actual = int(sum(lengths))
+        budgets_used = int(max_resp_len * M)
     # loop/invalid 样本跳过 teacher 前向与 append（需求 4），仍计入 summary
     valid = [i for i in range(len(statuses)) if statuses[i] not in ("loop", "invalid")]
     n_loop = statuses.count("loop"); n_invalid = statuses.count("invalid")
     n_eos = statuses.count("eos"); n_budget = statuses.count("budget_stop")
     if not valid:
         return {"n_total": len(statuses), "n_appended": 0, "n_eos": n_eos,
-                "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid}
+                "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
+                "rollout_tokens": int(actual), "expected_rollout_tokens": int(expected),
+                "budgets_used": int(budgets_used)}
     p_b_v = p_b[valid]
     resp_v = responses[valid]
     # 行为策略：生成完立即取当前 student 完整分布 top-K（s_old，精确行为策略 §2）。
@@ -540,7 +581,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         delta_k = rl_k - ref_dist.gather(-1, tk.indices)
     # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）
     mask = build_length_mask(resp_v, [lengths[i] for i in valid],
-                             [out["eos_pos"][i] for i in valid])
+                             [eos_pos[i] for i in valid])
     D = disag.compute(rl_chosen, ref_chosen, student_logp, ref_logp, mask)
     for j, i in enumerate(valid):
         pos = ring_buffer.append(ids_k[j], delta_k[j], generation_step=step,
@@ -556,7 +597,9 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                                 disagreement=float(D["abs"][j].detach()),
                                 resp_len=int(mask[j].sum()), step=step)
     return {"n_total": len(statuses), "n_appended": len(valid), "n_eos": n_eos,
-            "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid}
+            "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
+            "rollout_tokens": int(actual), "expected_rollout_tokens": int(expected),
+            "budgets_used": int(budgets_used)}
 
 
 class CacheHealthMonitor:

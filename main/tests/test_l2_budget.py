@@ -205,3 +205,84 @@ def test_value_includes_reward():
         "uncertainty": 0.4, "disagreement": 0.4, "novelty": 0.2, "reward": 0.5})
     v_r = sel_r._value()
     assert v_r[0].item() > v_r[1].item()
+
+
+# ---- Stage 3：run_refresh_phase per-sample budget 分桶 ----
+
+from fullstack_opd_v2.adaptive_cache import (
+    RefreshRingBuffer, DisagreementComputer, run_refresh_phase)
+from fullstack_opd_v2.model import CausalToyLM
+
+
+def _toy(vocab=8, d_model=8, n_layers=1, max_len=64):
+    """占位小 transformer（与 test_l2_rollout 一致）。"""
+    return CausalToyLM(vocab=vocab, d_model=d_model, n_layers=n_layers, max_len=max_len)
+
+
+def _recording_gen(log):
+    """注入式 rollout_generator：记录每次被调用的 max_new，返回全 budget_stop。
+
+    契约：绑定方法签名 gen(prompts, max_new, ...)，run_refresh_phase 以 prompts 为第一实参。
+    """
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0):
+        log.append(int(max_new))
+        n = prompts.size(0)
+        return {"responses": torch.ones(n, int(max_new), dtype=torch.long),
+                "statuses": ["budget_stop"] * n,
+                "lengths": [int(max_new)] * n,
+                "eos_pos": [None] * n, "looped": [False] * n}
+    return gen
+
+
+def test_run_refresh_phase_budget_buckets():
+    """per-sample budget 分桶：不同 prompt 按各自 budget(max_new) 生成，分桶生效。"""
+    torch.manual_seed(0)
+    V = 8
+    # max_len 需 ≥ prompt(5)+max budget(2048)，否则 teacher 前向越界
+    stu, t_rl, t_ref, s_ref = (_toy(V, max_len=4096),) * 4
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    n_prompts, m = 8, 4
+    prompts = torch.randint(0, V, (n_prompts, 5))
+    # 喂历史使 select 走 threaded 路径 → 选中互不重复的 prompt（避免 cand 重复映射）
+    ps = PromptStateStore(n_prompts)
+    for i in range(n_prompts):
+        ps.update(i, reward=float(i) / (n_prompts - 1), disagreement=0.1,
+                  resp_len=100 + i * 50, step=1)
+    sel = RefreshSelector(ps)
+    log = []
+    gen = _recording_gen(log)
+    budgets = torch.tensor([256, 512, 1024, 2048])
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, sel, rb, disag, prompts,
+                                step=1, version=1, m_selected=m,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen, budgets=budgets)
+    # 4 档 budget 各 1 个 prompt → 4 次 gen 调用，max_new 精确覆盖 budget_set
+    assert sorted(log) == [256, 512, 1024, 2048]
+    assert summary["n_total"] == m
+    assert summary["n_appended"] == m
+    assert summary["rollout_tokens"] == 256 + 512 + 1024 + 2048
+    assert summary["expected_rollout_tokens"] == 256 + 512 + 1024 + 2048
+    assert summary["budgets_used"] == 256 + 512 + 1024 + 2048
+    assert rb.size == m
+
+
+def test_run_refresh_phase_no_budget_regression():
+    """budgets=None（默认）→ 单预算路径：gen 只调 1 次，max_new=默认 max_resp_len。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _toy(V), _toy(V), _toy(V), _toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.arange(V * 5).view(V, 5) % V
+    log = []
+    gen = _recording_gen(log)
+    m_selected = 3
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag, prompts,
+                                step=1, version=1, m_selected=m_selected,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen)
+    assert log == [6]                       # 单次调用 + 默认 max_new（clamp 后 6）
+    assert summary["rollout_tokens"] == 6 * m_selected
+    assert summary["expected_rollout_tokens"] == 6 * m_selected
+    assert summary["budgets_used"] == 6 * m_selected
