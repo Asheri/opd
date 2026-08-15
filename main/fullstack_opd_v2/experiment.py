@@ -72,6 +72,43 @@ STAGE2_ROLLOUT_MATRIX: dict[str, dict] = {
 }
 
 
+# ---- Stage 3：Budget-Aware Selective Rollout 对比矩阵（§八，任务 7）----
+# S3_E0 random 单预算对照 / S3_E1 selective 单预算 / S3_E2 selective + adaptive 预算。
+# 三实验统一经 pipeline 改造后【无条件】compute_rollout_metrics 产 rollout/* 指标，
+# 可同口径对比 Performance（accuracy_proxy）/ RolloutTokens（rollout_tokens）/ Eff
+# （useful_per_token）。语义：
+#   - S3_E1 budget_mode=fixed 且无 token_budget → pipeline use_budget=False → 单预算路径，
+#     但产 rollout/ 指标（改造后无条件）。
+#   - S3_E2 adaptive + token_budget → use_budget=True → 分桶 + enforce_budget。
+#   - S3_E0 selective 关 → selector=None → 单预算 uniform 随机选 prompt + rollout/ 指标。
+STAGE3_MATRIX: dict[str, dict] = {
+    # S3_E0 random 单预算对照：selective 关、单统一 1024 预算（无 per-sample 分桶）
+    "S3_E0_random_fixed1024": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "adaptive",
+        "l2.selective_rollout.enabled": "false",
+        "l2.rollout.max_new_tokens": "1024",
+    },
+    # S3_E1 selective 单预算：候选池价值选择，但预算仍单档 1024（无分桶）
+    "S3_E1_selective_fixed1024": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "adaptive",
+        "l2.selective_rollout.enabled": "true",
+        "l2.selective_rollout.budget_mode": "fixed",
+        "l2.rollout.max_new_tokens": "1024",
+    },
+    # S3_E2 selective + adaptive 预算：价值选择 + 按分位数分档预算 + token 记账
+    "S3_E2_selective_adaptive": {
+        "l2.enabled": "true",
+        "l2.refresh_ratio.mode": "adaptive",
+        "l2.selective_rollout.enabled": "true",
+        "l2.selective_rollout.budget_mode": "adaptive",
+        "l2.selective_rollout.compute_aware": "true",
+        "l2.rollout.token_budget_per_refresh": "4096",
+    },
+}
+
+
 EXPERIMENT_MATRIX: dict[str, dict] = {
     "E0_base_only": {
         "l2.enabled": "false",
@@ -161,7 +198,9 @@ def run_experiment(name: str, run_dir: str, n_steps: int = 30,
     metrics = out["metrics"]
     summary = {
         "experiment": name,
-        "n_steps": len(metrics),
+        # n_steps 只数训练步（排除 rollout 相位指标步）；rollout 步带 "phase":"rollout"
+        "n_steps": sum(1 for m in metrics
+                       if isinstance(m, dict) and m.get("phase") != "rollout"),
         "reward_mean": (_mean([m.get("reward", 0.0) for m in metrics]) if metrics else 0.0),
         "pg_loss_mean": (_mean([m.get("pg_loss", 0.0) for m in metrics]) if metrics else 0.0),
         "kl_loss_mean": (_mean([m.get("kl_loss", 0.0) for m in metrics]) if metrics else 0.0),
@@ -280,5 +319,31 @@ def _mean(xs):
     return float(sum(xs) / len(xs)) if xs else 0.0
 
 
-__all__ = ["EXPERIMENT_MATRIX", "STAGE2_ROLLOUT_MATRIX", "build_config",
-           "run_experiment", "run_matrix", "save_results", "plot_experiments"]
+def aggregate_stage3(results, metrics_key="metrics") -> dict:
+    """从 S3 实验 metrics 聚合 rollout/* 指标均值，输出 Performance/RolloutTokens/Eff（§九）。
+
+    results 为 run_matrix 返回（每项含 name + metrics_key 的 step dict 列表）。
+    每个 step dict 含刷新相位落盘的 rollout/accuracy_proxy / rollout/rollout_tokens /
+    rollout/useful_per_token（pipeline 改造后无条件产）。缺键/None 的 step 跳过；
+    全缺时返回 0.0（不崩）。Eff 直接取 useful_per_token 均值（=Performance/RolloutTokens）。
+    """
+    out = {}
+    for r in results:
+        name = r["name"]
+        ms = [m for m in r.get(metrics_key, []) if isinstance(m, dict)]
+
+        def agg(key):
+            vals = [m[key] for m in ms if m.get(key) is not None]
+            return _mean(vals) if vals else 0.0
+
+        out[name] = {
+            "Performance": agg("rollout/accuracy_proxy"),      # UsefulSamples 占比
+            "RolloutTokens": agg("rollout/rollout_tokens"),    # 均 rollout token
+            "Eff": agg("rollout/useful_per_token"),            # Performance/RolloutTokens
+        }
+    return out
+
+
+__all__ = ["EXPERIMENT_MATRIX", "STAGE2_ROLLOUT_MATRIX", "STAGE3_MATRIX",
+           "build_config", "run_experiment", "run_matrix", "save_results",
+           "plot_experiments", "aggregate_stage3"]

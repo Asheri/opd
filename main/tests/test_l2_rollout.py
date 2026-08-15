@@ -368,13 +368,23 @@ def test_build_config_stage2_matrix():
 
 
 def test_run_matrix_stage2_runs(tmp_path):
-    """S2 矩阵跑通：4 实验（E0-E3）n_steps 对齐，rollout 预算覆盖到 toy 速跑。"""
+    """S2 矩阵跑通：4 实验（E0-E3），rollout 预算覆盖到 toy 速跑。
+
+    ⚠️ 任务7 后：refresh 触发条件删掉 `and selector is not None`，selective 关的
+    S2_E1/E2/E3（l2.enabled=true）现在【真正触发刷新】——n_steps 含 refresh 训练步
+    （4 base + 2 refresh ≈ 6）；E0_static（l2 关）仍恰好 4 步不刷。断言对齐新语义。
+    """
     res = run_matrix(str(tmp_path), n_steps=4, device="cpu",
                      matrix=STAGE2_ROLLOUT_MATRIX,
                      **{"l2.rollout.max_new_tokens": 8})
     assert len(res) == 4
-    assert all(r["summary"]["n_steps"] == 4 for r in res)
     assert {r["name"] for r in res} == set(STAGE2_ROLLOUT_MATRIX)
+    by_name = {r["name"]: r for r in res}
+    # E0_static（l2 关）无刷新 → 恰好 4 训练步
+    assert by_name["S2_E0_static"]["summary"]["n_steps"] == 4
+    # E1/E2/E3（l2 开）现在触发刷新 → 训练步 ≥ 4（含 refresh 训练步）
+    for n in ("S2_E1_opd512", "S2_E2_opd1024", "S2_E3_opd2048"):
+        assert by_name[n]["summary"]["n_steps"] >= 4
 
 
 # --------------------------- 任务7：报告 Q1-Q4（report_stage2.py） ---------------------------

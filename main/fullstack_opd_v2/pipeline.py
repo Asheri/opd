@@ -742,8 +742,12 @@ class FullStackOPDv2:
                         # G4：距上次刷新 >= min_interval 才触发（max_interval 强制），
                         # 否则本相位纯训练、跳过 refresh 与 α 更新。
                         elapsed = base_done - last_refresh
-                        if (elapsed >= refresh_min or elapsed >= refresh_max) \
-                                and selector is not None:
+                        # G4：距上次刷新 >= min_interval 才触发（max_interval 强制）。
+                        # 注：不要求 selector 非 None——selective 关闭（E6 / S3_E0 随机对照）时
+                        # selector=None，run_refresh_phase 走 torch.randint 均匀随机选 prompt
+                        # 仍产出 rollout/ 指标（改造后 compute_rollout_metrics 无条件落盘），
+                        # 使「随机单预算」对照实验可与其他实验同口径对比。
+                        if elapsed >= refresh_min or elapsed >= refresh_max:
                             # Stage 2：消费 l2.rollout 短预算协议（max_new_tokens / eos / loop）。
                             # fallback：未设 rollout 段 → 回落 cache.max_response_length（toy=4）。
                             rollcfg = l2_cfg.get("rollout", {})
@@ -804,6 +808,14 @@ class FullStackOPDv2:
                                 roll_metrics = compute_rollout_metrics(
                                     rollout_summary, budgets, budget_t)
                                 mr.record(roll_metrics)
+                                # 并入返回 metrics 列表（供 run_experiment / aggregate_stage3
+                                # 读 rollout/ 指标做 S3 同口径对比）。带 step/version 保证
+                                # 末步断点 cm.save(metrics[-1]["step"/"version"]) 安全。
+                                metrics.append({
+                                    "step": step_done,
+                                    "version": scheduler.staleness_q.current_version,
+                                    "phase": "rollout",
+                                    **roll_metrics})
                             last_refresh = base_done
                             # Health Monitor 观测（Observe-only，不改训练）。
                             # hm.record 只按 4 个已知键（hit_rate/refresh_age_p95/reuse_p95/
