@@ -128,3 +128,50 @@ def test_generate_batch_unchanged():
     out = generate_batch(m, pr, max_new=4)
     assert out.size() == (2, 4)
     assert out.dtype == torch.long
+
+
+# --------------------------- 任务3：vLLM 状态解析（纯函数） ---------------------------
+from fullstack_opd_v2.rollout_vllm import parse_vllm_outputs
+
+
+class _FakeOut:
+    """mock vLLM RequestOutput：outputs[0].token_ids 为生成部分。"""
+    def __init__(self, toks, finish_reason="length"):
+        class _Comp:
+            def __init__(self, toks, fr):
+                self.token_ids = toks
+                self.finish_reason = fr
+        self.outputs = [_Comp(toks, finish_reason)]
+        self.prompt_len = 0
+
+
+def test_parse_vllm_outputs_eos():
+    outs = [_FakeOut([1, 2, 0, 3], "stop")]        # eos=0 在第 2 位
+    r = parse_vllm_outputs(outs, max_new=8, eos_token_id=0)
+    assert r["statuses"] == ["eos"]
+    assert r["lengths"] == [3]                       # eos_pos+1 含 eos
+    assert r["eos_pos"] == [2]
+    assert r["looped"] == [False]
+
+
+def test_parse_vllm_outputs_budget_stop():
+    outs = [_FakeOut([1, 2, 3], "length")]           # 无 eos，撞 max_new
+    r = parse_vllm_outputs(outs, max_new=8, eos_token_id=0)
+    assert r["statuses"] == ["budget_stop"]
+    assert r["lengths"] == [3]
+    assert r["eos_pos"] == [None]
+
+
+def test_parse_vllm_outputs_loop():
+    outs = [_FakeOut([1, 2, 3, 1, 2, 3, 1, 2, 3], "length")]   # 周期 3 重复
+    r = parse_vllm_outputs(outs, max_new=16, eos_token_id=None,
+                           loop_periods=(3,))
+    assert r["statuses"] == ["loop"]
+    assert r["looped"] == [True]
+
+
+def test_parse_vllm_outputs_loop_disabled():
+    outs = [_FakeOut([1, 2, 3, 1, 2, 3, 1, 2, 3], "length")]
+    r = parse_vllm_outputs(outs, max_new=16, eos_token_id=None,
+                           loop_detection=False)
+    assert r["statuses"] == ["budget_stop"]          # 关闭 loop 检测 → 不判 loop

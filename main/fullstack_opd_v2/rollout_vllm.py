@@ -262,3 +262,69 @@ class VLLMRolloutEngine:
             toks = o.outputs[0].token_ids[:max_new]
             res[b, :len(toks)] = torch.tensor(toks, dtype=torch.long)
         return res.to(self.device)
+
+    # --------------------------- Stage 2 短 rollout（带 status）---------------------------
+    @torch.no_grad()
+    def generate_with_status(self, prompts: torch.Tensor, max_new: int,
+                             eos_token_id=None, temperature: float = 1.0,
+                             pad_id: int = 0, loop_detection: bool = True,
+                             loop_periods=(2, 3, 4)) -> dict:
+        """Stage 2：短预算 rollout（vLLM）——SamplingParams 定 max_new/eos，经
+        parse_vllm_outputs 得 status，responses 变长右 pad 到 max_new。
+
+        返回与 toy generate_with_status 同构的 dict（responses/statuses/lengths/
+        eos_pos/looped），使 run_refresh_phase 引擎无关。
+        """
+        prompts = prompts.detach().cpu()
+        B = prompts.size(0)
+        sampling = SamplingParams(
+            temperature=max(temperature, 1e-6), top_p=0.9, max_tokens=max_new,
+            eos_token_id=eos_token_id)
+        seqs = [prompts[b].tolist() for b in range(B)]
+        outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
+        parsed = parse_vllm_outputs(outs, max_new, eos_token_id,
+                                    loop_detection, loop_periods)
+        # 组装 responses：(B,max_new) 按 lengths 写入、pad 填充
+        res = torch.full((B, max_new), pad_id, dtype=torch.long)
+        for b, o in enumerate(outs):
+            toks = o.outputs[0].token_ids[:max_new]
+            n = parsed["lengths"][b]
+            res[b, :n] = torch.tensor(toks[:n], dtype=torch.long)
+        parsed["responses"] = res.to(self.device)
+        return parsed
+
+
+def parse_vllm_outputs(outs, max_new: int, eos_token_id=None,
+                       loop_detection: bool = True,
+                       loop_periods=(2, 3, 4)) -> dict:
+    """Stage 2：把 vLLM RequestOutput 列表解析为同构 status dict（纯函数，CPU 可单测）。
+
+    复用 budget_eval.generate_budget 的逐位 EOS 判定手法（eos in new + new.index(eos)）。
+    vLLM outputs[i].token_ids 是【生成部分】（不含 prompt）；finish_reason 仅作参考，
+    状态以 token 内容为准（eos 优先，其次 loop，其次 budget_stop / invalid）。
+
+    返回：{"responses": None, "statuses": [...], "lengths": [...], "eos_pos": [...],
+           "looped": [...]}（responses 由 generate_with_status 组装）。
+    """
+    from .model import detect_loop
+    statuses: list[str] = []
+    lengths: list[int] = []
+    eos_pos: list[int | None] = []
+    looped: list[bool] = []
+    for o in outs:
+        new = o.outputs[0].token_ids          # 生成部分（不含 prompt）
+        if eos_token_id is not None and eos_token_id in new:
+            ep = new.index(eos_token_id)
+            status, length = "eos", ep + 1          # 含 eos
+        else:
+            ep, status, length = None, "budget_stop", len(new)
+        loop = loop_detection and detect_loop(
+            torch.tensor(new[:max(1, length)]), loop_periods)
+        if loop:
+            status = "loop"
+        elif length == 0:
+            status = "invalid"
+        statuses.append(status); lengths.append(length)
+        eos_pos.append(ep); looped.append(loop)
+    return {"responses": None, "statuses": statuses, "lengths": lengths,
+            "eos_pos": eos_pos, "looped": looped}
