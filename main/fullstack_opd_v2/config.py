@@ -111,6 +111,20 @@ class L2CacheCfg(_Strict):
     delta_slope_eps: float = 0.001
 
 
+class L2RolloutCfg(_Strict):
+    """Stage 2：训练 rollout 短预算协议（短 Rollout，不要求自然 EOS）。
+
+    与 dataset.max_response_len（数据填充长度）、evaluation.max_reasoning_budget（eval 预算）
+    区分：本段是【训练期 rollout 生成上限】。短预算 L_train=1024 的意义是「训练短、评估长」
+    （train 1024 → eval B∈{256..4096}），验证短 rollout 能否稳定产生有效 OPD signal。
+    """
+    max_new_tokens: int = 1024         # 每 rollout 生成上限（训练预算 L_train）
+    allow_budget_stop: bool = True     # 允许预算截断（不把 budget-stop 当 EOS）
+    eos_token_id: int | None = None    # None=不判 EOS（全 BUDGET_STOP）；=int 采到即停
+    loop_detection: bool = True        # 周期重复检测 → 判 LOOP（不进 refresh cache）
+    pad_id: int = 0                    # 变长 batch 右 pad 值（不参与判定，仅占位）
+
+
 class L2DisagreementCfg(_Strict):
     """§3 Teacher-Student Disagreement 开关。"""
     enabled: bool = True
@@ -170,6 +184,7 @@ class L2Cfg(_Strict):
     t_train: int = 100               # 每轮训练步数
     m_refresh: int = 1000            # 每轮刷新量（= M_selected）
     cache: L2CacheCfg = Field(default_factory=L2CacheCfg)
+    rollout: L2RolloutCfg = Field(default_factory=L2RolloutCfg)   # Stage 2 短 rollout
     disagreement: L2DisagreementCfg = Field(default_factory=L2DisagreementCfg)
     health_monitor: L2HealthMonitorCfg = Field(default_factory=L2HealthMonitorCfg)
     refresh_ratio: L2RefreshRatioCfg = Field(default_factory=L2RefreshRatioCfg)
@@ -393,7 +408,7 @@ def load_config(path: str | None = None,
 
 
 __all__ = ["OPDConfig", "Stage0Cfg", "Stage1Cfg", "Stage2Cfg",
-           "L2Cfg", "L2CacheCfg", "L2DisagreementCfg", "L2HealthMonitorCfg",
+           "L2Cfg", "L2CacheCfg", "L2RolloutCfg", "L2DisagreementCfg", "L2HealthMonitorCfg",
            "L2RefreshRatioCfg", "L2SelectiveRolloutCfg", "L2UtilityCfg",
            "RunCfg", "LoggingCfg", "MetricsCfg", "DatasetCfg", "EvalCfg",
            "load_config", "ValidationError"]
