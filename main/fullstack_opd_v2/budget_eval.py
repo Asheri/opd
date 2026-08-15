@@ -61,12 +61,15 @@ class DatasetSpec:
     - split：加载哪个切分（GSM8K/MATH-500 用 test；AIME 用 train）
     - prob / ans：problem/answer 候选列名（大小写兼容，逐条取第一个非 None）
     - gt_extract：ground_truth 规整函数（GSM8K 剥 "#### xxx"；其余默认保留原样）
+    - hf_config：可选 HuggingFace 数据集 config 名（GSM8K 需 "main"，缺省会报
+      "Config name is missing"）
     """
     hf: str
     split: str = "train"
     prob: tuple[str, ...] = ("problem", "question", "prompt", "Problem", "Question", "Prompt")
     ans: tuple[str, ...] = ("answer", "solution", "Answer", "Solution")
     gt_extract: callable = lambda a: _extract_boxed_answer(a) or str(a).strip()
+    hf_config: str | None = None
 
 
 def _gsm8k_gt(a) -> str:
@@ -78,6 +81,7 @@ def _gsm8k_gt(a) -> str:
 # 键（大小写不敏感）→ 加载规格。未知键按直接 HF 数据集名对待（test 切分、默认列）。
 DATASET_REGISTRY = {
     "GSM8K":   DatasetSpec("openai/gsm8k", "test",
+                           hf_config="main",
                            prob=("question", "problem", "Question", "Problem"),
                            ans=("answer", "Answer"),
                            gt_extract=_gsm8k_gt),
@@ -127,7 +131,10 @@ class BudgetEvaluator(AimeEvaluator):
             raise ModelError(f"评估需要 datasets：{e}") from e
         spec = self.resolve_dataset(dataset_ref)
         try:
-            ds = load_dataset(spec.hf, split=spec.split)
+            if spec.hf_config:
+                ds = load_dataset(spec.hf, split=spec.split, config=spec.hf_config)
+            else:
+                ds = load_dataset(spec.hf, split=spec.split)
         except Exception as e:
             raise DataError(f"加载数据集 {spec.hf!r} 失败：{e}") from e
         rows = []
