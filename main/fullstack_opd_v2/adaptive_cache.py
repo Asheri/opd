@@ -24,6 +24,149 @@ from __future__ import annotations
 import torch
 
 
+# ============================================================
+# Stage 3：Budget-Aware Selective Rollout 纯函数区
+# 4 个纯函数：Select(p, B_p) 的 budget 分配 / 预算控制器 / 健康指标 / 分桶。
+# 不依赖任何类状态，只依赖 torch 与传入参数，可 CPU 单测、与 selector 解耦。
+# ============================================================
+
+
+def assign_budgets(v_values: torch.Tensor,
+                   budget_set=(256, 512, 1024, 2048),
+                   quantiles=(0.25, 0.5, 0.75)) -> torch.Tensor:
+    """§三 Budget Allocation：按 V 分位数把选中集映射到 4 档 budget。
+
+    v_values: (M,) 选中 prompt 的价值评分（EMA 加权，跨 prompt 相对量）。
+    返回 (M,) long budget。分位数在【传入的选中集内】算（非全池）。
+    全等 v（无区分度）→ 全部中档 budget_set[len//2]（防 q 全等错分到最高档）。
+    分段：v<q1→[0], q1≤v<q2→[1], q2≤v<q3→[2], v≥q3→[3]。
+    torch.quantile 用 torch.tensor(list(quantiles), dtype=v_values.dtype)。
+    """
+    # 全等 v（无区分度）：全部给中档，防 quantile 全等时错分到最低/最高档。
+    if v_values.min() == v_values.max():
+        return torch.full_like(v_values, budget_set[len(budget_set) // 2],
+                               dtype=torch.long)
+    q1, q2, q3 = torch.quantile(
+        v_values, torch.tensor(list(quantiles), dtype=v_values.dtype))
+    budget = torch.full_like(v_values, budget_set[0], dtype=torch.long)
+    budget = torch.where(v_values < q1, budget_set[0],
+                         torch.where(v_values < q2, budget_set[1],
+                                     torch.where(v_values < q3, budget_set[2],
+                                                 budget_set[3])))
+    return budget.long()
+
+
+def enforce_budget(indices: torch.Tensor, budgets: torch.Tensor,
+                   v_values: torch.Tensor, budget_t: int | None,
+                   budget_set=(256, 512, 1024, 2048),
+                   exploration_fraction: float = 0.20) -> tuple:
+    """§六 Budget Controller 降级：保证 Σbudgets ≤ budget_t，绝不突破。
+
+    indices: (M,) 选中 prompt 全局索引；budgets: (M,) 对应预算（long）；
+    v_values: (M,) 对应价值评分。
+    返回 (indices, budgets) 降级后。
+
+    1) budget_t is None 或 sum(budgets)<=budget_t → 直接返回原样。
+    2) 低价值降档：按 v 升序（低价值优先），把 budget>budget_set[0] 的样本逐一降一档
+       （budget_set.index(b)-1），重算直到 sum<=budget_t 或全降到最低档。
+    3) 仍超 → 减候选：砍"高预算低价值"（浪费）的样本，即 waste=v/b 升序优先砍
+       （低 waste=高预算低价值）。保留 exploration 下限：至少保留
+       round(len(indices)*exploration_fraction) 个样本（探索性），砍到该下限即停。
+    4) 返回降级后的 (indices, budgets)。
+    """
+    if indices is None or len(indices) == 0:
+        return indices, budgets
+    if budget_t is None:
+        return indices, budgets
+    budgets = budgets.long().clone()
+    if budgets.sum() <= budget_t:
+        return indices, budgets
+
+    # 2) 低价值降档：按 v 升序，把 budget>最低档 的样本逐一降一档。
+    order = torch.argsort(v_values)  # 升序（低价值在前）
+    can_downgrade = True
+    while budgets.sum() > budget_t and can_downgrade:
+        can_downgrade = False
+        for i in order:
+            b = int(budgets[i])
+            if b > budget_set[0]:
+                budgets[i] = budget_set[budget_set.index(b) - 1]
+                can_downgrade = True
+                if budgets.sum() <= budget_t:
+                    return indices, budgets
+    if budgets.sum() <= budget_t:
+        return indices, budgets
+
+    # 3) 仍超 → 减候选：砍"高预算低价值"（waste=v/b 升序优先砍），保留 exploration 下限。
+    keep_min = round(len(indices) * exploration_fraction)
+    # waste 升序 = 低价值高预算（浪费）优先砍；idx 升序打破平局。
+    waste = v_values.float() / budgets.float()
+    cut_order = torch.argsort(waste, stable=True)
+    drop_set = set()
+    while budgets.sum() > budget_t and (len(indices) - len(drop_set)) > keep_min:
+        if len(cut_order) == 0:
+            break
+        i = int(cut_order[0].item())
+        cut_order = cut_order[1:]
+        if i in drop_set:
+            continue
+        drop_set.add(i)
+        budgets[i] = 0
+    keep_mask = torch.tensor(
+        [i not in drop_set for i in range(len(indices))], dtype=torch.bool)
+    # 被砍样本预算置 0 后仍返回同长张量（调用方按 mask 消费）。
+    return indices, budgets
+
+
+def compute_rollout_metrics(summary: dict, budgets=None,
+                            budget_t: int | None = None) -> dict:
+    """§七 Health Monitor 指标：7 个 rollout 效率指标。
+
+    summary 含：n_total/n_appended/n_eos/n_budget/n_loop/n_invalid/rollout_tokens。
+    budgets/budget_t 可选（预算配置）。返回 dict，键带 'rollout/' 前缀：
+    - rollout/rollout_tokens = summary['rollout_tokens']
+    - rollout/budget_utilization = rollout_tokens/budget_t（budget_t is None → 1.0）
+    - rollout/truncation_rate = n_budget/n_total
+    - rollout/loop_rate = n_loop/n_total
+    - rollout/eos_rate = n_eos/n_total
+    - rollout/accuracy_proxy = n_appended/n_total（UsefulSamples 占比）
+    - rollout/useful_per_token = n_appended/rollout_tokens（核心效率口径）
+    所有除法 div-zero 返回 0.0（n_total=0 或 rollout_tokens=0）。
+    """
+    n_total = summary.get('n_total', 0)
+    n_appended = summary.get('n_appended', 0)
+    n_eos = summary.get('n_eos', 0)
+    n_budget = summary.get('n_budget', 0)
+    n_loop = summary.get('n_loop', 0)
+    n_invalid = summary.get('n_invalid', 0)
+    rollout_tokens = summary.get('rollout_tokens', 0)
+
+    def safe_div(num, den):
+        return float(num / den) if den else 0.0
+
+    return {
+        'rollout/rollout_tokens': rollout_tokens,
+        'rollout/budget_utilization': safe_div(rollout_tokens, budget_t) if budget_t else 1.0,
+        'rollout/truncation_rate': safe_div(n_budget, n_total),
+        'rollout/loop_rate': safe_div(n_loop, n_total),
+        'rollout/eos_rate': safe_div(n_eos, n_total),
+        'rollout/accuracy_proxy': safe_div(n_appended, n_total),
+        'rollout/useful_per_token': safe_div(n_appended, rollout_tokens),
+    }
+
+
+def group_by_budget(cand: torch.Tensor, budgets: torch.Tensor) -> dict:
+    """§四 per-sample budget 分桶：同 budget 的 prompt 合批。
+
+    cand: (M,) 选中 prompt 全局索引；budgets: (M,) 对应预算。
+    返回 {budget: [cand_idx,...]}（budget 为 int，值列表为 int）。
+    """
+    buckets: dict = {}
+    for c, b in zip(cand.tolist(), budgets.tolist()):
+        buckets.setdefault(int(b), []).append(int(c))
+    return buckets
+
+
 class RefreshRingBuffer:
     """Refresh Pool 动态 ring buffer（§2 双池结构）。
 
