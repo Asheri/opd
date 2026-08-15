@@ -733,13 +733,30 @@ class FullStackOPDv2:
                         elapsed = base_done - last_refresh
                         if (elapsed >= refresh_min or elapsed >= refresh_max) \
                                 and selector is not None:
-                            run_refresh_phase(
+                            # Stage 2：消费 l2.rollout 短预算协议（max_new_tokens / eos / loop）。
+                            # fallback：未设 rollout 段 → 回落 cache.max_response_length（toy=4）。
+                            rollcfg = l2_cfg.get("rollout", {})
+                            max_new = int(rollcfg.get("max_new_tokens")
+                                          or l2c.get("max_response_length", 8192))
+                            eos_id = rollcfg.get("eos_token_id")
+                            # 注入 rollout_generator：vLLM 引擎优先，否则 None → toy 默认
+                            # model.generate_with_status（run_refresh_phase 内部回落）。
+                            _rollout_gen = getattr(rollout_engine, "generate_with_status", None) \
+                                if rollout_engine is not None else None
+                            rollout_summary = run_refresh_phase(
                                 student, teacher_rl, teacher_ref, student_ref,
                                 selector, rb, disag, fat_prompts, step_done,
                                 scheduler.staleness_q.current_version,
                                 int(l2_cfg.get("m_refresh", 1000)),
-                                int(l2c.get("max_response_length", 8192)),
-                                cache.top_k, self.device, prompt_state=ps)
+                                max_new,
+                                cache.top_k, self.device, prompt_state=ps,
+                                rollout_generator=_rollout_gen,
+                                eos_token_id=eos_id,
+                                loop_detection=rollcfg.get("loop_detection", True))
+                            # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
+                            if isinstance(rollout_summary, dict):
+                                mr.record({f"rollout/{k}": v
+                                           for k, v in rollout_summary.items()})
                             last_refresh = base_done
                             # Health Monitor 观测（Observe-only，不改训练）
                             hm_metrics = hm.record(step_done, hit_rate=1.0,

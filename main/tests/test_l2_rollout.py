@@ -269,3 +269,39 @@ def test_run_refresh_phase_all_loop_no_append():
     assert summary == {"n_total": 2, "n_appended": 0, "n_eos": 0,
                        "n_budget": 0, "n_loop": 2, "n_invalid": 0}
     assert rb.size == 0
+
+
+# --------------------------- 任务5：pipeline 接线（消费 l2.rollout + 记录 status） ---------------------------
+from fullstack_opd_v2.config import load_config
+from fullstack_opd_v2.pipeline import FullStackOPDv2
+
+
+import csv as _csv
+
+
+def _read_csv_headers(csv_path):
+    with open(csv_path, encoding="utf-8") as f:
+        return next(_csv.reader(f))
+
+
+def test_pipeline_l2_rollout_consumes_max_new_and_records_status(tmp_path):
+    """显式设 l2.rollout.max_new_tokens → pipeline 消费并落盘 rollout/ 状态指标。"""
+    cfg = load_config(overrides=[
+        "l2.enabled=true", "l2.t_train=3", "stage2.n_steps=6",
+        "stage2.batch_size=4", "l2.m_refresh=4",
+        "l2.cache.refresh_size=8", "l2.cache.max_response_length=4",
+        "l2.rollout.max_new_tokens=8"])
+    out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
+    headers = _read_csv_headers(out["metrics_csv"])
+    assert any(h.startswith("rollout/") for h in headers)
+
+
+def test_pipeline_l2_rollout_fallback_cache_max_resp(tmp_path):
+    """未设 l2.rollout.max_new_tokens → 回落 cache.max_response_length（toy=4）仍跑通。"""
+    cfg = load_config(overrides=[
+        "l2.enabled=true", "l2.t_train=3", "stage2.n_steps=6",
+        "stage2.batch_size=4", "l2.m_refresh=4",
+        "l2.cache.refresh_size=8", "l2.cache.max_response_length=4"])
+    out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
+    headers = _read_csv_headers(out["metrics_csv"])
+    assert any(h.startswith("rollout/") for h in headers)
