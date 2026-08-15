@@ -123,6 +123,7 @@ class L2RolloutCfg(_Strict):
     eos_token_id: int | None = None    # None=不判 EOS（全 BUDGET_STOP）；=int 采到即停
     loop_detection: bool = True        # 周期重复检测 → 判 LOOP（不进 refresh cache）
     pad_id: int = 0                    # 变长 batch 右 pad 值（不参与判定，仅占位）
+    token_budget_per_refresh: int | None = None   # §六：每轮刷新全局 rollout token 预算；None=无上限
 
 
 class L2DisagreementCfg(_Strict):
@@ -165,8 +166,14 @@ class L2SelectiveRolloutCfg(_Strict):
     value_fraction: float = 0.80     # §6.3 高价值占比
     coverage_fraction: float = 0.20
     value_weights: dict = Field(default_factory=lambda: {
-        "uncertainty": 0.4, "disagreement": 0.4, "novelty": 0.2})
+        "uncertainty": 0.3, "disagreement": 0.3, "reward": 0.2, "novelty": 0.2})
     compute_aware: bool = False      # §6.4 ELG
+    budget_mode: Literal["fixed", "adaptive"] = "fixed"   # §三：fixed=单预算；adaptive=分位数 4 档
+    fixed_budget: int = 1024                              # §一：fixed 模式统一预算
+    budget_set: tuple[int, ...] = (256, 512, 1024, 2048)  # §一：候选预算档位（easy/medium/uncertain/hard）
+    budget_quantiles: tuple[float, ...] = (0.25, 0.5, 0.75)  # §三：4 档用 3 个分位
+    token_aware: bool = False            # §五：Dynamic Refresh Ratio 感知 rollout token（默认关零回归）
+    token_weight: float = 0.1            # §五：token 信号权重
     max_same_prompt_fraction: float = 0.05   # §6.8
     exploration_fraction: float = 0.20
 
