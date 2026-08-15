@@ -42,3 +42,89 @@ def test_l2_rollout_disabled_default():
     cfg = load_config()
     assert cfg["l2"]["enabled"] is False
     assert cfg["l2"]["rollout"]["max_new_tokens"] == 1024
+
+
+# --------------------------- 任务2：model.py 短 rollout ---------------------------
+import torch
+
+from fullstack_opd_v2.model import (
+    CausalToyLM, build_length_mask, detect_loop, generate_batch,
+    generate_with_status,
+)
+
+
+def test_detect_loop_true():
+    r = torch.tensor([1, 2, 3, 1, 2, 3, 1, 2, 3])          # 尾部周期 3
+    assert detect_loop(r, periods=(2, 3, 4), min_len=6)
+
+
+def test_detect_loop_false():
+    r = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
+    assert not detect_loop(r, periods=(2, 3, 4), min_len=6)
+
+
+def test_detect_loop_short_sequence_no_false_positive():
+    # 短序列（<min_len）不误报
+    r = torch.tensor([1, 2, 1, 2])
+    assert not detect_loop(r, periods=(2, 3, 4), min_len=8)
+
+
+def test_generate_with_status_no_eos_all_budget():
+    m = CausalToyLM(vocab=64, max_len=64)
+    pr = torch.randint(0, 64, (2, 5))
+    out = generate_with_status(m, pr, max_new=8, eos_token_id=None)
+    assert out["statuses"] == ["budget_stop", "budget_stop"]
+    assert out["lengths"] == [8, 8]
+    assert out["eos_pos"] == [None, None]
+    assert out["looped"] == [False, False]
+    mask = build_length_mask(out["responses"], out["lengths"], out["eos_pos"])
+    assert mask.size() == (2, 8)
+    assert mask.sum(1).tolist() == [8, 8]
+
+
+def test_generate_with_status_eos_stops(tmp_path, monkeypatch):
+    # 注入固定采样：首 token=0（eos）→ 提前停，mask 在 eos 后全 0
+    import torch as _t
+    m = CausalToyLM(vocab=64, max_len=64)
+    pr = torch.randint(0, 64, (1, 5))
+    # monkeypatch torch.multinomial 返回首步 0、其余 1
+    calls = {"n": 0}
+
+    def fake_multinomial(probs, num_samples=1):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _t.tensor([[0]])
+        return _t.tensor([[1]])
+
+    monkeypatch.setattr(_t, "multinomial", fake_multinomial)
+    out = generate_with_status(m, pr, max_new=8, eos_token_id=0)
+    assert out["statuses"] == ["eos"]
+    assert out["lengths"] == [1]                 # eos_pos(0)+1 含 eos
+    assert out["eos_pos"] == [0]
+    mask = build_length_mask(out["responses"], out["lengths"], out["eos_pos"])
+    assert mask.sum(1).tolist() == [1]           # eos 后全 0
+
+
+def test_generate_with_status_loop_detected(tmp_path, monkeypatch):
+    # 构造周期 3 重复输出 → 判 loop
+    import torch as _t
+    m = CausalToyLM(vocab=64, max_len=64)
+    pr = torch.randint(0, 64, (1, 5))
+    seq = [1, 2, 3, 1, 2, 3, 1, 2, 3]            # 周期 3 重复（9 tokens）
+    it = iter(seq)
+    monkeypatch.setattr(_t, "multinomial",
+                        lambda probs, num_samples=1: _t.tensor([[next(it)]]))
+
+    out = generate_with_status(m, pr, max_new=9, eos_token_id=None,
+                               loop_detection=True, loop_periods=(3,))
+    assert out["statuses"] == ["loop"]
+    assert out["looped"] == [True]
+
+
+def test_generate_batch_unchanged():
+    # 回归：generate_batch 行为不变（Stage 0/1 依赖）
+    m = CausalToyLM(vocab=64, max_len=64)
+    pr = torch.randint(0, 64, (2, 5))
+    out = generate_batch(m, pr, max_new=4)
+    assert out.size() == (2, 4)
+    assert out.dtype == torch.long
