@@ -162,7 +162,7 @@ class HFCausalLM:
             if loop:
                 statuses.append("loop"); looped.append(True)
             elif lengths[i] == 0:
-                statuses.append("invalid"); looped.append(False)
+                statuses.append("empty"); looped.append(False)   # IMP-1d：长度 0=empty
             elif eos_pos[i] is not None:
                 statuses.append("eos"); looped.append(False)
             else:
@@ -217,7 +217,7 @@ class HFCausalLM:
             if loop:
                 statuses.append("loop"); looped.append(True)
             elif L == 0:
-                statuses.append("invalid"); looped.append(False)
+                statuses.append("empty"); looped.append(False)   # IMP-1d：长度 0=empty
             elif ep is not None:
                 statuses.append("eos"); looped.append(False)
             else:

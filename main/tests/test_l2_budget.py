@@ -115,6 +115,8 @@ def test_compute_rollout_metrics():
     assert m['rollout/loop_rate'] == pytest.approx(0.1)
     assert m['rollout/eos_rate'] == pytest.approx(0.3)
     assert m['rollout/accuracy_proxy'] == pytest.approx(0.4)
+    # IMP-1d：valid_rate = valid/generated（= accuracy_proxy，40/100）
+    assert m['rollout/valid_rate'] == pytest.approx(0.4)
     assert m['rollout/useful_per_token'] == pytest.approx(0.2)  # 40/200
 
 
@@ -339,7 +341,7 @@ def test_pipeline_adaptive_budget_smoke():
     assert sorted(set(log)) == sorted(set(budgets.tolist()))
     # token 效率指标：7 键 + useful_per_token 合法 float
     rm = compute_rollout_metrics(summary, budgets, budget_t)
-    assert len(rm) == 7
+    assert len(rm) == 8   # 7 + rollout/valid_rate（IMP-1d）
     assert all(k.startswith("rollout/") for k in rm)
     assert isinstance(rm["rollout/useful_per_token"], float)
     assert rm["rollout/rollout_tokens"] == summary["rollout_tokens"]

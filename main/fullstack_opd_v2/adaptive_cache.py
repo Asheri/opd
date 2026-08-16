@@ -143,6 +143,9 @@ def compute_rollout_metrics(summary: dict, budgets=None,
         'rollout/loop_rate': safe_div(n_loop, n_total),
         'rollout/eos_rate': safe_div(n_eos, n_total),
         'rollout/accuracy_proxy': safe_div(n_appended, n_total),
+        # IMP-1d：有效样本率 = valid / generated（主验收指标，目标 >= 0.50）。
+        # 与 accuracy_proxy 同值但语义显式（valid=non_empty∧¬loop∧token 有效）。
+        'rollout/valid_rate': safe_div(n_appended, n_total),
         'rollout/useful_per_token': safe_div(n_appended, rollout_tokens),
     }
 
@@ -613,8 +616,13 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         expected = m_selected * max_resp_len
         budgets_used = m_selected * max_resp_len
     # loop/invalid 样本跳过 teacher 前向与 append（需求 4），仍计入 summary
-    valid = [i for i in range(len(statuses)) if statuses[i] not in ("loop", "invalid")]
+    # 有效样本定义（IMP-1d）：non_empty ∧ ¬loop_detected ∧ token 序列有效。
+    #   valid = eos + budget_stop（budget_stop 的 clean trajectory 可保留）；
+    #   empty（长度 0）与 invalid（非空但序列无效）与 loop 都不进 refresh 训练。
+    valid = [i for i in range(len(statuses))
+             if statuses[i] not in ("loop", "invalid", "empty")]
     n_loop = statuses.count("loop"); n_invalid = statuses.count("invalid")
+    n_empty = statuses.count("empty")
     n_eos = statuses.count("eos"); n_budget = statuses.count("budget_stop")
     valid_lens = [lengths[i] for i in valid]
     # P1.3：rollout_tokens=进 refresh 池的有效样本 token 数（非名义预算）。
@@ -622,6 +630,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     if not valid:
         return {"n_total": len(statuses), "n_appended": 0, "n_eos": n_eos,
                 "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
+                "n_empty": n_empty, "valid_rate": 0.0,
                 "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
                 "budgets_used": int(budgets_used),
                 "teacher_forward_tokens": 0,
@@ -677,6 +686,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     # （2×Σ有效长，供 Performance/Teacher Compute 比值）。
     return {"n_total": len(statuses), "n_appended": len(valid), "n_eos": n_eos,
             "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
+            "n_empty": n_empty,
+            "valid_rate": (len(valid) / len(statuses)) if len(statuses) else 0.0,
             "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
             "budgets_used": int(budgets_used),
             "teacher_forward_tokens": 2 * int(sum(valid_lens)),

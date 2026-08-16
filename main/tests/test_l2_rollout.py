@@ -281,7 +281,7 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
     n = 4
     # 4 样本：0=eos, 1=budget_stop, 2=loop, 3=invalid
     resp = torch.randint(1, V, (n, 6))
-    statuses = ["eos", "budget_stop", "loop", "invalid"]
+    statuses = ["eos", "budget_stop", "loop", "empty"]   # 长度 0 = empty（IMP-1d）
     lengths = [3, 6, 6, 0]
     eos_pos = [2, None, None, None]
     looped = [False, False, True, False]
@@ -294,7 +294,8 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
     # 成本字段（P1.3）：valid=[eos(3),budget_stop(6)] → rollout=9；名义预算=4×6=24；
     # teacher 前向=2×(3+6)=18
     assert summary == {"n_total": 4, "n_appended": 2, "n_eos": 1,
-                       "n_budget": 1, "n_loop": 1, "n_invalid": 1,
+                       "n_budget": 1, "n_loop": 1, "n_invalid": 0,
+                       "n_empty": 1, "valid_rate": 0.5,     # 2/4（IMP-1d）
                        "rollout_tokens": 9, "expected_rollout_tokens": 24,
                        "budgets_used": 24, "teacher_forward_tokens": 18,
                        "loop_periods": (2, 3, 4),
@@ -384,6 +385,7 @@ def test_run_refresh_phase_all_loop_no_append():
                                 rollout_generator=gen)
     assert summary == {"n_total": 2, "n_appended": 0, "n_eos": 0,
                        "n_budget": 0, "n_loop": 2, "n_invalid": 0,
+                       "n_empty": 0, "valid_rate": 0.0,    # 0/2（IMP-1d）
                        "rollout_tokens": 0, "expected_rollout_tokens": 12,
                        "budgets_used": 12, "teacher_forward_tokens": 0,
                        "loop_periods": (2, 3, 4),
@@ -865,3 +867,33 @@ def test_pipeline_cold_start_trains_after_pool_ready(tmp_path):
                for r in rollout_rows)
     # 训练确实发生（存在 pool="refresh" 行）
     assert any(isinstance(m, dict) and m.get("pool") == "refresh" for m in out["metrics"])
+# --------------------------- IMP-1d：有效样本率定义（valid_rate + 完整 outcome） ---------------------------
+def test_run_refresh_phase_valid_rate_breakdown():
+    """IMP-1d：valid = non_empty ∧ ¬loop ∧ token 序列有效 → 完整 outcome 统计 + valid_rate。
+    5 样本：eos(valid) / budget_stop(valid) / loop / invalid(非空) / empty(长度0)。
+    valid_rate = 2/5 = 0.4；loop/invalid/empty 都不进 refresh 池。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=16, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (5, 5))
+    n = 5
+    resp = torch.randint(1, V, (n, 6))
+    statuses = ["eos", "budget_stop", "loop", "invalid", "empty"]
+    lengths = [3, 6, 6, 4, 0]
+    eos_pos = [2, None, None, None, None]
+    looped = [False, False, True, False, False]
+    gen = _fake_rollout(resp, statuses, lengths, eos_pos, looped)
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen)
+    assert summary["n_total"] == 5                       # generated
+    assert summary["n_eos"] == 1 and summary["n_budget"] == 1
+    assert summary["n_loop"] == 1
+    assert summary["n_invalid"] == 1 and summary["n_empty"] == 1
+    assert summary["n_appended"] == 2                    # valid = eos + budget_stop
+    assert summary["valid_rate"] == pytest.approx(0.4)   # 2/5（>=0.50 目标）
+    assert rb.size == 2                                  # loop/invalid/empty 不进池
+    assert sorted(rb._status) == ["budget_stop", "eos"]

@@ -198,7 +198,7 @@ def generate_with_status(model: CausalToyLM, prompts: torch.Tensor, max_new: int
         if loop:
             statuses.append("loop"); looped.append(True)
         elif lengths[i] == 0:
-            statuses.append("invalid"); looped.append(False)
+            statuses.append("empty"); looped.append(False)   # IMP-1d：长度 0=empty（非空无效=invalid 保留）
         elif eos_pos[i] is not None:
             statuses.append("eos"); looped.append(False)
         else:

@@ -327,7 +327,7 @@ def parse_vllm_outputs(outs, max_new: int, eos_token_id=None,
         if loop:
             status = "loop"
         elif length == 0:
-            status = "invalid"
+            status = "empty"
         statuses.append(status); lengths.append(length)
         eos_pos.append(ep); looped.append(loop)
     return {"responses": None, "statuses": statuses, "lengths": lengths,
