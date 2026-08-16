@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", type=Path, default=None,
                    help="把建议的 l2.rollout 配置（loop_periods/eos_token_id）写成 YAML（IMP-1b）")
+    p.add_argument("--labels", type=Path, default=None,
+                   help="人工标注 jsonl（每行 {\"label\": true/false}，与 rollout 顺序对齐）"
+                        "——用于 false_positive/negative 计算（IMP-1 校准）")
+    p.add_argument("--report", type=Path, default=None,
+                   help="输出 loop detector 校准 markdown 报告（IMP-1，见 docs/reports）")
     return p.parse_args()
 
 
@@ -105,6 +110,153 @@ def write_yaml(report: dict, out_path: Path | str) -> str:
         },
     }
     text = yaml.safe_dump(body, allow_unicode=True, sort_keys=False)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+    return text
+
+
+# ============================ IMP-1：loop detector 校准（sweep） ============================
+# 配置矩阵：periods × min_len。periods 覆盖窄/中/宽三档，min_len 覆盖 8/16/24（2-3 个候选）。
+# 判断标准：选「误报最低且能抓住明显循环」的配置；不得为凑 <50% 人为放松 detector。
+DEFAULT_SWEEP_CONFIGS: list[tuple[tuple[int, ...], int]] = [
+    ((2, 3, 4), 8),
+    ((2, 3, 4), 16),
+    ((2, 3, 4), 24),
+    ((4, 6, 8), 8),
+    ((4, 6, 8), 16),
+    ((4, 6, 8), 24),
+    ((6, 8, 12), 8),
+    ((6, 8, 12), 16),
+    ((6, 8, 12), 24),
+]
+
+
+def sweep_loop_configs(all_new: list[list[int]],
+                       configs: list[tuple[tuple[int, ...], int]],
+                       labels: list[bool] | None = None) -> dict:
+    """对每种 (periods, min_len) 配置计算 loop 检测指标（IMP-1 校准）。
+
+    all_new: list[list[int]]，每条为一条 rollout 的新生成 token 序列（已去 pad）。
+    configs: list of (periods: tuple[int,...], min_len: int)。
+    labels : 可选人工标注（True=真退化循环；False=正常 CoT），与 all_new 顺序对齐。
+             None 时 false_positive_rate / false_negative_cases 置 None。
+    返回 {config_key: dict}，config_key 形如 "periods=(2, 3, 4),min_len=8"：
+      - loop_detected_count / loop_rate / samples_flagged
+      - false_positive_rate / false_negative_cases（labels 可用时）
+    判定用与训练完全一致的 detect_loop 语义（尾部周期自相关 + min_len 门槛），
+    保证校准结果可直接迁移到 L2 rollout 刷新相位。
+    """
+    import torch
+    from fullstack_opd_v2.model import detect_loop
+    n = len(all_new)
+    out: dict = {}
+    for periods, min_len in configs:
+        key = f"periods={tuple(periods)},min_len={int(min_len)}"
+        flagged = [i for i, seq in enumerate(all_new)
+                   if detect_loop(torch.tensor(seq), periods=tuple(periods),
+                                  min_len=int(min_len))]
+        res = {
+            "loop_detected_count": len(flagged),
+            "loop_rate": len(flagged) / n if n else 0.0,
+            "samples_flagged": flagged,
+            "false_positive_rate": None,
+            "false_negative_cases": None,
+        }
+        if labels is not None:
+            flagged_set = set(flagged)
+            n_false = sum(1 for lb in labels if not lb)
+            fp = [i for i in flagged if i < len(labels) and not labels[i]]
+            fn = [i for i in range(min(n, len(labels)))
+                  if labels[i] and i not in flagged_set]
+            res["false_positive_rate"] = len(fp) / n_false if n_false else 0.0
+            res["false_negative_cases"] = fn
+        out[key] = res
+    return out
+
+
+def write_calibration_report(sweep_results: dict, out_path: Path | str,
+                             meta: dict | None = None) -> str:
+    """生成 loop detector 校准 markdown 报告（方法学 + 配置矩阵 + 结果表）。返回内容并落盘。
+
+    sweep_results: sweep_loop_configs 输出（config_key -> 指标 dict）。
+    meta: 可选 {n, max_new, model, eos_token_id, date, status, labels_available}。
+    空 sweep_results → 占位报告（待服务器真实 rollout 数据填充），不伪造通过。
+    """
+    meta = meta or {}
+    out_path = Path(out_path)
+    L: list[str] = []
+    L.append("# Rollout Loop Detector 校准报告（IMP-1）")
+    L.append("")
+    L.append("> 日期：" + str(meta.get("date", "2026-08-16")) +
+             " ｜ 状态：" + str(meta.get("status", "待 GPU")) +
+             " ｜ 模型：" + str(meta.get("model", "-")) +
+             " ｜ N=" + str(meta.get("n", "-")) +
+             " ｜ max_new=" + str(meta.get("max_new", "-")) +
+             " ｜ eos_token_id=" + str(meta.get("eos_token_id", "-")) +
+             " ｜ 人工标注：" + ("有" if meta.get("labels_available") else "无"))
+    L.append("")
+    L.append("## 背景与目标")
+    L.append("")
+    L.append("- 当前 loop 检测存在**误杀风险**：真实 Qwen3-1.7B + Skywork 短 rollout 循环退化率")
+    L.append("  75-87%，默认 `(2,3,4)` 可能把正常长 CoT 误判为 loop（误报）。")
+    L.append("- 目标：在配置矩阵（periods × min_len）中选择「**误报最低且能抓住明显循环**」的配置。")
+    L.append("- 硬约束：**不得为凑 `<50%` 人为放松 detector**——若最低误报配置仍误杀正常 CoT，")
+    L.append("  应记录并转向采样侧（temperature / repetition_penalty）治理，而非放宽检测。")
+    L.append("")
+    L.append("## 方法学")
+    L.append("")
+    L.append("1. 真实 rollout N 条（temperature=1.0，短预算 `max_new`，新生成 token 序列去 pad）。")
+    L.append("2. 对每条 rollout，用与训练完全一致的 `detect_loop`（尾部周期自相关 + min_len 门槛）判定。")
+    L.append("3. 对每种 (periods, min_len) 配置统计：`loop_detected_count` / `loop_rate` /")
+    L.append("   `samples_flagged`；有**人工标注**时另算 `false_positive_rate` / `false_negative_cases`。")
+    L.append("4. 人工抽样检查：正常长 CoT 是否被误杀；`Final Answer` 重复是否被捕获；")
+    L.append("   真正 token-level repetition 是否被捕获。")
+    L.append("")
+    L.append("## 配置矩阵")
+    L.append("")
+    L.append("| periods | min_len |")
+    L.append("|---|---|")
+    for cfg_key in sweep_results:
+        periods, min_len = cfg_key.split(",min_len=")
+        L.append(f"| `{periods.split('=')[1]}` | {min_len} |")
+    if not sweep_results:
+        L.append("| （待 GPU 填充） | |")
+    L.append("")
+    L.append("## 结果")
+    L.append("")
+    if not sweep_results:
+        L.append("> **（无数据）**：真实 rollout 100 条需服务器 GPU，本机无 GPU 未伪造通过；")
+        L.append("> 此表为占位，待服务器 `calibrate_rollout.py --n 100 --report ...` 填充。")
+        L.append("")
+    L.append("| config | loop_detected_count | loop_rate | FP rate | FN cases | samples_flagged |")
+    L.append("|---|---:|---:|---:|---|---|")
+    for cfg_key, r in sweep_results.items():
+        fn = ",".join(str(i) for i in (r["false_negative_cases"] or [])) or "-"
+        fp = ("-" if r["false_positive_rate"] is None
+              else f"{r['false_positive_rate']:.3f}")
+        flags = ",".join(str(i) for i in r["samples_flagged"]) or "-"
+        L.append(f"| `{cfg_key}` | {r['loop_detected_count']} | "
+                 f"{r['loop_rate']:.3f} | {fp} | {fn} | {flags} |")
+    L.append("")
+    L.append("## 人工抽样检查清单（需 GPU + 人工）")
+    L.append("")
+    L.append("- [ ] 正常长 CoT 是否被误杀（抽查 flagged 样本看内容）")
+    L.append("- [ ] `Final Answer` 标记重复是否被捕获")
+    L.append("- [ ] 真正 token-level repetition 是否被捕获")
+    L.append("- [ ] 误报最低配置下的误报样本内容（是否为真实退化或误判）")
+    L.append("")
+    L.append("## 决策")
+    L.append("")
+    L.append("- 选「误报最低且能抓住明显循环」的配置作为 `l2.rollout.loop_periods` / `loop_min_len`。")
+    L.append("- 若最低误报配置仍误杀正常 CoT：不放松 detector，转向采样侧治理并记录。")
+    L.append("")
+    L.append("## GPU 验证状态")
+    L.append("")
+    L.append("- 真实 rollout 100 条：**待服务器 GPU**（本机无 GPU，不伪造通过）。")
+    L.append("- 人工标注与抽样检查：**待**。")
+    L.append("- 结果表填充后，本报告才可视为校准结论。")
+    L.append("")
+    text = "\n".join(L)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
     return text
@@ -180,6 +332,26 @@ def main() -> None:
     periods = report["suggested_loop_periods"]
     print(f"\n建议 loop_periods = {periods}（命中率>5% 的周期）", flush=True)
     print(f"建议 eos_token_id = {report['suggested_eos_token_id']}（l2.rollout.eos_token_id）", flush=True)
+
+    # ---- IMP-1：loop detector 校准（sweep periods × min_len）----
+    labels = None
+    if args.labels is not None:
+        labels = [bool(json.loads(l)["label"])
+                  for l in open(args.labels, encoding="utf-8") if l.strip()]
+    sweep = sweep_loop_configs(all_new, DEFAULT_SWEEP_CONFIGS, labels)
+    print("\n=== loop detector 校准（sweep） ===", flush=True)
+    for k, r in sweep.items():
+        fp = "-" if r["false_positive_rate"] is None else f"{r['false_positive_rate']:.3f}"
+        fn = len(r["false_negative_cases"]) if r["false_negative_cases"] else 0
+        print(f"  {k}: loop={r['loop_detected_count']}/{report['n']} "
+              f"rate={r['loop_rate']:.3f} FP_rate={fp} FN_cases={fn}", flush=True)
+    if args.report is not None:
+        meta = {"n": report["n"], "max_new": args.max_new, "model": str(args.model),
+                "eos_token_id": report["eos_tok"], "date": "2026-08-16",
+                "status": ("已填充" if all_new else "待服务器真实 rollout 数据填充"),
+                "labels_available": labels is not None}
+        text = write_calibration_report(sweep, args.report, meta)
+        print(f"\n✅ 校准报告写入 {args.report}", flush=True)
 
     # IMP-1b：可选 YAML 落盘（不只 stdout）
     if args.output is not None:
