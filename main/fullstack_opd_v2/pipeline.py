@@ -449,6 +449,12 @@ class FullStackOPDv2:
                         "请用新版 `opd cache` 子命令重建（stage1_build_cache 已把 fat 上下文落盘）")
             timings["stage0_rl"] = 0.0
             timings["stage1_cache"] = time.perf_counter() - t
+            # L2（任务 6.1）load_cache 补丁：load_cache 路径原本跳过 Stage 0、不加载教师对
+            # （teacher_rl/ref 保持 None）——但 L2 的 rollout 刷新相位需要教师算 disagreement
+            # （4 chosen logp），缺了会 NoneType 崩溃。L2 启用时在此补加载预下载教师对
+            # （hf 路径 _stage0_teachers 跳过 RL 直接加载两档；toy 路径重建）。
+            if bool((self.cfg.get("l2") or {}).get("enabled", False)):
+                teacher_rl, teacher_ref = self._stage0_teachers()
         else:
             logger.info("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
             t = time.perf_counter()
@@ -667,7 +673,9 @@ class FullStackOPDv2:
                         capacity=int(l2c.get("refresh_size", 5000)),
                         top_k=cache.top_k, vocab=cache.vocab,
                         student_top_k=int(s2cfg.get("top_k_student", 0) or cache.top_k),
-                        value_protect_quantile=l2c.get("value_protect_quantile", 0.9))
+                        value_protect_quantile=l2c.get("value_protect_quantile", 0.9),
+                        # G7（§3.5）：sample utility U_i 驱动价值保护（L2UtilityCfg 权重）
+                        utility_weights=l2_cfg.get("utility") or None)
                     _rb_ref = rb
                     # G8：resume 恢复 L2 ring buffer 内容（含行为策略 s_old + 元数据），
                     # 使续跑后 refresh 池保留、可继续被双池 feeder 消费。
@@ -684,7 +692,6 @@ class FullStackOPDv2:
                         alert_cooldown=int(l2_cfg.get("health_monitor", {})
                                            .get("alert_cooldown", 50)))
                     rc = l2_cfg.get("refresh_ratio", {})
-                    sc_tok = l2_cfg.get("selective_rollout", {})
                     drc = DynamicRatioController(
                         initial=rc.get("initial", 0.3), min=rc.get("min", 0.1),
                         max=rc.get("max", 0.6), mode=rc.get("mode", "adaptive"),
@@ -693,9 +700,7 @@ class FullStackOPDv2:
                         quality_weight=rc.get("quality_weight", 0.25),
                         ema_beta=rc.get("ema_beta", 0.9),
                         warmup_steps=rc.get("warmup_steps", 500),
-                        max_step_change=rc.get("max_step_change", 0.05),
-                        token_aware=sc_tok.get("token_aware", False),
-                        token_weight=sc_tok.get("token_weight", 0.1))
+                        max_step_change=rc.get("max_step_change", 0.05))
                     sc = l2_cfg.get("selective_rollout", {})
                     selector = (RefreshSelector(
                         ps, candidate_multiplier=sc.get("candidate_multiplier", 4),
@@ -710,6 +715,9 @@ class FullStackOPDv2:
                     scheduler._l2_enabled = True
                     scheduler._refresh_buffer = rb
                     scheduler._drc = drc
+                    # G5（§2 Q4）：base 池跳过陈旧度截断（base s_old 恒新），
+                    # 仅 refresh 池受截断。
+                    scheduler.staleness_drop_base = False
                     # §3 初始 student（student_ref）：warmup_student 即 P1-4 独立实例；
                     # warmup_M=0 时未建，则新建一份初始 student 副本。
                     student_ref = warmup_student if warmup_student is not None else \
@@ -742,11 +750,6 @@ class FullStackOPDv2:
                         # G4：距上次刷新 >= min_interval 才触发（max_interval 强制），
                         # 否则本相位纯训练、跳过 refresh 与 α 更新。
                         elapsed = base_done - last_refresh
-                        # G4：距上次刷新 >= min_interval 才触发（max_interval 强制）。
-                        # 注：不要求 selector 非 None——selective 关闭（E6 / S3_E0 随机对照）时
-                        # selector=None，run_refresh_phase 走 torch.randint 均匀随机选 prompt
-                        # 仍产出 rollout/ 指标（改造后 compute_rollout_metrics 无条件落盘），
-                        # 使「随机单预算」对照实验可与其他实验同口径对比。
                         if elapsed >= refresh_min or elapsed >= refresh_max:
                             # Stage 2：消费 l2.rollout 短预算协议（max_new_tokens / eos / loop）。
                             # fallback：未设 rollout 段 → 回落 cache.max_response_length（toy=4）。
@@ -754,6 +757,13 @@ class FullStackOPDv2:
                             max_new = int(rollcfg.get("max_new_tokens")
                                           or l2c.get("max_response_length", 8192))
                             eos_id = rollcfg.get("eos_token_id")
+                            # IMP-1a：rollout 采样温度（默认 0.7，pipeline 不写死；1.0 复现旧行为）。
+                            temperature = float(rollcfg.get("temperature", 0.7))
+                            # P1.5：真实 pad 判定——HF 学生用 config 真实 pad_token_id
+                            # 替代 pad_id=0 近似（toy 默认 0 无碍；Qwen3 真实 pad≈1516xx）。
+                            _pad_id = int(rollcfg.get("pad_id", 0))
+                            if self.cfg.get("model_kind") == "hf":
+                                _pad_id = int(getattr(student, "pad_token_id", None) or _pad_id)
                             # 注入 rollout_generator（绑定方法，run_refresh_phase 按
                             # GenerateWithStatus(prompts, max_new=...) 约定调用）：
                             #   vLLM 引擎优先；真实 HF 学生用 KV-cached 快速路径
@@ -798,6 +808,10 @@ class FullStackOPDv2:
                                 rollout_generator=_rollout_gen,
                                 eos_token_id=eos_id,
                                 loop_detection=rollcfg.get("loop_detection", True),
+                                pad_id=_pad_id,
+                                temperature=temperature,
+                                compute_disagreement=bool(
+                                    (l2_cfg.get("disagreement") or {}).get("enabled", True)),
                                 cand=indices, budgets=budgets, budget_t=budget_t)
                             # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
                             roll_metrics = None
@@ -805,30 +819,36 @@ class FullStackOPDv2:
                                 mr.record({f"rollout/{k}": v
                                            for k, v in rollout_summary.items()})
                                 # Stage 3：token 效率指标（键已带 rollout/ 前缀）落盘 mr。
+                                # 无条件调用（budgets=None 单预算也产出），供 S3 同口径对比。
                                 roll_metrics = compute_rollout_metrics(
                                     rollout_summary, budgets, budget_t)
                                 mr.record(roll_metrics)
                                 # 并入返回 metrics 列表（供 run_experiment / aggregate_stage3
-                                # 读 rollout/ 指标做 S3 同口径对比）。带 step/version 保证
-                                # 末步断点 cm.save(metrics[-1]["step"/"version"]) 安全。
+                                # 读 rollout/ 指标做 S3 同口径对比）。phase=rollout 供 n_steps
+                                # 过滤；不写 version，避免末步断点误取 rollout 行（_last_train）。
                                 metrics.append({
                                     "step": step_done,
-                                    "version": scheduler.staleness_q.current_version,
                                     "phase": "rollout",
+                                    # 原始 status 计数（rollout/n_total/n_appended/...，供
+                                    # run_s2_real / test_l2_integration 消费）
+                                    **{f"rollout/{k}": v
+                                       for k, v in rollout_summary.items()},
+                                    # 派生效率指标（compute_rollout_metrics，供 S3 同口径对比）
                                     **roll_metrics})
+                            logger.info(f"[L2] rollout temperature={temperature:.3f} "
+                                        f"(m_refresh={int(l2_cfg.get('m_refresh', 1000))})")
                             last_refresh = base_done
                             # Health Monitor 观测（Observe-only，不改训练）。
-                            # hm.record 只按 4 个已知键（hit_rate/refresh_age_p95/reuse_p95/
-                            # max_length_ratio）做分类，其余 kwargs 原样透传，故把 rollout/ 键
-                            # 并入 hm.record 顶层安全、不破坏既有分类逻辑（任务 5 谨慎要求）。
+                            # hm.record 只按 4 个已知键做分类，其余 kwargs 原样透传，
+                            # 把 rollout/ 键并入 hm.record 顶层安全、不破坏既有分类逻辑。
                             hm_metrics = hm.record(
                                 step_done, hit_rate=1.0,
                                 refresh_age_p95=0, reuse_p95=0, max_length_ratio=0,
                                 **(roll_metrics or {}))
                             mr.record(hm_metrics)
-                            # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）
+                            # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）。
                             # 任务 6：传 rollout_efficiency（expected/actual tokens，§五）。
-                            # >1 省 token → 放宽 α；<1 超用 → 收紧。方向修正（此前写反）。
+                            # >1 省 token → 放宽 α；<1 超用 → 收紧（方向修正，此前写反）。
                             _eff = (rollout_summary.get("expected_rollout_tokens") / max(
                                 1, rollout_summary.get("rollout_tokens", 1))
                                 if isinstance(rollout_summary, dict) else None)
@@ -867,8 +887,12 @@ class FullStackOPDv2:
         # 计时落盘（时间优化指标1的证据）
         with open(os.path.join(paths["run_dir"], "timings.json"), "w", encoding="utf-8") as f:
             json.dump({k: round(v, 4) for k, v in timings.items()}, f, indent=2)
-        # 末步断点无条件存（保证最终状态可被 AIME 蒸馏后评估），随附 KL 锚点 ref
-        last_ck = cm.save(metrics[-1]["step"], student, metrics[-1]["version"],
+        # 末步断点无条件存（保证最终状态可被 AIME 蒸馏后评估），随附 KL 锚点 ref。
+        # ⚠️ metrics 尾部可能是 rollout 相位行（phase=rollout，无 version）——取最后一个
+        # 训练步（含 version）作末步断点。
+        _last_train = next((m for m in reversed(metrics)
+                            if isinstance(m, dict) and "version" in m), None)
+        last_ck = cm.save(_last_train["step"], student, _last_train["version"],
                           self.cfg, force=True, ref=ref,
                           optimizer=(_scheduler_ref.opt if _scheduler_ref is not None
                                      else None),
@@ -877,7 +901,7 @@ class FullStackOPDv2:
                                         if torch.cuda.is_available() else None)},
                           refresh_buffer=((_rb_ref.state_dict() if _rb_ref is not None else None)
                                           if l2_enabled else None)) \
-            if metrics else None
+            if _last_train is not None else None
         logger.info(f"训练完成: {len(metrics)} 步, 总耗时 {timings['total']:.2f}s, 断点 {last_ck or '无'}")
 
         return {

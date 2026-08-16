@@ -23,14 +23,6 @@ from __future__ import annotations
 
 import torch
 
-
-# ============================================================
-# Stage 3：Budget-Aware Selective Rollout 纯函数区
-# 4 个纯函数：Select(p, B_p) 的 budget 分配 / 预算控制器 / 健康指标 / 分桶。
-# 不依赖任何类状态，只依赖 torch 与传入参数，可 CPU 单测、与 selector 解耦。
-# ============================================================
-
-
 def assign_budgets(v_values: torch.Tensor,
                    budget_set=(256, 512, 1024, 2048),
                    quantiles=(0.25, 0.5, 0.75)) -> torch.Tensor:
@@ -186,12 +178,17 @@ class RefreshRingBuffer:
 
     def __init__(self, capacity: int, top_k: int, vocab: int,
                  student_top_k: int | None = None,
-                 value_protect_quantile: float = 0.9):
+                 value_protect_quantile: float = 0.9,
+                 utility_weights: dict | None = None):
         self.capacity = capacity
         self.top_k = top_k                 # 教师 top-K（Δ_T 支撑）
         self.student_top_k = student_top_k or top_k   # 行为策略学生 top-K（s_old 支撑）
         self.vocab = vocab
         self.value_protect_quantile = value_protect_quantile
+        # G7（§3.5 sample utility）：U_i = λ_D·D + λ_R·R̂ − λ_A·A 驱动价值保护。
+        # 键名对齐 L2UtilityCfg：disagreement_weight / reward_weight / age_penalty。
+        # None → 退回纯 disagreement 分位（向后兼容）。
+        self.utility_weights = dict(utility_weights or {}) if utility_weights else None
         # ring buffer 槽位（预分配 capacity，append 原地写）
         self.ids: torch.Tensor | None = None        # (cap, T, Kt)  教师 top-K id
         self.delta_k: torch.Tensor | None = None    # (cap, T, Kt)  Δ_T on 教师 top-K
@@ -283,18 +280,36 @@ class RefreshRingBuffer:
             self._prompt_idx.append(prompt_idx)
             self._response.append(response)
             self._status.append(status)
-        # 价值保护：高于分位的样本标记
-        if disagreement_abs > self._value_threshold():
+        # 价值保护：高于分位的样本标记（G7：U_i 驱动，None 退回 disagreement）。
+        # ⚠️ 先更新 size（新样本已写入槽位，属有效样本），否则首条 append 时
+        # _value_threshold 按 size=0 构造空张量 → quantile 崩。
+        self.size = min(self.size + 1, self.capacity)
+        if self._utility(pos, generation_step) > self._value_threshold(generation_step):
             self._protected[pos] = True
         self._write_pos = (pos + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
         return pos
 
-    def _value_threshold(self) -> float:
-        """当前 disagreement 的价值保护分位（无样本时 inf）。"""
+    def _utility(self, pos: int, current_step: int) -> float:
+        """G7（§3.5）：U_i = λ_D·D + λ_R·R̂ − λ_A·A。D=disagreement、R̂=reward_estimate、
+        A=age(current_step−gen_step)。utility_weights=None → 退回 disagreement（旧行为）。"""
+        if self.utility_weights is None:
+            return self._disagreements[pos]
+        ld = self.utility_weights.get("disagreement_weight", 0.5)
+        lr = self.utility_weights.get("reward_weight", 0.3)
+        la = self.utility_weights.get("age_penalty", 0.2)
+        d = self._disagreements[pos]
+        r = self.reward_estimate(pos)
+        age = max(0, current_step - self._gen_steps[pos])
+        return ld * d + lr * r - la * age
+
+    def _value_threshold(self, current_step: int = 0) -> float:
+        """当前 utility 的价值保护分位（无样本时 inf；None 权重=disagreement 分位）。"""
         if not self._disagreements:
             return float("inf")
-        return float(torch.tensor(self._disagreements).quantile(
+        vals = [self._utility(i, current_step) for i in range(self.size)]
+        # float64：避免单样本/多样本时 float32 量化把「恰等于分位」的样本误判为
+        # `>` 受保护（0.35 在 float32 下是 0.34999999 → 0.35 > 0.34999999 误触发）。
+        return float(torch.tensor(vals, dtype=torch.float64).quantile(
             self.value_protect_quantile).item())
 
     def get(self, idxs: torch.Tensor) -> dict:
@@ -476,11 +491,15 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       eos_token_id=None,           # Stage 2：None=不判 EOS（全 budget_stop）
                       loop_detection=True,         # Stage 2：周期重复判 loop
                       pad_id=0,
+                      temperature: float = 0.7,    # IMP-1a：采样温度（默认 0.7 降循环率；1.0 旧行为）
                       budgets=None,                # Stage 3：per-sample budget (M,) long；None→单预算
                       budget_t=None,               # Stage 3：全局 token 预算；None→无上限
                       budget_set=(256, 512, 1024, 2048),
                       exploration_fraction=0.20,
-                      cand=None):                  # Stage 3：预选 prompt 索引 (M,)；None→内部 select
+                      cand=None,                   # Stage 3：预选 prompt 索引 (M,)；None→内部 select
+                      compute_disagreement=True):  # P1.4：disagreement.enabled 硬 gate
+                                                  # False 时跳过 D 计算（省 student/student_ref
+                                                  # chosen-logp 前向），append 用 D=0
     """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 短 rollout（带 status）
     -> 4 个 chosen logp -> D_i^abs -> append_refresh。teacher 前向在此（_train_step 不动）。
 
@@ -489,7 +508,13 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     loop/invalid 样本跳过 teacher 前向与 append（不进 refresh cache，§短 rollout），
     仍计入返回 summary。响应按有效长度构建长度式 mask（m_t=1 当 t<length）。
 
-    返回 summary dict：{n_total, n_appended, n_eos, n_budget, n_loop, n_invalid}。
+    Stage 3：budgets 非 None 时走 per-sample budget 分桶（Select(p, B_p)）——先
+    enforce_budget（超全局 budget_t 降档），再按 budget 分组逐档生成，prompt 与
+    budget 一一对应；budgets=None 走原单预算路径（零回归）。cand 可由外部传入
+    （select_with_budget 的 indices，与 budgets 配对）；None → 内部 select。
+
+    返回 summary dict：{n_total, n_appended, n_eos, n_budget, n_loop, n_invalid,
+    rollout_tokens, expected_rollout_tokens, budgets_used, teacher_forward_tokens}。
     除标量块控，还存行为策略 s_old（学生生成时完整分布 top-K，G1 闭环）与
     prompt_idx/response（G2 PromptState 闭环）。
 
@@ -514,9 +539,11 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     def _gen(pb, max_new):
         if rollout_generator is not None:
             return rollout_generator(pb, max_new=max_new, eos_token_id=eos_token_id,
-                                     loop_detection=loop_detection, pad_id=pad_id)
+                                     loop_detection=loop_detection, pad_id=pad_id,
+                                     temperature=temperature)
         return _default_gen(student, pb, max_new=max_new, eos_token_id=eos_token_id,
-                            loop_detection=loop_detection, pad_id=pad_id)
+                            loop_detection=loop_detection, pad_id=pad_id,
+                            temperature=temperature)
 
     M = cand.size(0)
     if budgets is not None:
@@ -531,7 +558,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         max_b = int(budgets.max().item())
         resp_all = torch.full((M, max_b), pad_id, dtype=torch.long, device=device)
         statuses = [None] * M; lengths = [0] * M; eos_pos = [None] * M
-        expected = int(budgets.sum().item()); actual = 0
+        budgets_used = int(budgets.sum().item())
         cand_list = cand.tolist()
         for b, idxs in groups.items():
             # 映射：每个 bucket 元素（全局 prompt idx）在 cand 中的行位置。
@@ -544,25 +571,29 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                 statuses[pc] = out["statuses"][k]
                 lengths[pc] = out["lengths"][k]
                 eos_pos[pc] = out["eos_pos"][k]
-                actual += int(out["lengths"][k])
         responses = resp_all
-        budgets_used = int(budgets.sum().item())
+        expected = budgets_used
     else:
         p_b = prompts[cand].to(device)
         out = _gen(p_b, max_new=max_resp_len)
         responses, statuses, lengths = out["responses"], out["statuses"], out["lengths"]
         eos_pos = out["eos_pos"]
-        expected = actual = int(sum(lengths))
-        budgets_used = int(max_resp_len * M)
+        expected = m_selected * max_resp_len
+        budgets_used = m_selected * max_resp_len
     # loop/invalid 样本跳过 teacher 前向与 append（需求 4），仍计入 summary
     valid = [i for i in range(len(statuses)) if statuses[i] not in ("loop", "invalid")]
     n_loop = statuses.count("loop"); n_invalid = statuses.count("invalid")
     n_eos = statuses.count("eos"); n_budget = statuses.count("budget_stop")
+    valid_lens = [lengths[i] for i in valid]
+    # P1.3：rollout_tokens=进 refresh 池的有效样本 token 数（非名义预算）。
+    actual = int(sum(valid_lens))
     if not valid:
         return {"n_total": len(statuses), "n_appended": 0, "n_eos": n_eos,
                 "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
-                "rollout_tokens": int(actual), "expected_rollout_tokens": int(expected),
-                "budgets_used": int(budgets_used)}
+                "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
+                "budgets_used": int(budgets_used),
+                "teacher_forward_tokens": 0,
+                "temperature": float(temperature)}
     p_b_v = p_b[valid]
     resp_v = responses[valid]
     # 行为策略：生成完立即取当前 student 完整分布 top-K（s_old，精确行为策略 §2）。
@@ -572,25 +603,31 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     Ks = ring_buffer.student_top_k
     s_old_ids = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).indices
     s_old_logp = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).values
-    student_logp = token_logprobs(student, p_b_v, resp_v)        # (M,T) chosen
-    with torch.no_grad():
-        student_ref.eval()
-        ref_logp = token_logprobs(student_ref, p_b_v, resp_v)
-        rl_dist = response_dists(teacher_rl, p_b_v, resp_v)      # (M,T,V)
-        ref_dist = response_dists(teacher_ref, p_b_v, resp_v)
-        rl_chosen = disag.gather_chosen_logp(rl_dist, resp_v)
-        ref_chosen = disag.gather_chosen_logp(ref_dist, resp_v)
-        tk = rl_dist.topk(top_k, dim=-1)
-        ids_k, rl_k = tk.indices, tk.values
-        delta_k = rl_k - ref_dist.gather(-1, tk.indices)
-    # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）
+    rl_dist = response_dists(teacher_rl, p_b_v, resp_v)      # (M,T,V)
+    ref_dist = response_dists(teacher_ref, p_b_v, resp_v)
+    tk = rl_dist.topk(top_k, dim=-1)
+    ids_k, rl_k = tk.indices, tk.values
+    delta_k = rl_k - ref_dist.gather(-1, tk.indices)
+    # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）。先于 D 计算（compute 用）。
     mask = build_length_mask(resp_v, [lengths[i] for i in valid],
                              [eos_pos[i] for i in valid])
-    D = disag.compute(rl_chosen, ref_chosen, student_logp, ref_logp, mask)
+    # P1.4：disagreement.enabled 硬 gate——关闭时跳过 D 计算（省 student/student_ref
+    # chosen-logp 前向），append 用 D=0（E1↔E2 差异改为真实计算量差异）。
+    if compute_disagreement:
+        with torch.no_grad():
+            student_ref.eval()
+            ref_logp = token_logprobs(student_ref, p_b_v, resp_v)
+            rl_chosen = disag.gather_chosen_logp(rl_dist, resp_v)
+            ref_chosen = disag.gather_chosen_logp(ref_dist, resp_v)
+            student_logp = token_logprobs(student, p_b_v, resp_v)
+        D_vals = disag.compute(rl_chosen, ref_chosen, student_logp, ref_logp, mask).get("abs")
+        D_vals = [float(v.detach()) for v in D_vals]
+    else:
+        D_vals = [0.0] * len(valid)
     for j, i in enumerate(valid):
         pos = ring_buffer.append(ids_k[j], delta_k[j], generation_step=step,
             response_length=int(mask[j].sum()), token_mask=mask[j],
-            disagreement_abs=float(D["abs"][j].detach()),
+            disagreement_abs=D_vals[j],
             prompt_idx=int(cand[i]), response=resp_v[j],
             s_old_ids=s_old_ids[j], s_old_logp=s_old_logp[j],
             status=statuses[i])
@@ -598,14 +635,16 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         if prompt_state is not None:
             rew = ring_buffer.reward_estimate(pos)
             prompt_state.update(int(cand[i]), reward=rew,
-                                disagreement=float(D["abs"][j].detach()),
+                                disagreement=D_vals[j],
                                 resp_len=int(mask[j].sum()), step=step)
+    # P1.3 成本核算：teacher_forward_tokens=教师 rl+ref 前向处理的有效 token 数
+    # （2×Σ有效长，供 Performance/Teacher Compute 比值）。
     return {"n_total": len(statuses), "n_appended": len(valid), "n_eos": n_eos,
             "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
-            "rollout_tokens": int(actual), "expected_rollout_tokens": int(expected),
-            "budgets_used": int(budgets_used)}
-
-
+            "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
+            "budgets_used": int(budgets_used),
+            "teacher_forward_tokens": 2 * int(sum(valid_lens)),
+            "temperature": float(temperature)}
 class CacheHealthMonitor:
     """§4 Cache Health Monitor（只 Observe->Diagnose，不自动改训练）。
 
@@ -734,8 +773,7 @@ class DynamicRatioController:
                rollout_efficiency=None) -> float:
         """推进一步，返回本轮 α（三信号 or 按模式降级）。
 
-        rollout_efficiency: 可选 rollout token 效率（expected/actual，§五）。任务 5 只
-        接收该参数、尚不参与 α（token_aware 第 4 信号接入留给任务 6）；None 默认零回归。
+        rollout_efficiency: 可选 rollout token 效率（expected/actual，§五）；None 默认零回归。
         """
         self._step += 1
         if self.mode == "fixed":

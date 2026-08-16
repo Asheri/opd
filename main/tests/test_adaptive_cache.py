@@ -152,3 +152,30 @@ def test_selector_diversity_max_same_prompt():
     selected = sel.select(10, 20)
     # 单 prompt 不应超过 1（10*0.1 向下取整）
     assert max(Counter(selected.tolist()).values()) <= 1
+
+def test_g7_utility_math_and_value_protection():
+    """G7（§3.5）：U_i=λ_D·D+λ_R·R̂−λ_A·A 驱动价值保护；None 权重退回 disagreement。"""
+    from fullstack_opd_v2.adaptive_cache import RefreshRingBuffer
+    V = 8
+    def _append(rb, step, D, idx):
+        return rb.append(torch.zeros(1, 2, dtype=torch.long), torch.zeros(1, 2),
+                         generation_step=step, response_length=1,
+                         token_mask=torch.ones(1), disagreement_abs=D,
+                         prompt_idx=idx, response=torch.zeros(1),
+                         s_old_ids=torch.zeros(1, 2, dtype=torch.long),
+                         s_old_logp=torch.zeros(1, 2))
+    # None 权重 → U=disagreement（向后兼容）
+    rb = RefreshRingBuffer(capacity=4, top_k=2, vocab=V)
+    _append(rb, 5, 0.7, 0)
+    assert abs(rb._utility(0, current_step=10) - 0.7) < 1e-6
+    # 有权重 → U = 0.5·D + 0.3·R̂ − 0.2·age（R̂=0 因 delta 全 0）
+    rb2 = RefreshRingBuffer(capacity=4, top_k=2, vocab=V,
+                            utility_weights={"disagreement_weight": 0.5,
+                                             "reward_weight": 0.3,
+                                             "age_penalty": 0.2})
+    _append(rb2, 5, 0.7, 0)
+    assert abs(rb2._utility(0, current_step=10) - (0.5 * 0.7 - 0.2 * 5)) < 1e-6
+    # 新样本（age 0, D=1.0, U=0.5）受保护；旧样本（age 5, U=−0.65）不受
+    _append(rb2, 10, 1.0, 1)
+    assert rb2._protected[1] is True
+    assert rb2._protected[0] is False

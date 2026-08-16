@@ -5,3 +5,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 高核服务器（96 核+）上 torch 默认 intra-op 线程池在嵌套多线程（scheduler 4 线程 +
+# 测试主线程同时前向）下偶发死锁（实测在 torch._transformer_encoder_layer_fwd 卡死）。
+# 测试用 toy 模型极小，1 线程足够且确定性更好——在 torch import 前锁死 OMP 并收线程数。
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+import torch  # noqa: E402
+torch.set_num_threads(1)

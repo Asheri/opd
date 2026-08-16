@@ -132,7 +132,9 @@ def write_cache_disk(cache, prefix: str, responses: torch.Tensor | None = None,
     N, T, K = cache.ids_sorted.shape
 
     ids_np = cache.ids_sorted.cpu().numpy().astype(np.int32)
-    delta_np = cache.delta_k_sorted.cpu().numpy().astype(np.float32)
+    delta_np = cache.delta_k_sorted.float().cpu().numpy().astype(np.float32)
+    # 注：delta_k_sorted 源自 teacher bf16 前向 → bf16 张量，numpy 不支持 bf16，
+    # 必须先 .float() 再 numpy（否则 `Got unsupported ScalarType BFloat16`）。
     # 逐 chunk 直写（避免整文件 numpy 副本驻留 RAM）
     _write_memmap(f"{prefix}.ids_sorted.dat", ids_np, chunk)
     _write_memmap(f"{prefix}.delta_k_sorted.dat", delta_np, chunk)

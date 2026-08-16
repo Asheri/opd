@@ -333,7 +333,7 @@ def test_stage0_teachers_hf_skips_rl(tmp_path, monkeypatch):
     import fullstack_opd_v2.pipeline as PL
     from fullstack_opd_v2.pipeline import FullStackOPDv2
 
-    def fake_hf(path, device="cpu", dtype="auto"):
+    def fake_hf(path, device="cpu", dtype="auto", attn_implementation=None):
         m = mock.Mock()
         m.vocab, m.d_model, m.max_len = 152, 768, 1024
         m.path = path
@@ -454,3 +454,40 @@ def test_warmup_requires_student_raises_dataerror():
            "cache_path": "x.pt", "build_batch_size": 4}
     with pytest.raises(DataError):
         stage1_build_cache(p, r, tr, t, cfg, warmup_student=None)
+
+
+def test_l2_load_cache_loads_teachers_for_refresh(tmp_path):
+    """回归：L2 启用 + load_cache=true 时，教师对必须补加载供刷新相位（否则 NoneType 崩溃）。
+
+    load_cache 路径原本跳过 Stage 0、teacher_rl/ref=None；L2 刷新相位需要教师算
+    disagreement（4 chosen logp），本测试验证补丁：跑通且有 rollout 相位行。
+    """
+    import os
+    from fullstack_opd_v2.cache import TensorTeacherCache
+    from fullstack_opd_v2.model import CausalToyLM
+    from fullstack_opd_v2.pipeline import FullStackOPDv2, stage1_build_cache
+
+    cache_path = os.path.join(str(tmp_path), "prebuilt.pt")
+    cfg = _cfg(tmp_path)
+    opd = FullStackOPDv2(cfg, device="cpu")
+    teacher_rl, teacher_ref = opd._stage0_teachers()
+    warmup_student = CausalToyLM(vocab=DEFAULT_CONFIG_V2["vocab_size"],
+                                 d_model=DEFAULT_CONFIG_V2["d_model"],
+                                 n_layers=DEFAULT_CONFIG_V2["n_layers"])
+    s1 = dict(cfg["stage1"])
+    s1["cache_path"] = cache_path
+    stage1_build_cache(opd.prompts, opd.responses, teacher_rl, teacher_ref, s1,
+                       warmup_student=warmup_student)
+
+    cfg2 = _cfg(tmp_path)
+    cfg2["stage1"]["cache_path"] = cache_path
+    cfg2["stage1"]["load_cache"] = True
+    cfg2["stage2"]["n_steps"] = 6
+    cfg2["l2"] = {"enabled": True, "t_train": 3, "m_refresh": 4,
+                  "cache": {"refresh_size": 8, "max_response_length": 4,
+                            "refresh_min_interval": 2, "refresh_max_interval": 9}}
+    out = FullStackOPDv2(cfg2, device="cpu").run()
+    rollout_rows = [m for m in out["metrics"]
+                    if isinstance(m, dict) and m.get("phase") == "rollout"]
+    assert rollout_rows, "L2+load_cache 刷新相位未执行（教师未加载 / 门控仍误跳）"
+    assert all(r.get("rollout/n_appended", 0) > 0 for r in rollout_rows)

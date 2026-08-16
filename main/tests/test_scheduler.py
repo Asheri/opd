@@ -179,14 +179,17 @@ def test_scheduler_topk_renormalize_wires_through(monkeypatch):
     orig_kl = SCH.low_var_kl_support
 
     def spy_pg(s_cur, s_old, delta, mask=None, clip_eps=0.2, p_old=None,
-               log_ratio_max=None, renormalize_support=False, support=None,
+               log_ratio_max=None, log_ratio_clip=None,
+               renormalize_support=False, support=None,
                delta_clip=None):
         pg_kwargs.update(renormalize_support=renormalize_support, support=support,
                          has_support=support is not None)
         # 代理真实实现（不 monkeypatch 掉数学）
-        return orig_pg(s_cur, s_old, delta, mask, clip_eps, p_old,
-                       log_ratio_max, renormalize_support, support,
-                       delta_clip)
+        return orig_pg(s_cur=s_cur, s_old=s_old, delta=delta, mask=mask,
+                       clip_eps=clip_eps, p_old=p_old,
+                       log_ratio_max=log_ratio_max, log_ratio_clip=log_ratio_clip,
+                       renormalize_support=renormalize_support, support=support,
+                       delta_clip=delta_clip)
     def spy_kl(s_topk_logp, ref_logp_at_support, mask=None, renormalize_support=False):
         kl_kwargs.update(renormalize_support=renormalize_support)
         return orig_kl(s_topk_logp, ref_logp_at_support, mask, renormalize_support)
@@ -319,3 +322,30 @@ def test_scheduler_cross_vocab_student_topk_train():
     for m in metrics:
         for k in ("loss", "pg_loss", "kl_loss"):
             assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"
+
+
+def test_g5_base_skips_staleness_drop():
+    """G5（§2 Q4）：staleness_drop_base=False 时 base 样本跳过陈旧度截断（恒新不误伤）。
+    默认 True 保持原双截断语义；L2 交替相位把 base 置 False 显式落实契约。"""
+    student, cache, prompts, responses, ref_dists = _setup(seed=21)
+    idxs = torch.tensor([0, 1, 2, 3])
+    with torch.no_grad():
+        s_old = response_dists(student, prompts[idxs], responses[idxs])
+    delta = cache.get_delta(idxs)
+    # 对照组：默认 True → 陈旧样本被截断（返回 None）
+    cfg2 = _cfg()
+    sched2 = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                   ref_dists, None, None, cfg2, "cpu")
+    for _ in range(5):
+        sched2.staleness_q.advance_version()
+    assert sched2._train_step(0, idxs, s_old, delta, 0) is None, \
+        "默认 base 陈旧样本仍按原语义截断"
+    # G5：staleness_drop_base=False → base 陈旧样本仍被训练
+    cfg = _cfg(staleness_drop_base=False)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, cfg, "cpu")
+    for _ in range(5):
+        sched.staleness_q.advance_version()
+    m = sched._train_step(0, idxs, s_old, delta, 0)
+    assert m is not None, "staleness_drop_base=False 时 base 陈旧样本仍应被训练（G5 契约）"
+    assert math.isfinite(m["loss"])

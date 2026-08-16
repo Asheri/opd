@@ -122,6 +122,9 @@ class L2RolloutCfg(_Strict):
     allow_budget_stop: bool = True     # 允许预算截断（不把 budget-stop 当 EOS）
     eos_token_id: int | None = None    # None=不判 EOS（全 BUDGET_STOP）；=int 采到即停
     loop_detection: bool = True        # 周期重复检测 → 判 LOOP（不进 refresh cache）
+    # IMP-1a：rollout 采样温度。默认 0.7（降循环率）；=1.0 复现旧行为（temperature=1.0 恒等）。
+    # 真实 HF 生成层（generate_with_status* / vLLM）已支持该参数，此处仅透传。
+    temperature: float = 0.7
     pad_id: int = 0                    # 变长 batch 右 pad 值（不参与判定，仅占位）
     token_budget_per_refresh: int | None = None   # §六：每轮刷新全局 rollout token 预算；None=无上限
 

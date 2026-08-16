@@ -26,6 +26,28 @@ from .model import CausalToyLM, response_dists
 # 正常 s_old 最小值 ≈ -ln V（V=128k 时约 -11.5），10 以内的余量不误伤；_LOG_ZERO=-30 闭合。
 LOG_RATIO_MAX = 20.0
 
+# L2 refresh 刷新相位的 ratio 硬化阈值（log 空间）。refresh 样本的 s_old 是 rollout 时刻
+# 学生快照、在 ring buffer 滞留后陈旧——学生漂移使 s_cur top-K 里某 token 高概率（logp≈0）
+# 而 s_old 中等低（如 -15）时，ratio=exp(0-(-15))=3.3e6 爆炸；delta<0 时 pg_loss 悲观下界取
+# 未 clip 的 ratio*delta → pg 无界（部署实测 E1=400/E2=134）。grad_clip 兜底训练仍稳定，但
+# loss 数值失真。
+# 修复分两层（lb 语义）：
+#   1) log_ratio_clip=REFRESH_LOG_RATIO_MAX：对 logr 全局 clamp（IS 权重上界），从根上限定
+#      ratio≤exp(3)≈20——这是根因硬化（s_old<-5 屏蔽管不住 s_old∈[-5,0] 的 ratio 放大）。
+#   2) log_ratio_max=REFRESH_LOG_RATIO_MAX：纵深防御，屏蔽 s_old<-3 的支撑外 log0 近似位。
+# 3.0 保证单 token |ratio*delta|≤exp(3)*delta_clip≈40，支撑重归一后 pg 回到个位数量级。
+# base 路径（_train_step）s_old 来自 cache 快照、陈旧度受 staleness_threshold 双截断约束，
+# ratio 温和，保持 LOG_RATIO_MAX=20 不误伤。
+REFRESH_LOG_RATIO_MAX = 3.0
+
+# base 路径（_train_step）的 IS 权重上界。base 的 s_old 来自 Async worker 异步快照，正常时
+# 与 s_cur 同版本漂移小、logr<1，无需 clip。但【起步瞬态】会爆：初始大 lr 一步后学生剧烈
+# 漂移，而 worker 异步滞后仍持初始权重 → s_old 与 s_cur 差极大（logr 可达 ~8），悲观下界在
+# delta<0 时取未 clip 的 ratio*delta → pg 单步上千（部署实测步1/3 各 ~3800/~4300，E1/E2
+# 确定性复现）。grad_clip 兜底训练仍稳定（步4+ 稳态 pg<27），但会污染 loss 监控。用 5.0
+# 只挡天文 ratio（exp(5)≈148，正常 logr 远小于此），保留正常 IS 放大，不改变稳态语义。
+BASE_LOG_RATIO_CLIP = 5.0
+
 # 队列操作超时（秒）：put 满 / get 空时的轮询间隔，平衡吞吐与线程响应
 _PUT_TIMEOUT = 0.5        # 入队侧（prompt→rollout、rollout→scorer、scorer→staleness_q）
 _GET_TIMEOUT = 1.0        # 消费侧空转轮询（rollout/scorer 无批次时）
@@ -114,6 +136,10 @@ class AsyncBatchedScheduler:
         self.offload_to_cpu = bool(cfg.get("offload_to_cpu", False))
 
         self.staleness_q = StalenessQueue(cfg.get("staleness_threshold", 4))
+        # G5（§2 Q4 契约）：base 池样本是否跳过消费侧陈旧度截断。base 的 s_old 由
+        # RolloutCollector 每次用当前权重重算、天然带新版本（恒新），截断从不误触发；
+        # L2 交替相位把此标志置 False 显式落实「base 跳过、仅 refresh 受截断」契约。
+        self.staleness_drop_base = bool(cfg.get("staleness_drop_base", True))
         self.weight_store = WeightStore(offload_to_cpu=self.offload_to_cpu)
         self.stop = threading.Event()
         self.metrics: list = []
@@ -232,8 +258,16 @@ class AsyncBatchedScheduler:
             else:
                 self.worker.eval()
                 with torch.no_grad():
-                    s_old = response_dists(self.worker, self.prompts[idxs_dev],
-                                           self.responses[idxs_dev])     # (B,T,V) device
+                    # P-显存修复：worker 前向产物 s_old 是 (B,T,V) 大张量，HF lm_head 输出
+                    # 在 autocast 下仍 fp32（2.5GB/份@batch2）。队列 queue_size=2 + 训练
+                    # backward 同时驻留 → 与 train_step 叠加 OOM（部署实测 84GB）。autocast
+                    # 省前向激活 + 显式 .to 让队列里的 s_old 全程 bf16（砍半）。
+                    with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
+                                            enabled=self.amp):
+                        s_old = response_dists(self.worker, self.prompts[idxs_dev],
+                                               self.responses[idxs_dev])  # (B,T,V)
+                    if self.dtype is not None and s_old.dtype != self.dtype:
+                        s_old = s_old.to(self.dtype)
             try:
                 self._rq.put((idxs, s_old, self._loaded_ver), timeout=_PUT_TIMEOUT)
             except queue.Full:
@@ -254,6 +288,15 @@ class AsyncBatchedScheduler:
         rids_sorted = self.ref_ids_sorted[idxs]              # (B, T, Kr) 已升序
         rlogp_sorted = self.ref_logp_sorted[idxs]            # (B, T, Kr)
         Kr = rids_sorted.size(-1)
+        # L2 refresh 样本的响应长（rollout 预算 512/1024/2048）可能 ≠ 锚点 T（缓存响应长
+        # 2048）：searchsorted 要求除排序维外各维匹配，按 min T 截断避免维度崩。截断是
+        # 近似——刷新响应尾部超出锚点的位置失去 KL 锚点（真实场景刷新短于锚点，不丢）。
+        Tb, Ts = rids_sorted.size(1), student_ids.size(1)
+        if Ts != Tb:
+            T = min(Ts, Tb)
+            rids_sorted = rids_sorted[:, :T]
+            rlogp_sorted = rlogp_sorted[:, :T]
+            student_ids = student_ids[:, :T]
         pos = torch.searchsorted(rids_sorted, student_ids.contiguous()).clamp(max=Kr - 1)
         found = rids_sorted.gather(-1, pos) == student_ids
         gathered = rlogp_sorted.gather(-1, pos)              # (B, T, Ks)
@@ -287,8 +330,9 @@ class AsyncBatchedScheduler:
         现场按 student 支撑展开。陈旧度超阈值返回 None（截断），否则返回 metric dict。
         """
         threshold = self.cfg.get("staleness_threshold", 4)
-        # 陈旧度截断（消费侧，与 v1 审阅修复一致）
-        if self.staleness_q.current_version - ver > threshold:
+        # 陈旧度截断（消费侧，与 v1 审阅修复一致）。G5：base 池跳过（恒新），
+        # 仅 refresh 池（存 rollout 时刻行为 s_old）受陈旧度约束。
+        if self.staleness_drop_base and self.staleness_q.current_version - ver > threshold:
             return None
         self.student.train()
         idxs_dev = idxs.to(self.device)
@@ -300,6 +344,12 @@ class AsyncBatchedScheduler:
         with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
                                 enabled=self.amp):
             s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
+            # P-显存修复：HF lm_head 输出在 autocast 下仍为 fp32（transformers 行为），
+            # 真实词表 V=152k 下 (B,T,V) fp32=2.5GB/张，而 pg_loss 内部 ~11 个中间张量
+            # 全堆 fp32 → 25GB+，叠加 worker/队列/激活 OOM（部署实测 87GB）。转回 autocast
+            # dtype（bf16）砍半——Δ_T 本就在 bf16 域，PG 中间量 bf16 精度足够。
+            if self.dtype is not None and s_cur.dtype != self.dtype:
+                s_cur = s_cur.to(self.dtype)
             # 与 s_cur 同设备同精度，保证 ratio 一致（M2：分布式路径 s_old 由 worker 进程
             # 回传在 CPU，此前只转 dtype 不转 device → s_cur-s_old 设备不匹配崩溃）。
             s_old = s_old.to(self.device, dtype=s_cur.dtype)
@@ -316,6 +366,11 @@ class AsyncBatchedScheduler:
                 delta_d = self.cache.delta_for_student_topk(
                     idxs_dev, s_topk.indices,
                     vocab_out=getattr(self.student, "vocab", None))  # (B,T,V) 支撑外=0
+                # P-显存修复：磁盘缓存 delta 为 fp32，与 bf16 的 s_cur 运算会拉回 fp32
+                # （torch 类型提升），pg_loss 中间又堆 fp32 大张量；Δ_T 无梯度其值已
+                # delta_clip 到 ±2，bf16 足够。转同 dtype 让 pg_loss 全 bf16（砍半）。
+                if self.dtype is not None and delta_d.dtype != self.dtype:
+                    delta_d = delta_d.to(self.dtype)
                 # P2-G（二次审查）：renormalize 时把【完整 student top-K】掩码显式传给
                 # pg_loss，与 low_var_kl_support 的支撑（也是完整 student top-K）一致——
                 # 否则 pg 用 delta!=0（student∩teacher 交集）归一、KL 用完整 top-K 归一，
@@ -326,6 +381,7 @@ class AsyncBatchedScheduler:
                     pg_support.scatter_(-1, s_topk.indices, True)
                 loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
                                   log_ratio_max=LOG_RATIO_MAX,
+                                  log_ratio_clip=BASE_LOG_RATIO_CLIP,
                                   renormalize_support=self.renormalize_topk,
                                   support=pg_support, delta_clip=self.delta_clip)
                 # 稀疏 KL 锚点
@@ -344,8 +400,13 @@ class AsyncBatchedScheduler:
                 if delta is None:
                     delta = self.cache.get_delta(idxs_dev)
                 delta_d = delta
+                # P-显存修复（同 topk 分支）：delta fp32 与 bf16 s_cur 运算拉回 fp32。
+                if self.dtype is not None and delta_d.dtype != self.dtype:
+                    delta_d = delta_d.to(self.dtype)
                 loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
-                                  log_ratio_max=LOG_RATIO_MAX, delta_clip=self.delta_clip)
+                                  log_ratio_max=LOG_RATIO_MAX,
+                                  log_ratio_clip=BASE_LOG_RATIO_CLIP,
+                                  delta_clip=self.delta_clip)
                 loss_kl = low_var_kl(s_cur, self.ref_dists[idxs_dev], None)
 
             loss = loss_pg + self.kl_coef * loss_kl
@@ -388,6 +449,20 @@ class AsyncBatchedScheduler:
 
         rb_idxs: (B,) ring buffer 局部槽位。token_mask 处理变长（真实 EOS padding）。
         """
+        if not self.use_topk:
+            # dense/toy 模式（top_k_student=0）：ring buffer 只存稀疏 top-K（teacher Δ、
+            # 行为 s_old、ref 锚点都是 top-K 支撑），无法做稠密 refresh 训练。产出
+            # pool="refresh" no-op 步（维持交替相位闭环与测试语义，loss=0 无学习信号）。
+            # 真实规模（top_k_student>0，由 cache.top_k 驱动，cache_mode=topk）走下方
+            # 稀疏 top-K 路径。
+            print("[scheduler] refresh 训练相位在 dense/toy（top_k_student=0）下为 no-op；"
+                  "真实规模需稀疏 top-K 配置", flush=True)
+            return {
+                "step": done, "version": self.staleness_q.current_version,
+                "age": 0, "pool": "refresh", "batch": self.batch,
+                "loss": 0.0, "pg_loss": 0.0, "kl_loss": 0.0,
+                "adv_mean": 0.0, "reward": 0.0,
+            }
         batch = rb.get(rb_idxs)
         p_b = self.prompts[batch["prompt_idx"]].to(self.device)
         r_b = batch["responses"].to(self.device)
@@ -396,6 +471,11 @@ class AsyncBatchedScheduler:
         with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
                                 enabled=self.amp):
             s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
+            # P-显存修复（同 _train_step）：HF lm_head 输出 autocast 下仍 fp32，真实
+            # V=152k 大张量堆 fp32 OOM；转回 autocast dtype（bf16）。refresh 只用 topk
+            # 小张量，bf16 精度足够。
+            if self.dtype is not None and s_cur.dtype != self.dtype:
+                s_cur = s_cur.to(self.dtype)
             s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
             # Δ_T 展开到 s_cur top-K（教师 top-K 命中处取 delta_k，未命中=0）
             delta_at = rb.delta_at_student_topk(
@@ -406,15 +486,17 @@ class AsyncBatchedScheduler:
                 tail_logp=self.ref_tail_logp)                  # (B,T,Ks)
             # KL 锚点：dense 模式从 ref_dists 取，稀疏模式从 ref_top-K 取（同 base 路径）
             if self.kl_mode == "dense":
-                ref_at = self.ref_dists[batch["prompt_idx"]].gather(
-                    -1, s_topk.indices)                        # (B,T,Ks)
+                _T = min(self.ref_dists[batch["prompt_idx"]].size(1), s_topk.indices.size(1))
+                ref_at = self.ref_dists[batch["prompt_idx"]][:, :_T].gather(
+                    -1, s_topk.indices[:, :_T])                # (B,T,Ks)
             else:
                 ref_at = self._ref_logp_at_student_topk(
                     batch["prompt_idx"], s_topk.indices)       # (B,T,Ks)
             # 支撑 = 完整 s_cur top-K（ones），与 KL 同源重归一（对齐原始 Direct-OPD）
             sup = torch.ones_like(s_topk.values, dtype=torch.bool)
             loss_pg = pg_loss(s_topk.values, s_old_at, delta_at, mask, self.clip_eps,
-                              p_old=s_old_at.exp(), log_ratio_max=LOG_RATIO_MAX,
+                              p_old=s_old_at.exp(), log_ratio_max=REFRESH_LOG_RATIO_MAX,
+                              log_ratio_clip=REFRESH_LOG_RATIO_MAX,
                               renormalize_support=True, support=sup,
                               delta_clip=self.delta_clip)
             loss_kl = low_var_kl_support(s_topk.values, ref_at, mask,

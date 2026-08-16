@@ -116,7 +116,7 @@ def run_one(model, tok, prompts: list[str], max_new_tokens: int, batch_size: int
             out = model.generate(
                 **enc, max_new_tokens=max_new_tokens, do_sample=True,
                 temperature=1.0, top_p=0.95, num_return_sequences=1,
-                pad_token_id=tok.pad_token_id, generator=g,
+                pad_token_id=tok.pad_token_id,
                 stopping_criteria=StoppingCriteriaList([TimeLimitCriteria(max_time_s)])
                 if max_time_s > 0 else None)
         dt = time.time() - t0

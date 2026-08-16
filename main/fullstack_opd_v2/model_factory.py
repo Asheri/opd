@@ -41,7 +41,8 @@ class HFCausalLM:
 
     def __init__(self, path: str, device: str = "cpu", dtype: str = "auto",
                  vocab: int | None = None, d_model: int | None = None,
-                 max_len: int | None = None):
+                 max_len: int | None = None,
+                 attn_implementation: str | None = None):
         if not _HF_AVAILABLE:
             raise ModelError("model_kind='hf' 需要 transformers（统一 GPU 环境应含）")
         # P2 修复（二次审查）：config Literal 允许 "bfloat16"/"float32"，适配器字典要覆盖，
@@ -50,9 +51,16 @@ class HFCausalLM:
                "float16": torch.float16, "fp16": torch.float16,
                "fp32": None, "float32": None, "auto": None}
         td = _DT.get(str(dtype).lower())
+        # P-回归/显存修复：训练长序列（P+T≈3072）× 大隐层下，默认 SDPA 会物化完整
+        # 注意力矩阵 (B,heads,T,T) 并保留给 backward → 28 层累积 80+GB OOM（部署实测）。
+        # eval 早已用 flash_attention_2；训练模型同样开启（CUDA 环境 flash_attn 已装）。
+        # None → 不传（CPU 单测/无 flash 环境回退默认，from_pretrained 断言不受影响）。
+        _PT_KW = {"torch_dtype": td}
+        if attn_implementation:
+            _PT_KW["attn_implementation"] = attn_implementation
         try:
             self.model = _HF_AutoModelForCausalLM.from_pretrained(
-                path, torch_dtype=td).to(device).eval()
+                path, **_PT_KW).to(device).eval()
         except Exception as e:
             raise ModelError(f"HF 模型 {path!r} 加载失败（路径/HF id 无效？）：{e}") from e
         self.path = path
@@ -65,6 +73,13 @@ class HFCausalLM:
         # P1-B（二次审查）：scheduler 用 student.n_layers 构造 worker（CausalToyLM 分支）；
         # HFCausalLM 之前没有该属性 → model_kind='hf' 构造调度器即 AttributeError。
         self.n_layers = getattr(self.model.config, "num_hidden_layers", None)
+        # P1.5：真实 pad_token_id（供变长 rollout 右 pad 与尾部去 pad；Qwen3 的 token 0
+        # 不是 pad，默认 0 会误判/错误填充）。
+        self._pad_token_id = getattr(self.model.config, "pad_token_id", None)
+
+    @property
+    def pad_token_id(self):
+        return self._pad_token_id
 
     # ---- 内核用接口：forward / response_dists / generate（委托模块级实现）----
     def __call__(self, input_ids: torch.Tensor,
@@ -272,8 +287,12 @@ def build_model(cfg: dict, device: str = "cpu", role: str = "student"):
             n_layers=cfg["n_layers"]).to(device)
     if kind == "hf":
         # ⚠️ 骨架：本地无法 GPU 实测；需真实模型 + GPU 验证。
+        # 长序列 × 大隐层训练前向必须 flash 注意力（否则 SDPA 物化注意力矩阵 OOM）；
+        # CPU 单测不传（保持 from_pretrained 断言与无 flash 环境兼容）。
+        _attn = "flash_attention_2" if str(device).startswith("cuda") else None
         return HFCausalLM(_hf_model_path(cfg, role), device,
-                          dtype=cfg.get("dtype", "auto"))
+                          dtype=cfg.get("dtype", "auto"),
+                          attn_implementation=_attn)
     if kind in ("megatron", "vllm"):
         raise ModelError(
             f"model_kind={kind!r} 的真实模型集成尚未实现（由 async-opd/vLLM 承担）。"

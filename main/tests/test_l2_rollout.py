@@ -44,6 +44,15 @@ def test_l2_rollout_disabled_default():
     assert cfg["l2"]["rollout"]["max_new_tokens"] == 1024
 
 
+
+def test_l2_rollout_temperature_default():
+    """IMP-1a：L2RolloutCfg 默认 temperature=0.7；可覆盖到 1.0（复现旧行为）。"""
+    cfg = load_config(overrides=["l2.enabled=true"])
+    assert cfg["l2"]["rollout"]["temperature"] == 0.7
+    cfg2 = load_config(overrides=["l2.rollout.temperature=1.0"])
+    assert cfg2["l2"]["rollout"]["temperature"] == 1.0
+
+
 # --------------------------- 任务2：model.py 短 rollout ---------------------------
 import torch
 
@@ -194,7 +203,8 @@ def _fake_rollout(responses, statuses, lengths, eos_pos, looped):
     gen(prompts, max_new, ...)；run_refresh_phase 以 prompts 为第一实参调用，
     不再把 student 当 self 传入（模块级 generate_with_status 才收 (model, prompts)）。
     """
-    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0):
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
+            temperature=1.0):
         return {"responses": responses, "statuses": statuses, "lengths": lengths,
                 "eos_pos": eos_pos, "looped": looped}
     return gen
@@ -220,12 +230,14 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
                                 prompts, step=1, version=1, m_selected=n,
                                 max_resp_len=6, top_k=3, device="cpu",
                                 rollout_generator=gen)
-    # summary：loop/invalid 跳过 append，只 2 个进池（budgets=None 单预算路径，
-    # 新增 token 记账：actual=sum(lengths)=3+6+6+0=15，budgets_used=6*4=24）
+    # summary：loop/invalid 跳过 append，只 2 个进池
+    # 成本字段（P1.3）：valid=[eos(3),budget_stop(6)] → rollout=9；名义预算=4×6=24；
+    # teacher 前向=2×(3+6)=18
     assert summary == {"n_total": 4, "n_appended": 2, "n_eos": 1,
                        "n_budget": 1, "n_loop": 1, "n_invalid": 1,
-                       "rollout_tokens": 15, "expected_rollout_tokens": 15,
-                       "budgets_used": 24}
+                       "rollout_tokens": 9, "expected_rollout_tokens": 24,
+                       "budgets_used": 24, "teacher_forward_tokens": 18,
+                       "temperature": 0.7}
     assert rb.size == 2
     # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
     assert sorted(rb._status) == ["budget_stop", "eos"]
@@ -242,7 +254,8 @@ def test_run_refresh_phase_injected_gen_called_with_prompts_not_student():
     prompts = torch.arange(V * 5).view(V, 5) % V    # 可辨识的 prompt 张量 (V,5)
     seen = {}
 
-    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0):
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
+            temperature=1.0):
         seen["first_arg_is_prompts"] = prompts is not None
         seen["first_arg_shape"] = tuple(prompts.shape)
         seen["max_new"] = max_new
@@ -306,8 +319,9 @@ def test_run_refresh_phase_all_loop_no_append():
                                 rollout_generator=gen)
     assert summary == {"n_total": 2, "n_appended": 0, "n_eos": 0,
                        "n_budget": 0, "n_loop": 2, "n_invalid": 0,
-                       "rollout_tokens": 12, "expected_rollout_tokens": 12,
-                       "budgets_used": 12}
+                       "rollout_tokens": 0, "expected_rollout_tokens": 12,
+                       "budgets_used": 12, "teacher_forward_tokens": 0,
+                       "temperature": 0.7}
     assert rb.size == 0
 
 
@@ -368,21 +382,16 @@ def test_build_config_stage2_matrix():
 
 
 def test_run_matrix_stage2_runs(tmp_path):
-    """S2 矩阵跑通：4 实验（E0-E3），rollout 预算覆盖到 toy 速跑。
-
-    ⚠️ 任务7 后：refresh 触发条件删掉 `and selector is not None`，selective 关的
-    S2_E1/E2/E3（l2.enabled=true）现在【真正触发刷新】——n_steps 含 refresh 训练步
-    （4 base + 2 refresh ≈ 6）；E0_static（l2 关）仍恰好 4 步不刷。断言对齐新语义。
-    """
+    """S2 矩阵跑通：4 实验（E0-E3）n_steps 对齐，rollout 预算覆盖到 toy 速跑。"""
     res = run_matrix(str(tmp_path), n_steps=4, device="cpu",
                      matrix=STAGE2_ROLLOUT_MATRIX,
                      **{"l2.rollout.max_new_tokens": 8})
     assert len(res) == 4
     assert {r["name"] for r in res} == set(STAGE2_ROLLOUT_MATRIX)
+    # S2_E1-E3（l2.enabled=true）现在【真正触发刷新】——n_steps 含 refresh 训练步
+    # （门控修复：selective 关闭时 selector=None=均匀随机选，刷新照常执行）
     by_name = {r["name"]: r for r in res}
-    # E0_static（l2 关）无刷新 → 恰好 4 训练步
     assert by_name["S2_E0_static"]["summary"]["n_steps"] == 4
-    # E1/E2/E3（l2 开）现在触发刷新 → 训练步 ≥ 4（含 refresh 训练步）
     for n in ("S2_E1_opd512", "S2_E2_opd1024", "S2_E3_opd2048"):
         assert by_name[n]["summary"]["n_steps"] >= 4
 
@@ -412,3 +421,77 @@ def test_write_stage2_report_with_data(tmp_path):
     assert "S2_E0_static" in md
     assert "1.2000" in md or "1.2" in md
     assert "4096" in md and "0.42" in md
+
+def test_disagreement_gate_hard_off():
+    """P1.4：compute_disagreement=False 时跳过 D 计算（硬 gate），append 的 disagreement_abs=0。"""
+    torch.manual_seed(0)
+    V = 8
+    stu = _make_toy(V); t_rl = _make_toy(V); t_ref = _make_toy(V); s_ref = _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (4, 5))
+    n = 4
+    resp = torch.randint(1, V, (n, 6))
+    gen = _fake_rollout(resp, ["budget_stop"] * n, [6] * n, [None] * n, [False] * n)
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen, compute_disagreement=False)
+    assert summary["n_appended"] == n
+    assert all(d == 0.0 for d in rb._disagreements), "硬 gate 关闭时 disagreement 应为 0"
+    assert rb.size == n
+# --------------------------- IMP-1a：rollout temperature 透传 ---------------------------
+def test_run_refresh_phase_temperature_passed_to_generator():
+    """IMP-1a：run_refresh_phase 把 temperature 完整透传给注入的 rollout_generator，
+    且 summary 记录实际 temperature。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    n = 2
+    seen = {}
+
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
+            temperature=1.0):
+        seen["temperature"] = temperature
+        m = prompts.size(0)
+        return {"responses": torch.ones(m, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * m,
+                "lengths": [max_new] * m,
+                "eos_pos": [None] * m, "looped": [False] * m}
+
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen, temperature=0.7)
+    assert seen["temperature"] == 0.7            # 生成器收到配置的温度
+    assert summary["temperature"] == 0.7         # summary 记录实际温度
+
+
+def test_run_refresh_phase_temperature_1_0_old_behavior():
+    """IMP-1a：temperature=1.0 可配置复现旧行为（显式传参，生成器收到 1.0）。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    n = 2
+    seen = {}
+
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
+            temperature=1.0):
+        seen["temperature"] = temperature
+        m = prompts.size(0)
+        return {"responses": torch.ones(m, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * m,
+                "lengths": [max_new] * m,
+                "eos_pos": [None] * m, "looped": [False] * m}
+
+    run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                      prompts, step=1, version=1, m_selected=n,
+                      max_resp_len=6, top_k=3, device="cpu",
+                      rollout_generator=gen, temperature=1.0)
+    assert seen["temperature"] == 1.0            # 1.0 旧行为可复现

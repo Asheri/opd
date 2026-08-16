@@ -16,6 +16,7 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
             mask: torch.Tensor | None = None, clip_eps: float = 0.2,
             p_old: torch.Tensor | None = None,
             log_ratio_max: float | None = None,
+            log_ratio_clip: float | None = None,
             renormalize_support: bool = False,
             support: torch.Tensor | None = None,
             delta_clip: float | None = None) -> torch.Tensor:
@@ -30,6 +31,12 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
                    否则支撑失配且 delta≠0 时，ratio=exp(s_cur-s_old) 放大到天文数字、
                    与 p_old=exp(-30) 抵消后残留符号相关伪梯度（负 delta 有值、正 delta 为 0）。
                    默认 None 走原路径，正常输入下逐位不变（正常 s_old 最小值 ≈ -ln V > -log_ratio_max）。
+    log_ratio_clip: 可选 IS 权重上界——对 logr=s_cur-s_old clamp 到 ±log_ratio_clip，从根上限定
+                   ratio=exp(logr) ≤ exp(log_ratio_clip)。⊕ 悲观下界（min(unclipped,clipped)）在
+                   delta<0 时取未 clip 的 ratio*delta，若行为快照 s_old 陈旧（refresh 相位学生漂移
+                   后 s_cur 高而 s_old 中等低）→ ratio 无界放大 → pg 爆炸（部署实测 refresh pg~200）。
+                   log_ratio_max 只屏蔽 s_old<-max 的位置，管不住 s_old∈[-max,0] 区间的 ratio 放大；
+                   本参数对 logr 全局 clamp 才是硬化根因。默认 None 保持原行为（base 路径不受影响）。
     renormalize_support: 稀疏支撑重归一化（对齐原始 Direct-OPD）。稀疏缓存下 delta 只在
                    student top-K 支撑上有值（其余=0），此时把 π_old 在支撑上重归一
                    （除以其支撑内概率和 Z），使 pg = −E_{π_old^renorm}[min(ratio·Δ, clip·Δ)]
@@ -54,6 +61,11 @@ def pg_loss(s_cur: torch.Tensor, s_old: torch.Tensor, delta: torch.Tensor,
         # 初始分布（KL 爆到 ~29）→ 坍缩到换行死区。clip 到 ±delta_clip 让 loss 有界。
         delta = torch.clamp(delta, -delta_clip, delta_clip)
     logr = s_cur - s_old
+    if log_ratio_clip is not None:
+        # IS 权重上界（部署实测 refresh 相位 pg 爆炸的根因硬化）：行为快照 s_old 陈旧时
+        # logr 可放大到几十（s_cur 高概率 vs s_old 中等低 → ratio=exp(几十)），悲观下界在
+        # delta<0 时取未 clip 的 ratio*delta → pg 无界。clamp logr 到 ±c 使 ratio≤exp(c)。
+        logr = torch.clamp(logr, -log_ratio_clip, log_ratio_clip)
     ratio = logr.exp()                                         # (B, T, V)
     unclipped = ratio * delta
     clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * delta

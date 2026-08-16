@@ -68,7 +68,7 @@ class DatasetSpec:
     split: str = "train"
     prob: tuple[str, ...] = ("problem", "question", "prompt", "Problem", "Question", "Prompt")
     ans: tuple[str, ...] = ("answer", "solution", "Answer", "Solution")
-    gt_extract: callable = lambda a: _extract_boxed_answer(a) or str(a).strip()
+    gt_extract: callable = lambda a: _extract_boxed_answer(str(a)) or str(a).strip()
     hf_config: str | None = None
 
 
