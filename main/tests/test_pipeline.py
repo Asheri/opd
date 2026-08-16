@@ -357,9 +357,10 @@ def test_stage0_teachers_hf_skips_rl(tmp_path, monkeypatch):
     PL.stage0_small_rl.assert_not_called()
 
 
-def test_stage0_teachers_hf_missing_ref_raises():
-    """HF 骨架：缺 teacher_ref_path → 显式 ModelError。"""
+def test_stage0_teachers_hf_missing_ref_raises(monkeypatch):
+    """HF 骨架：缺 teacher_ref_path → 显式 ModelError（hermetic：mock build_model 不触网）。"""
     from fullstack_opd_v2.pipeline import FullStackOPDv2
+    import fullstack_opd_v2.pipeline as PL
     cfg = _cfg(type("T", (), {"__truediv__": lambda self, o: str(o)})())
     cfg["model_kind"] = "hf"
     cfg["teacher_rl_path"] = "RL"
@@ -367,6 +368,10 @@ def test_stage0_teachers_hf_missing_ref_raises():
     opd = object.__new__(FullStackOPDv2)
     opd.cfg = {**DEFAULT_CONFIG_V2, **cfg}
     opd.device = "cpu"
+    # 耗时修复：_stage0_teachers 会先 build_model(teacher_rl)→from_pretrained("RL") 触网
+    # （hf-mirror 不可达时超时 7-50s/839s）。mock build_model 使本测试秒回、且仍验证
+    # 「缺 teacher_ref_path → ModelError」这一被测行为。
+    monkeypatch.setattr(PL, "build_model", lambda *a, **k: object())
     with pytest.raises(ModelError):
         opd._stage0_teachers()
 
