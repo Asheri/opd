@@ -122,6 +122,9 @@ class L2RolloutCfg(_Strict):
     allow_budget_stop: bool = True     # 允许预算截断（不把 budget-stop 当 EOS）
     eos_token_id: int | None = None    # None=不判 EOS（全 BUDGET_STOP）；=int 采到即停
     loop_detection: bool = True        # 周期重复检测 → 判 LOOP（不进 refresh cache）
+    # IMP-1b：尾部周期重复检测的周期集合。默认 (2,3,4) 即原 detect_loop 硬编码
+    # 值；真实 Qwen3/Skywork 经 scripts/calibrate_rollout.py 校准后覆盖（命中率>5% 的周期）。
+    loop_periods: tuple[int, ...] = (2, 3, 4)
     # IMP-1a：rollout 采样温度。默认 0.7（降循环率）；=1.0 复现旧行为（temperature=1.0 恒等）。
     # 真实 HF 生成层（generate_with_status* / vLLM）已支持该参数，此处仅透传。
     temperature: float = 0.7
@@ -362,10 +365,26 @@ def _seep_deployment_keys(d: dict) -> dict:
 
 
 def _parse_scalar(text: str) -> Any:
-    """把 CLI 字符串覆盖值解析成 bool/int/float/str。"""
+    """把 CLI 字符串覆盖值解析成 bool/int/float/tuple/str。
+
+    IMP-1b：支持 tuple/int-list 语法 "(2,3,4)" / "[2,3,4]" / "2,3,4" →
+    tuple[int, ...]，使 l2.rollout.loop_periods（及 budget_set/quantiles）
+    可经 --set 点分覆盖。全 int 才转 tuple；否则回退常规解析。
+    """
     low = text.strip().lower()
     if low in ("true", "false"):
         return low == "true"
+    # tuple / int-list 语法："(2,3,4)" | "[2,3,4]" | "2,3,4" → tuple[int, ...]
+    s = text.strip()
+    if (s.startswith("(") and s.endswith(")")) or (s.startswith("[") and s.endswith("]")):
+        s = s[1:-1]
+    if "," in s:
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        if parts:
+            try:
+                return tuple(int(p) for p in parts)
+            except ValueError:
+                pass   # 含非 int → 回退常规解析
     for cast in (int, float):
         try:
             return cast(text)

@@ -490,6 +490,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       rollout_generator=None,      # Stage 2：短 rollout 生成器
                       eos_token_id=None,           # Stage 2：None=不判 EOS（全 budget_stop）
                       loop_detection=True,         # Stage 2：周期重复判 loop
+                      loop_periods=(2, 3, 4),      # IMP-1b：尾部周期检测周期集合（默认 (2,3,4)）
                       pad_id=0,
                       temperature: float = 0.7,    # IMP-1a：采样温度（默认 0.7 降循环率；1.0 旧行为）
                       budgets=None,                # Stage 3：per-sample budget (M,) long；None→单预算
@@ -514,7 +515,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     （select_with_budget 的 indices，与 budgets 配对）；None → 内部 select。
 
     返回 summary dict：{n_total, n_appended, n_eos, n_budget, n_loop, n_invalid,
-    rollout_tokens, expected_rollout_tokens, budgets_used, teacher_forward_tokens}。
+    rollout_tokens, expected_rollout_tokens, budgets_used, teacher_forward_tokens,
+    loop_periods（配置的周期集合），temperature（采样温度）}。
     除标量块控，还存行为策略 s_old（学生生成时完整分布 top-K，G1 闭环）与
     prompt_idx/response（G2 PromptState 闭环）。
 
@@ -540,10 +542,10 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         if rollout_generator is not None:
             return rollout_generator(pb, max_new=max_new, eos_token_id=eos_token_id,
                                      loop_detection=loop_detection, pad_id=pad_id,
-                                     temperature=temperature)
+                                     temperature=temperature, loop_periods=loop_periods)
         return _default_gen(student, pb, max_new=max_new, eos_token_id=eos_token_id,
                             loop_detection=loop_detection, pad_id=pad_id,
-                            temperature=temperature)
+                            temperature=temperature, loop_periods=loop_periods)
 
     M = cand.size(0)
     if budgets is not None:
@@ -593,6 +595,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                 "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
                 "budgets_used": int(budgets_used),
                 "teacher_forward_tokens": 0,
+                "loop_periods": tuple(loop_periods),
                 "temperature": float(temperature)}
     p_b_v = p_b[valid]
     resp_v = responses[valid]
@@ -644,6 +647,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
             "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
             "budgets_used": int(budgets_used),
             "teacher_forward_tokens": 2 * int(sum(valid_lens)),
+            "loop_periods": tuple(loop_periods),
             "temperature": float(temperature)}
 class CacheHealthMonitor:
     """§4 Cache Health Monitor（只 Observe->Diagnose，不自动改训练）。

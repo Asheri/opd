@@ -808,6 +808,7 @@ class FullStackOPDv2:
                                 rollout_generator=_rollout_gen,
                                 eos_token_id=eos_id,
                                 loop_detection=rollcfg.get("loop_detection", True),
+                                loop_periods=rollcfg.get("loop_periods", (2, 3, 4)),
                                 pad_id=_pad_id,
                                 temperature=temperature,
                                 compute_disagreement=bool(

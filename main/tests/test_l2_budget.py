@@ -225,7 +225,7 @@ def _recording_gen(log):
     契约：绑定方法签名 gen(prompts, max_new, ...)，run_refresh_phase 以 prompts 为第一实参。
     """
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0):
+            temperature=1.0, loop_periods=(2, 3, 4)):
         log.append(int(max_new))
         n = prompts.size(0)
         return {"responses": torch.ones(n, int(max_new), dtype=torch.long),
@@ -265,6 +265,7 @@ def test_run_refresh_phase_budget_buckets():
     assert summary["rollout_tokens"] == 256 + 512 + 1024 + 2048
     assert summary["expected_rollout_tokens"] == 256 + 512 + 1024 + 2048
     assert summary["budgets_used"] == 256 + 512 + 1024 + 2048
+    assert summary["loop_periods"] == (2, 3, 4)     # IMP-1b：summary 记录周期集合
     assert rb.size == m
 
 
@@ -287,6 +288,7 @@ def test_run_refresh_phase_no_budget_regression():
     assert summary["rollout_tokens"] == 6 * m_selected
     assert summary["expected_rollout_tokens"] == 6 * m_selected
     assert summary["budgets_used"] == 6 * m_selected
+    assert summary["loop_periods"] == (2, 3, 4)     # IMP-1b：单预算路径也记录
 
 
 # ---- Stage 3：任务 5 pipeline 接线 smoke（adaptive 全链路：select_with_budget

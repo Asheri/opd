@@ -45,6 +45,30 @@ def test_l2_rollout_disabled_default():
 
 
 
+def test_l2_rollout_loop_periods_default():
+    """IMP-1b：L2RolloutCfg 默认 loop_periods=(2,3,4)（原 detect_loop 硬编码值）。"""
+    cfg = load_config(overrides=["l2.enabled=true"])
+    assert cfg["l2"]["rollout"]["loop_periods"] == (2, 3, 4)
+    cfg0 = load_config()          # l2 关闭时默认仍存在
+    assert cfg0["l2"]["rollout"]["loop_periods"] == (2, 3, 4)
+
+
+def test_l2_rollout_loop_periods_override():
+    """IMP-1b：loop_periods 可经 --set 点分覆盖（逗号 / 括号 / 方括号语法）。"""
+    cfg = load_config(overrides=["l2.rollout.loop_periods=2,4,6"])
+    assert cfg["l2"]["rollout"]["loop_periods"] == (2, 4, 6)
+    cfg2 = load_config(overrides=["l2.rollout.loop_periods=(3,5)"])
+    assert cfg2["l2"]["rollout"]["loop_periods"] == (3, 5)
+    cfg3 = load_config(overrides=["l2.rollout.loop_periods=[4,6,8]"])
+    assert cfg3["l2"]["rollout"]["loop_periods"] == (4, 6, 8)
+
+
+def test_l2_rollout_loop_periods_bad_value_rejected():
+    """IMP-1b：loop_periods 非 int 序列 → pydantic 校验拒绝（不静默吞）。"""
+    with pytest.raises(ConfigError):
+        load_config(overrides=["l2.rollout.loop_periods=2,x,4"])
+
+
 def test_l2_rollout_temperature_default():
     """IMP-1a：L2RolloutCfg 默认 temperature=0.7；可覆盖到 1.0（复现旧行为）。"""
     cfg = load_config(overrides=["l2.enabled=true"])
@@ -76,6 +100,41 @@ def test_detect_loop_short_sequence_no_false_positive():
     # 短序列（<min_len）不误报
     r = torch.tensor([1, 2, 1, 2])
     assert not detect_loop(r, periods=(2, 3, 4), min_len=8)
+
+
+def test_detect_loop_default_periods_detect_2_3_4():
+    """IMP-1b：detect_loop 默认 periods=(2,3,4) 下，周期 2/3/4 重复都判 loop。"""
+    assert detect_loop(torch.tensor([1, 2, 1, 2, 1, 2, 1, 2]))                 # 周期 2
+    assert detect_loop(torch.tensor([1, 2, 3, 1, 2, 3, 1, 2, 3]))              # 周期 3
+    assert detect_loop(torch.tensor([1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]))     # 周期 4
+    # 周期 5（不在默认集合）不判 loop
+    assert not detect_loop(torch.tensor([1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5]))
+
+
+def test_detect_loop_custom_periods_override():
+    """IMP-1b：自定义 periods（如校准后 (5,)）替换默认集合生效。"""
+    r = torch.tensor([1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5])
+    assert detect_loop(r, periods=(5,))            # 自定义 5 判 loop
+    assert not detect_loop(r, periods=(2, 3, 4))   # 默认集合不判周期 5
+
+
+def test_generate_with_status_loop_periods_custom(tmp_path, monkeypatch):
+    """IMP-1b：generate_with_status 透传 loop_periods——周期 5 输出在 periods=(5,) 判 loop，
+    默认 (2,3,4) 下不判（配置驱动，不硬编码）。"""
+    import torch as _t
+    m = CausalToyLM(vocab=64, max_len=64)
+    pr = torch.randint(0, 64, (1, 5))
+    seq = [1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5]   # 周期 5（15 tokens）
+    state = {"it": iter(seq)}
+    monkeypatch.setattr(_t, "multinomial",
+                        lambda probs, num_samples=1: _t.tensor([[next(state["it"])]]))
+    out_default = generate_with_status(m, pr, max_new=len(seq), eos_token_id=None)
+    state["it"] = iter(seq)      # 重置迭代器，两次采样独立（各消费 15 tokens）
+    out_custom = generate_with_status(m, pr, max_new=len(seq), eos_token_id=None,
+                                      loop_periods=(5,))
+    assert out_default["statuses"] == ["budget_stop"]    # 默认 (2,3,4) 不判周期 5
+    assert out_custom["statuses"] == ["loop"]            # 自定义 (5,) 判 loop
+    assert out_custom["looped"] == [True]
 
 
 def test_generate_with_status_no_eos_all_budget():
@@ -204,7 +263,7 @@ def _fake_rollout(responses, statuses, lengths, eos_pos, looped):
     不再把 student 当 self 传入（模块级 generate_with_status 才收 (model, prompts)）。
     """
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0):
+            temperature=1.0, loop_periods=(2, 3, 4)):
         return {"responses": responses, "statuses": statuses, "lengths": lengths,
                 "eos_pos": eos_pos, "looped": looped}
     return gen
@@ -237,6 +296,7 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
                        "n_budget": 1, "n_loop": 1, "n_invalid": 1,
                        "rollout_tokens": 9, "expected_rollout_tokens": 24,
                        "budgets_used": 24, "teacher_forward_tokens": 18,
+                       "loop_periods": (2, 3, 4),
                        "temperature": 0.7}
     assert rb.size == 2
     # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
@@ -255,7 +315,7 @@ def test_run_refresh_phase_injected_gen_called_with_prompts_not_student():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0):
+            temperature=1.0, loop_periods=(2, 3, 4)):
         seen["first_arg_is_prompts"] = prompts is not None
         seen["first_arg_shape"] = tuple(prompts.shape)
         seen["max_new"] = max_new
@@ -321,6 +381,7 @@ def test_run_refresh_phase_all_loop_no_append():
                        "n_budget": 0, "n_loop": 2, "n_invalid": 0,
                        "rollout_tokens": 0, "expected_rollout_tokens": 12,
                        "budgets_used": 12, "teacher_forward_tokens": 0,
+                       "loop_periods": (2, 3, 4),
                        "temperature": 0.7}
     assert rb.size == 0
 
@@ -348,6 +409,9 @@ def test_pipeline_l2_rollout_consumes_max_new_and_records_status(tmp_path):
     out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
     headers = _read_csv_headers(out["metrics_csv"])
     assert any(h.startswith("rollout/") for h in headers)
+    # IMP-1b：rollout/loop_periods 随 summary 一并落盘（tuple 值 CSV 字符串化，不崩）
+    assert "rollout/loop_periods" in headers
+    assert "rollout/temperature" in headers
 
 
 def test_pipeline_l2_rollout_fallback_cache_max_resp(tmp_path):
@@ -359,6 +423,23 @@ def test_pipeline_l2_rollout_fallback_cache_max_resp(tmp_path):
     out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
     headers = _read_csv_headers(out["metrics_csv"])
     assert any(h.startswith("rollout/") for h in headers)
+
+
+def test_pipeline_l2_rollout_custom_loop_periods(tmp_path):
+    """IMP-1b：config 自定义 loop_periods → pipeline 透传到 run_refresh_phase，
+    rollout/loop_periods 落盘值为自定义 tuple（配置驱动，非硬编码）。"""
+    cfg = load_config(overrides=[
+        "l2.enabled=true", "l2.t_train=3", "stage2.n_steps=6",
+        "stage2.batch_size=4", "l2.m_refresh=4",
+        "l2.cache.refresh_size=8", "l2.cache.max_response_length=4",
+        "l2.rollout.max_new_tokens=8",
+        "l2.rollout.loop_periods=2,4,6"])
+    out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
+    with open(out["metrics_csv"], encoding="utf-8") as f:
+        rows = list(_csv.DictReader(f))
+    vals = {r["rollout/loop_periods"] for r in rows
+            if r.get("rollout/loop_periods")}
+    assert vals == {"(2, 4, 6)"}          # CSV 字符串化 tuple，值来自 config 覆盖
 
 
 # --------------------------- 任务6：Stage 2 实验矩阵（S2_E0-E3） ---------------------------
@@ -454,7 +535,7 @@ def test_run_refresh_phase_temperature_passed_to_generator():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0):
+            temperature=1.0, loop_periods=(2, 3, 4)):
         seen["temperature"] = temperature
         m = prompts.size(0)
         return {"responses": torch.ones(m, max_new, dtype=torch.long),
@@ -482,7 +563,7 @@ def test_run_refresh_phase_temperature_1_0_old_behavior():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0):
+            temperature=1.0, loop_periods=(2, 3, 4)):
         seen["temperature"] = temperature
         m = prompts.size(0)
         return {"responses": torch.ones(m, max_new, dtype=torch.long),
@@ -495,3 +576,60 @@ def test_run_refresh_phase_temperature_1_0_old_behavior():
                       max_resp_len=6, top_k=3, device="cpu",
                       rollout_generator=gen, temperature=1.0)
     assert seen["temperature"] == 1.0            # 1.0 旧行为可复现
+
+# --------------------------- IMP-1b：loop_periods 透传 ---------------------------
+def test_run_refresh_phase_loop_periods_passed_to_generator():
+    """IMP-1b：run_refresh_phase 把 loop_periods 完整透传给注入的 rollout_generator，
+    summary 记录实际使用的 loop_periods（tuple）。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    n = 2
+    seen = {}
+
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
+            temperature=1.0, loop_periods=(2, 3, 4)):
+        seen["loop_periods"] = loop_periods
+        m = prompts.size(0)
+        return {"responses": torch.ones(m, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * m,
+                "lengths": [max_new] * m,
+                "eos_pos": [None] * m, "looped": [False] * m}
+
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen, loop_periods=(2, 4, 6))
+    assert seen["loop_periods"] == (2, 4, 6)     # 生成器收到配置的周期集合
+    assert summary["loop_periods"] == (2, 4, 6)  # summary 记录实际周期集合
+
+
+def test_run_refresh_phase_loop_periods_default_summary():
+    """IMP-1b：不显式传 loop_periods 时默认 (2,3,4) 透传，summary 记录默认值（零回归）。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    n = 2
+    seen = {}
+
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
+            temperature=1.0, loop_periods=(2, 3, 4)):
+        seen["loop_periods"] = loop_periods
+        m = prompts.size(0)
+        return {"responses": torch.ones(m, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * m,
+                "lengths": [max_new] * m,
+                "eos_pos": [None] * m, "looped": [False] * m}
+
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen)
+    assert seen["loop_periods"] == (2, 3, 4)
+    assert summary["loop_periods"] == (2, 3, 4)
