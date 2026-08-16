@@ -1,4 +1,4 @@
-# ---------------------------------------------------------------------------
+﻿# ---------------------------------------------------------------------------
 # 上游 clone（各自是独立 git 仓库，有自己的 remote 和历史，不纳入本仓库）
 #   async-opd/     https://github.com/furiosa-ai/async-opd
 #   Direct-OPD/    https://github.com/BytedTsinghua-SIA/Direct-OPD.git
@@ -67,3 +67,7 @@ datasets/
 *~
 Thumbs.db
 desktop.ini
+
+# 工具写入自测残留（0 字节，非项目产物）
+/.write_tool_test.txt
+
