@@ -111,7 +111,9 @@ class HFCausalLM:
     def generate_with_status(self, prompts: torch.Tensor, max_new: int,
                              eos_token_id=None, temperature: float = 1.0,
                              pad_id: int = 0, loop_detection: bool = True,
-                             loop_periods=(2, 3, 4)) -> dict:
+                             loop_periods=(2, 3, 4),
+                             repetition_penalty: float = 1.0,
+                             loop_min_len: int = 8) -> dict:
         """Stage 2：HF 短预算 rollout，与 model.generate_with_status 返回同构 dict。
 
         ⚠️ 骨架边界：无 KV cache，逐 token 前向 O(T²) —— 校准/小批量验证用；真实大规模
@@ -120,6 +122,7 @@ class HFCausalLM:
         判定优先级 loop > invalid > eos > budget_stop。pad_id 只填变长空白，不参与判定。
         """
         from .model import detect_loop, build_length_mask as _blm
+        from .model import apply_repetition_penalty
         B, P = prompts.size(0), prompts.size(1)
         device = prompts.device
         responses = torch.full((B, max_new), pad_id, dtype=torch.long, device=device)
@@ -133,6 +136,9 @@ class HFCausalLM:
             idx = alive.nonzero(as_tuple=False).squeeze(-1)   # (n_a,) alive 样本同长
             ctx = torch.cat([prompts[idx], responses[idx, :t]], dim=1)
             logits = self(ctx)[:, -1]                          # (n_a, V)
+            if repetition_penalty > 1.0:
+                logits = apply_repetition_penalty(
+                    logits, responses[idx, :t], repetition_penalty)
             probs = torch.softmax(logits / max(temperature, 1e-6), dim=-1)
             tok = torch.multinomial(probs, 1).squeeze(-1)      # (n_a,)
             responses[idx, t] = tok
@@ -152,7 +158,7 @@ class HFCausalLM:
         looped: list[bool] = []
         for i in range(B):
             eff = responses[i, :max(1, lengths[i])]
-            loop = loop_detection and detect_loop(eff, loop_periods)
+            loop = loop_detection and detect_loop(eff, loop_periods, min_len=loop_min_len)
             if loop:
                 statuses.append("loop"); looped.append(True)
             elif lengths[i] == 0:
@@ -168,7 +174,9 @@ class HFCausalLM:
     def generate_with_status_kv(self, prompts: torch.Tensor, max_new: int,
                                 eos_token_id=None, temperature: float = 1.0,
                                 pad_id: int = 0, loop_detection: bool = True,
-                                loop_periods=(2, 3, 4)) -> dict:
+                                loop_periods=(2, 3, 4),
+                                repetition_penalty: float = 1.0,
+                                loop_min_len: int = 8) -> dict:
         """Stage 2 真实 HF 大规模 rollout：KV-cached 快速路径，与 generate_with_status 同构。
 
         ⚠️ 性能边界：`generate_with_status`（无 KV cache 的逐 token 前向）在真实 152k 词表 +
@@ -182,10 +190,12 @@ class HFCausalLM:
         B = prompts.size(0)
         device = prompts.device
         eos = int(eos_token_id) if eos_token_id is not None else -1   # -1 永不匹配
-        out = self.model.generate(
-            prompts, max_new_tokens=int(max_new), do_sample=True,
-            temperature=max(float(temperature), 1e-6), top_p=0.95,
-            pad_token_id=pad_id, eos_token_id=eos)
+        _gen_kw = dict(max_new_tokens=int(max_new), do_sample=True,
+                       temperature=max(float(temperature), 1e-6), top_p=0.95,
+                       pad_token_id=pad_id, eos_token_id=eos)
+        if repetition_penalty is not None and repetition_penalty > 1.0:
+            _gen_kw["repetition_penalty"] = float(repetition_penalty)
+        out = self.model.generate(prompts, **_gen_kw)
         new = out[:, prompts.size(1):]                       # (B, T_实际) 右 pad
         responses = torch.full((B, int(max_new)), pad_id, dtype=torch.long, device=device)
         responses[:, :new.size(1)] = new
@@ -203,7 +213,7 @@ class HFCausalLM:
                 ep = seq.index(eos_token_id)
                 L = ep + 1
             loop = loop_detection and detect_loop(
-                torch.tensor(seq[:max(1, L)]), loop_periods)
+                torch.tensor(seq[:max(1, L)]), loop_periods, min_len=loop_min_len)
             if loop:
                 statuses.append("loop"); looped.append(True)
             elif L == 0:

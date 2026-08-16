@@ -118,11 +118,31 @@ def detect_loop(response: torch.Tensor, periods=(2, 3, 4),
     return False
 
 
+def apply_repetition_penalty(logits: torch.Tensor, past: torch.Tensor,
+                             penalty: float) -> torch.Tensor:
+    """对已生成 token 施加 repetition penalty（logits 除以 penalty，>1 抑制重复）。
+
+    logits: (B, V)；past: (B, T) 已生成 token（调用方保证不含 pad）。对每行中出现在
+    past 的 token：logits[b, tok] /= penalty（标准 HF 语义）。penalty<=1.0 直接返回原
+    张量（默认禁用，零回归）。返回新张量，不改入参。
+    """
+    if penalty is None or penalty <= 1.0:
+        return logits
+    out = logits.clone()
+    for b in range(past.size(0)):
+        seen = torch.unique(past[b])
+        if seen.numel():
+            out[b].index_put_((seen,), out[b][seen] / penalty)
+    return out
+
+
 @torch.no_grad()
 def generate_with_status(model: CausalToyLM, prompts: torch.Tensor, max_new: int,
                          eos_token_id=None, temperature: float = 1.0, pad_id: int = 0,
                          loop_detection: bool = True,
-                         loop_periods=(2, 3, 4)) -> dict:
+                         loop_periods=(2, 3, 4),
+                         repetition_penalty: float = 1.0,
+                         loop_min_len: int = 8) -> dict:
     """Stage 2：短预算 rollout——逐 token 采样 + EOS 提前停 + 预算截断。
 
     EOS 语义：把 eos_token_id 当普通可采样 token，采到即停（不要求自然 EOS）；
@@ -150,6 +170,9 @@ def generate_with_status(model: CausalToyLM, prompts: torch.Tensor, max_new: int
         # 上下文 = prompt + 已生成前 t 个 token（alive 样本恒同长 P+t）
         ctx_a = torch.cat([prompts[idx], responses[idx, :t]], dim=1)
         logits = model(ctx_a)[:, -1]                      # (n_a, V)
+        if repetition_penalty > 1.0:
+            logits = apply_repetition_penalty(
+                logits, responses[idx, :t], repetition_penalty)
         probs = torch.softmax(logits / max(temperature, 1e-6), dim=-1)
         tok = torch.multinomial(probs, 1).squeeze(-1)     # (n_a,)
         responses[idx, t] = tok                          # 写回当前步 token
@@ -171,7 +194,7 @@ def generate_with_status(model: CausalToyLM, prompts: torch.Tensor, max_new: int
     looped: list[bool] = []
     for i in range(B):
         eff = responses[i, :max(1, lengths[i])]          # 有效长度（不含 pad）
-        loop = loop_detection and detect_loop(eff, loop_periods)
+        loop = loop_detection and detect_loop(eff, loop_periods, min_len=loop_min_len)
         if loop:
             statuses.append("loop"); looped.append(True)
         elif lengths[i] == 0:

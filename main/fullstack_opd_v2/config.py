@@ -128,6 +128,11 @@ class L2RolloutCfg(_Strict):
     # IMP-1a：rollout 采样温度。默认 0.7（降循环率）；=1.0 复现旧行为（temperature=1.0 恒等）。
     # 真实 HF 生成层（generate_with_status* / vLLM）已支持该参数，此处仅透传。
     temperature: float = 0.7
+    # IMP-1c：抗退化采样。repetition_penalty>1 对已生成 token 的 logits 除 penalty（抑制
+    # 「Final Answer marker 反复」）；=1.0 禁用（旧行为）。loop_min_len 为 detect_loop 的
+    # 最小有效长度门槛，默认 8=旧行为；真实模型短预算下可调高以降低误报。
+    repetition_penalty: float = 1.0
+    loop_min_len: int = 8
     pad_id: int = 0                    # 变长 batch 右 pad 值（不参与判定，仅占位）
     token_budget_per_refresh: int | None = None   # §六：每轮刷新全局 rollout token 预算；None=无上限
 

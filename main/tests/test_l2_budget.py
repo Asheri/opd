@@ -225,7 +225,8 @@ def _recording_gen(log):
     契约：绑定方法签名 gen(prompts, max_new, ...)，run_refresh_phase 以 prompts 为第一实参。
     """
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0, loop_periods=(2, 3, 4)):
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
         log.append(int(max_new))
         n = prompts.size(0)
         return {"responses": torch.ones(n, int(max_new), dtype=torch.long),

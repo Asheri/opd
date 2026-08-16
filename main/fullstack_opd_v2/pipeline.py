@@ -759,6 +759,9 @@ class FullStackOPDv2:
                             eos_id = rollcfg.get("eos_token_id")
                             # IMP-1a：rollout 采样温度（默认 0.7，pipeline 不写死；1.0 复现旧行为）。
                             temperature = float(rollcfg.get("temperature", 0.7))
+                            # IMP-1c：抗退化采样（repetition_penalty>1 抑制重复；loop_min_len 放宽误报）。
+                            repetition_penalty = float(rollcfg.get("repetition_penalty", 1.0))
+                            loop_min_len = int(rollcfg.get("loop_min_len", 8))
                             # P1.5：真实 pad 判定——HF 学生用 config 真实 pad_token_id
                             # 替代 pad_id=0 近似（toy 默认 0 无碍；Qwen3 真实 pad≈1516xx）。
                             _pad_id = int(rollcfg.get("pad_id", 0))
@@ -811,6 +814,8 @@ class FullStackOPDv2:
                                 loop_periods=rollcfg.get("loop_periods", (2, 3, 4)),
                                 pad_id=_pad_id,
                                 temperature=temperature,
+                                repetition_penalty=repetition_penalty,
+                                loop_min_len=loop_min_len,
                                 compute_disagreement=bool(
                                     (l2_cfg.get("disagreement") or {}).get("enabled", True)),
                                 cand=indices, budgets=budgets, budget_t=budget_t)

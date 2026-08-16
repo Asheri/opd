@@ -263,7 +263,8 @@ def _fake_rollout(responses, statuses, lengths, eos_pos, looped):
     不再把 student 当 self 传入（模块级 generate_with_status 才收 (model, prompts)）。
     """
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0, loop_periods=(2, 3, 4)):
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
         return {"responses": responses, "statuses": statuses, "lengths": lengths,
                 "eos_pos": eos_pos, "looped": looped}
     return gen
@@ -297,7 +298,9 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
                        "rollout_tokens": 9, "expected_rollout_tokens": 24,
                        "budgets_used": 24, "teacher_forward_tokens": 18,
                        "loop_periods": (2, 3, 4),
-                       "temperature": 0.7}
+                       "temperature": 0.7,
+                       "repetition_penalty": 1.0,
+                       "loop_min_len": 8}
     assert rb.size == 2
     # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
     assert sorted(rb._status) == ["budget_stop", "eos"]
@@ -315,7 +318,8 @@ def test_run_refresh_phase_injected_gen_called_with_prompts_not_student():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0, loop_periods=(2, 3, 4)):
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
         seen["first_arg_is_prompts"] = prompts is not None
         seen["first_arg_shape"] = tuple(prompts.shape)
         seen["max_new"] = max_new
@@ -382,7 +386,9 @@ def test_run_refresh_phase_all_loop_no_append():
                        "rollout_tokens": 0, "expected_rollout_tokens": 12,
                        "budgets_used": 12, "teacher_forward_tokens": 0,
                        "loop_periods": (2, 3, 4),
-                       "temperature": 0.7}
+                       "temperature": 0.7,
+                       "repetition_penalty": 1.0,
+                       "loop_min_len": 8}
     assert rb.size == 0
 
 
@@ -412,6 +418,9 @@ def test_pipeline_l2_rollout_consumes_max_new_and_records_status(tmp_path):
     # IMP-1b：rollout/loop_periods 随 summary 一并落盘（tuple 值 CSV 字符串化，不崩）
     assert "rollout/loop_periods" in headers
     assert "rollout/temperature" in headers
+    # IMP-1c：repetition_penalty / loop_min_len 随 summary 落盘
+    assert "rollout/repetition_penalty" in headers
+    assert "rollout/loop_min_len" in headers
 
 
 def test_pipeline_l2_rollout_fallback_cache_max_resp(tmp_path):
@@ -535,7 +544,8 @@ def test_run_refresh_phase_temperature_passed_to_generator():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0, loop_periods=(2, 3, 4)):
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
         seen["temperature"] = temperature
         m = prompts.size(0)
         return {"responses": torch.ones(m, max_new, dtype=torch.long),
@@ -563,7 +573,8 @@ def test_run_refresh_phase_temperature_1_0_old_behavior():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0, loop_periods=(2, 3, 4)):
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
         seen["temperature"] = temperature
         m = prompts.size(0)
         return {"responses": torch.ones(m, max_new, dtype=torch.long),
@@ -591,7 +602,8 @@ def test_run_refresh_phase_loop_periods_passed_to_generator():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0, loop_periods=(2, 3, 4)):
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
         seen["loop_periods"] = loop_periods
         m = prompts.size(0)
         return {"responses": torch.ones(m, max_new, dtype=torch.long),
@@ -619,7 +631,8 @@ def test_run_refresh_phase_loop_periods_default_summary():
     seen = {}
 
     def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
-            temperature=1.0, loop_periods=(2, 3, 4)):
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
         seen["loop_periods"] = loop_periods
         m = prompts.size(0)
         return {"responses": torch.ones(m, max_new, dtype=torch.long),
@@ -633,3 +646,71 @@ def test_run_refresh_phase_loop_periods_default_summary():
                                 rollout_generator=gen)
     assert seen["loop_periods"] == (2, 3, 4)
     assert summary["loop_periods"] == (2, 3, 4)
+# --------------------------- IMP-1c：repetition_penalty + loop_min_len ---------------------------
+from fullstack_opd_v2.model import apply_repetition_penalty
+
+
+def test_l2_rollout_repetition_penalty_config():
+    """IMP-1c：L2RolloutCfg 默认 repetition_penalty=1.0 / loop_min_len=8；可覆盖。"""
+    cfg = load_config(overrides=["l2.enabled=true"])
+    assert cfg["l2"]["rollout"]["repetition_penalty"] == 1.0
+    assert cfg["l2"]["rollout"]["loop_min_len"] == 8
+    cfg2 = load_config(overrides=["l2.rollout.repetition_penalty=1.3",
+                                  "l2.rollout.loop_min_len=16"])
+    assert cfg2["l2"]["rollout"]["repetition_penalty"] == 1.3
+    assert cfg2["l2"]["rollout"]["loop_min_len"] == 16
+
+
+def test_apply_repetition_penalty_math():
+    """IMP-1c：repetition_penalty>1 时已生成 token 的 logits 除以 penalty；<=1 零回归。"""
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0],
+                           [1.0, 2.0, 3.0, 4.0]])
+    past = torch.tensor([[0, 2], [1, 3]])       # 行0 见 token 0,2；行1 见 token 1,3
+    out = apply_repetition_penalty(logits.clone(), past, 2.0)
+    # 已见 token 减半：row0 -> [0.5, 2.0, 1.5, 4.0]；row1 -> [1.0, 1.0, 3.0, 2.0]
+    assert out[0].tolist() == [0.5, 2.0, 1.5, 4.0]
+    assert out[1].tolist() == [1.0, 1.0, 3.0, 2.0]
+    # penalty=1.0（默认禁用）与 None 均零回归（不改数值）
+    assert torch.equal(apply_repetition_penalty(logits, past, 1.0), logits)
+    assert torch.equal(apply_repetition_penalty(logits, past, None), logits)
+
+
+def test_detect_loop_loop_min_len_controls():
+    """IMP-1c：loop_min_len 门槛控制短序列是否判 loop（调高=降误报）。"""
+    r = torch.tensor([1, 2, 3, 1, 2, 3])        # 15 token 周期 3 的前 6
+    assert detect_loop(r, periods=(3,), min_len=6)          # min_len=6 判 loop
+    assert not detect_loop(r, periods=(3,), min_len=16)     # min_len=16 不判（过严门槛）
+
+
+def test_run_refresh_phase_repetition_controls_passed():
+    """IMP-1c：run_refresh_phase 把 repetition_penalty / loop_min_len 完整透传给生成器，
+    summary 记录实际值（可配置，非硬编码）。"""
+    torch.manual_seed(0)
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    n = 2
+    seen = {}
+
+    def gen(prompts, max_new, eos_token_id=None, loop_detection=True, pad_id=0,
+            temperature=1.0, loop_periods=(2, 3, 4),
+            repetition_penalty=1.0, loop_min_len=8):
+        seen["repetition_penalty"] = repetition_penalty
+        seen["loop_min_len"] = loop_min_len
+        m = prompts.size(0)
+        return {"responses": torch.ones(m, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * m,
+                "lengths": [max_new] * m,
+                "eos_pos": [None] * m, "looped": [False] * m}
+
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=n,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_generator=gen,
+                                repetition_penalty=1.3, loop_min_len=16)
+    assert seen["repetition_penalty"] == 1.3
+    assert seen["loop_min_len"] == 16
+    assert summary["repetition_penalty"] == 1.3
+    assert summary["loop_min_len"] == 16

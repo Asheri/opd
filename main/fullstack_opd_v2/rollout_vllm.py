@@ -268,7 +268,9 @@ class VLLMRolloutEngine:
     def generate_with_status(self, prompts: torch.Tensor, max_new: int,
                              eos_token_id=None, temperature: float = 1.0,
                              pad_id: int = 0, loop_detection: bool = True,
-                             loop_periods=(2, 3, 4)) -> dict:
+                             loop_periods=(2, 3, 4),
+                             repetition_penalty: float = 1.0,
+                             loop_min_len: int = 8) -> dict:
         """Stage 2：短预算 rollout（vLLM）——SamplingParams 定 max_new/eos，经
         parse_vllm_outputs 得 status，responses 变长右 pad 到 max_new。
 
@@ -279,11 +281,12 @@ class VLLMRolloutEngine:
         B = prompts.size(0)
         sampling = SamplingParams(
             temperature=max(temperature, 1e-6), top_p=0.9, max_tokens=max_new,
-            eos_token_id=eos_token_id)
+            eos_token_id=eos_token_id,
+            repetition_penalty=max(float(repetition_penalty), 1.0))
         seqs = [prompts[b].tolist() for b in range(B)]
         outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
         parsed = parse_vllm_outputs(outs, max_new, eos_token_id,
-                                    loop_detection, loop_periods)
+                                    loop_detection, loop_periods, loop_min_len)
         # 组装 responses：(B,max_new) 按 lengths 写入、pad 填充
         res = torch.full((B, max_new), pad_id, dtype=torch.long)
         for b, o in enumerate(outs):
@@ -296,7 +299,8 @@ class VLLMRolloutEngine:
 
 def parse_vllm_outputs(outs, max_new: int, eos_token_id=None,
                        loop_detection: bool = True,
-                       loop_periods=(2, 3, 4)) -> dict:
+                       loop_periods=(2, 3, 4),
+                       loop_min_len: int = 8) -> dict:
     """Stage 2：把 vLLM RequestOutput 列表解析为同构 status dict（纯函数，CPU 可单测）。
 
     复用 budget_eval.generate_budget 的逐位 EOS 判定手法（eos in new + new.index(eos)）。
@@ -319,7 +323,7 @@ def parse_vllm_outputs(outs, max_new: int, eos_token_id=None,
         else:
             ep, status, length = None, "budget_stop", len(new)
         loop = loop_detection and detect_loop(
-            torch.tensor(new[:max(1, length)]), loop_periods)
+            torch.tensor(new[:max(1, length)]), loop_periods, min_len=loop_min_len)
         if loop:
             status = "loop"
         elif length == 0:
