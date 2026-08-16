@@ -1,0 +1,77 @@
+{
+  "E0_base_only": {
+    "experiment": "E0_base_only",
+    "n_steps": 20,
+    "reward_mean": -0.194921875,
+    "pg_loss_mean": 0.2165000516921282,
+    "kl_loss_mean": 0.9007742711328378,
+    "total_s": 62.986,
+    "stage2_train_s": 50.803
+  },
+  "E1_base_fixed_refresh": {
+    "experiment": "E1_base_fixed_refresh",
+    "n_steps": 20,
+    "reward_mean": -0.2114990234375,
+    "pg_loss_mean": 0.22555091492831708,
+    "kl_loss_mean": 0.8365449034594408,
+    "total_s": 78.61,
+    "stage2_train_s": 66.634,
+    "rollout_n_appended": 0,
+    "rollout_n_loop": 8
+  },
+  "E2_add_disagreement": {
+    "experiment": "E2_add_disagreement",
+    "n_steps": 22,
+    "reward_mean": -0.194325100291859,
+    "pg_loss_mean": 0.20838183448226613,
+    "kl_loss_mean": 1.8300628274327344,
+    "total_s": 78.607,
+    "stage2_train_s": 66.615,
+    "rollout_n_appended": 2,
+    "rollout_n_loop": 6
+  },
+  "E3_add_health_monitor": {
+    "experiment": "E3_add_health_monitor",
+    "n_steps": 20,
+    "reward_mean": -0.20576171875,
+    "pg_loss_mean": 0.2250038918107748,
+    "kl_loss_mean": 0.8810368905760756,
+    "total_s": 79.019,
+    "stage2_train_s": 66.96,
+    "rollout_n_appended": 0,
+    "rollout_n_loop": 8
+  },
+  "E4_add_dynamic_ratio": {
+    "experiment": "E4_add_dynamic_ratio",
+    "n_steps": 22,
+    "reward_mean": -0.19103587757457385,
+    "pg_loss_mean": 0.20974411216395145,
+    "kl_loss_mean": 2.9535567330352652,
+    "total_s": 79.632,
+    "stage2_train_s": 67.553,
+    "rollout_n_appended": 2,
+    "rollout_n_loop": 6
+  },
+  "E5_add_selective_rollout": {
+    "experiment": "E5_add_selective_rollout",
+    "n_steps": 21,
+    "reward_mean": -0.19590541294642858,
+    "pg_loss_mean": 0.21458749821232187,
+    "kl_loss_mean": 2.2740325940138204,
+    "total_s": 79.609,
+    "stage2_train_s": 67.651,
+    "rollout_n_appended": 1,
+    "rollout_n_loop": 7
+  },
+  "E6_random_rollout": {
+    "experiment": "E6_random_rollout",
+    "n_steps": 21,
+    "reward_mean": -0.20001856486002603,
+    "pg_loss_mean": 0.2176942169400198,
+    "kl_loss_mean": 2.4852052286608264,
+    "total_s": 78.561,
+    "stage2_train_s": 66.615,
+    "rollout_n_appended": 1,
+    "rollout_n_loop": 7
+  }
+}

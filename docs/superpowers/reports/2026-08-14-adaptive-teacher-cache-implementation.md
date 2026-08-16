@@ -187,3 +187,32 @@ E6_random_rollout        reward=-0.2377  pg=0.2737  kl=0.0632  total=2.46s  12�
    验证真实词表下稀疏支撑展开的显存与数值行为。
 5. **成本核算模块**：在 rollout 相位显式统计 `teacher_forward_tokens` 与 `rollout_tokens`，
    注入 metrics，供 E0-E6 计算 `Performance/Compute` 比值（当前效率指标用 `total_s` 作代理）。
+---
+
+## 10. 真实规模 E0-E6 实测（2026-08-16，补充）
+
+> 服务器实测：Qwen3-1.7B 学生 + JustRL/R1-Distill 教师对 + 500 条 Skywork pilot 缓存，
+> 20 base 步，m_refresh=8，refresh_min=10，rollout max_new=1024，refresh_size=64，
+> 稀疏 top-K（K=256）。前置修复了刷新相位门控 bug（§9 待办 1 的前提）。
+
+| 实验 | reward | pg | kl | 追加/循环 | 说明 |
+|---|---:|---:|---:|---:|---|
+| E0_base_only | −0.195 | 0.217 | 0.901 | — | 基线 |
+| E1_base_fixed_refresh | −0.212 | 0.226 | 0.837 | 0/8 | 全 loop，无刷新样本 |
+| E2_add_disagreement | −0.194 | 0.208 | 1.830 | 2/6 | 刷新训练，kl 升 |
+| E3_add_health_monitor | −0.206 | 0.225 | 0.881 | 0/8 | 全 loop，Observe-only |
+| E4_add_dynamic_ratio | **−0.191** | 0.210 | 2.954 | 2/6 | reward 最优 |
+| E5_add_selective_rollout | −0.196 | 0.215 | 2.274 | 1/7 | |
+| E6_random_rollout | −0.200 | 0.218 | 2.485 | 1/7 | |
+
+### 关键发现（真实规模 vs toy）
+1. **循环率主导（75-100%）**：temperature=1.0 下 1.7B 学生在短预算内生成大量周期循环
+   CoT，loop 检测（periods=(2,3,4)）拒绝绝大多数 rollout → 每轮仅 0-2 条样本进池。
+   **这使 L2 消融在 20 步尺度上被噪声主导**，toy 端 E5>E6 的方向未在真实规模清晰复现
+   （E5 −0.196 vs E6 −0.200，差异在噪声内）。
+2. **E4（adaptive α）reward 最优（−0.191）**：动态刷新比例信号方向正确，但 kl 飙升
+   （2.95）说明 tiny 池刷新训练噪声大、需更多样本。
+3. **Refresh 训练让 kl 系统性升高**（0.84→2.95 vs base 0.90）：刷新样本进训练确实改变
+   学习信号（G1 闭环真实生效），但小池 + 高循环率下 KL 锚点噪声大。
+4. **后续建议**：① 校准 loop_periods/放宽循环判定（当前过严，7/8 被拒）；② n_steps 提到
+   百步级让刷新池累积；③ 真实规模 E0-E6 需在循环率可控后重跑才有模块消融意义。

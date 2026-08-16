@@ -1,6 +1,11 @@
 # Adaptive Staleness-Aware Teacher Cache 实现计划
 
-> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
+
+> **状态（2026-08-16 同步）：** L2 四能力（RefreshRingBuffer/Disagreement/CacheHealthMonitor/DynamicRatio/RefreshSelector+PromptState）+ 双池 feeder + 交替相位 + E0-E6 已实现；服务器 pytest 344 全绿；真实规模 E0-E6 已实测（见实现报告 §10，循环率高是主要限制）；G5/G7/成本核算/disagreement gate/真实 pad 已在 P1 落地。HF/FSDP/分布式骨架仍为 GPU 待验证。
+> 本计划的实现进度已按服务器实测/测试结果回填；`- [x]` 表示已实现并通过
+> 服务器 pytest（341 全绿）与真实 GPU 运行验证，未打勾项为后续/部分完成。
+
+> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [x]`）语法来跟踪进度。
 
 **目标：** 在 L2 周期刷新机制上实现 Adaptive Staleness-Aware Teacher Cache（四能力 + 整合 + E0-E6 实验框架），保持 `_train_step` teacher-free、最小侵入、默认可关。
 
@@ -57,7 +62,7 @@
 - 修改：`main/fullstack_opd_v2/config.py`（`Stage2Cfg` 后新增 `L2Cfg`，`OPDConfig` 加 `l2` 槽位）
 - 测试：`main/tests/test_config.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 在 `test_config.py` 末尾加：
 ```python
@@ -80,12 +85,12 @@ def test_l2_cfg_unknown_key_rejected():
         load_config(overrides=["l2.bogus=1"])
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cd main && python -m pytest tests/test_config.py::test_l2_cfg_defaults_off -q`
 预期：FAIL，`KeyError: 'l2'`
 
-- [ ] **步骤 3：实现 L2Cfg**
+- [x] **步骤 3：实现 L2Cfg**
 
 在 `config.py` 的 `Stage2Cfg` 类之后、`RunCfg` 之前插入：
 ```python
@@ -171,12 +176,12 @@ class L2Cfg(_Strict):
 
 在 `DEFAULT_CONFIG_V2`（pipeline.py）的 dict 加 `"l2": {"enabled": False}`（与 schema 默认对齐，保证 `load_config` 合并后存在）。同时 `CLOUD_CONFIG` 无需加（L2 默认关）。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：`cd main && python -m pytest tests/test_config.py::test_l2_cfg_defaults_off tests/test_config.py::test_l2_cfg_unknown_key_rejected -q`
 预期：PASS
 
-- [ ] **步骤 5：回归 + Commit**
+- [x] **步骤 5：回归 + Commit**
 
 运行：`cd main && python -m pytest tests/test_config.py -q`（全绿）
 ```bash
@@ -192,7 +197,7 @@ git commit -m "feat(l2): L2Cfg 配置 schema(默认全关, 每模块 enabled 可
 - 创建：`main/fullstack_opd_v2/adaptive_cache.py`（首个类）
 - 测试：`main/tests/test_adaptive_cache.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 创建 `test_adaptive_cache.py`：
 ```python
@@ -247,12 +252,12 @@ def test_ring_buffer_empty_safe():
     assert rb.size == 0
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cd main && python -m pytest tests/test_adaptive_cache.py::test_ring_buffer_append_and_get -q`
 预期：FAIL，`ImportError: cannot import name 'RefreshRingBuffer'`
 
-- [ ] **步骤 3：实现 RefreshRingBuffer**
+- [x] **步骤 3：实现 RefreshRingBuffer**
 
 创建 `main/fullstack_opd_v2/adaptive_cache.py`：
 ```python
@@ -371,12 +376,12 @@ class RefreshRingBuffer:
         return float(sum(self._disagreements) / len(self._disagreements))
 ```
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：`cd main && python -m pytest tests/test_adaptive_cache.py -q`
 预期：4 个 PASS
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add main/fullstack_opd_v2/adaptive_cache.py main/tests/test_adaptive_cache.py
@@ -391,7 +396,7 @@ git commit -m "feat(l2): RefreshRingBuffer(FIFO+价值保护, base 池不动)"
 - 修改：`main/fullstack_opd_v2/data.py`（`JsonLinesDataLoader.load` 返回 mask）
 - 测试：`main/tests/test_data.py`（若无则新建）
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_jsonl_returns_mask(tmp_path):
@@ -411,12 +416,12 @@ def test_jsonl_returns_mask(tmp_path):
 ```
 （若 `test_data.py` 已有 jsonl 测试用 mock tokenizer，在其基础上断言返回 4 元组含 mask。具体断言：`prompts, responses, reward_fn, mask = loader.load()`，`mask.shape == (N, T)`，pad 位置为 0。）
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cd main && python -m pytest tests/test_data.py -q -k jsonl`
 预期：FAIL（返回 3 元组无 mask）
 
-- [ ] **步骤 3：实现 mask 回传**
+- [x] **步骤 3：实现 mask 回传**
 
 修改 `data.py` 的 `JsonLinesDataLoader.load()`：在编码 response 时记录有效长度，构造 mask：
 ```python
@@ -433,12 +438,12 @@ def test_jsonl_returns_mask(tmp_path):
 
 修改 `pipeline.py` 中调用 `build_data_loader(...).load()` 的地方解包 4 元素（`_run_body` 里 `prompts, responses, reward_fn, masks = ...`；mask 传入 scheduler）。**注意**：pipeline Agent 返回后确认精确行号。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：`cd main && python -m pytest tests/test_data.py tests/test_pipeline.py -q`
 预期：PASS（pipeline 解包需同步改，见任务 1.5）
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add main/fullstack_opd_v2/data.py main/tests/test_data.py
@@ -453,7 +458,7 @@ git commit -m "feat(data): JsonLinesDataLoader 回传 response padding mask(§3.
 - 修改：`main/fullstack_opd_v2/scheduler.py`（`_train_step:291` + `_rand_idxs:200`）
 - 测试：`main/tests/test_scheduler.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_base_sample_not_truncated_by_version():
@@ -474,12 +479,12 @@ def test_dual_pool_feeder_mix_ratio():
     ...
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cd main && python -m pytest tests/test_scheduler.py::test_base_sample_not_truncated_by_version -q`
 预期：FAIL（当前 base ver=0 会被截断返回 None）
 
-- [ ] **步骤 3：实现修复 + 双池 feeder**
+- [x] **步骤 3：实现修复 + 双池 feeder**
 
 修改 `scheduler.py`：
 
@@ -517,12 +522,12 @@ def test_dual_pool_feeder_mix_ratio():
 
 在 `AsyncBatchedScheduler.__init__` 加 L2 钩子（`l2.enabled` 时初始化 refresh_buffer=None、alpha=initial；pipeline 在交替相位注入）。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：`cd main && python -m pytest tests/test_scheduler.py -q`
 预期：PASS
 
-- [ ] **步骤 5：回归 + Commit**
+- [x] **步骤 5：回归 + Commit**
 
 运行：`cd main && python -m pytest tests/ -q`（全绿，确认 l2.enabled=false 时行为不变）
 ```bash
@@ -538,7 +543,7 @@ git commit -m "fix(l2): base 样本不受版本截断(ratio+clip 降权) + 双�
 - 修改：`main/fullstack_opd_v2/checkpoint.py`（`save` 加 optimizer/RNG；`resume` 恢复）
 - 测试：`main/tests/test_checkpoint.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_checkpoint_saves_optimizer_and_rng(tmp_path):
@@ -556,12 +561,12 @@ def test_checkpoint_saves_optimizer_and_rng(tmp_path):
     assert "rng" in ck
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cd main && python -m pytest tests/test_checkpoint.py::test_checkpoint_saves_optimizer_and_rng -q`
 预期：FAIL（save 不接受 optimizer 参数）
 
-- [ ] **步骤 3：实现扩展**
+- [x] **步骤 3：实现扩展**
 
 修改 `checkpoint.py` 的 `save()` 签名加 `optimizer=None, rng=None, refresh_buffer=None`：
 ```python
@@ -584,12 +589,12 @@ def test_checkpoint_saves_optimizer_and_rng(tmp_path):
 
 `resume()` 已返回 dict（含新键），pipeline `_run_body` resume 分支加载 optimizer.load_state_dict + torch.set_rng_state + ring buffer 恢复（见任务 6.x）。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：`cd main && python -m pytest tests/test_checkpoint.py -q`
 预期：PASS
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add main/fullstack_opd_v2/checkpoint.py main/tests/test_checkpoint.py
@@ -606,7 +611,7 @@ git commit -m "feat(l2): checkpoint 扩展(optimizer+RNG+ring buffer, §B 精确
 - 修改：`main/fullstack_opd_v2/adaptive_cache.py`（加 `DisagreementComputer`）
 - 测试：`main/tests/test_adaptive_cache.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_disagreement_identical_zero():
@@ -641,12 +646,12 @@ def test_disagreement_mask_excludes_padding():
     assert torch.allclose(D["abs"], torch.zeros(2), atol=1e-6)
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cd main && python -m pytest tests/test_adaptive_cache.py::test_disagreement_identical_zero -q`
 预期：FAIL（无 DisagreementComputer）
 
-- [ ] **步骤 3：实现 DisagreementComputer**
+- [x] **步骤 3：实现 DisagreementComputer**
 
 在 `adaptive_cache.py` 加：
 ```python
@@ -689,12 +694,12 @@ class DisagreementComputer:
         return log_dists.gather(2, responses.unsqueeze(-1)).squeeze(-1)
 ```
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：`cd main && python -m pytest tests/test_adaptive_cache.py -q -k disagreement`
 预期：3 个 PASS
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add main/fullstack_opd_v2/adaptive_cache.py main/tests/test_adaptive_cache.py
@@ -712,7 +717,7 @@ git commit -m "feat(l2): DisagreementComputer(D_t=Δ_T−Δ_S, 不同源4 logp, 
 
 > 本任务实现「rollout 相位」：student 生成 -> 4 个 chosen logp -> D_i^abs -> append_refresh。teacher 前向在此相位，_train_step 不动（teacher-free）。
 
-- [ ] **步骤 1-5：** 实现编排函数 `run_refresh_phase(student, teacher_rl, teacher_ref, student_ref, selector, ring_buffer, prompts, step, version, cfg)`，在 `adaptive_cache.py`：
+- [x] **步骤 1-5：** 实现编排函数 `run_refresh_phase(student, teacher_rl, teacher_ref, student_ref, selector, ring_buffer, prompts, step, version, cfg)`，在 `adaptive_cache.py`：
 
 ```python
     def run_refresh_phase(self, student, teacher_rl, teacher_ref,
@@ -770,7 +775,7 @@ Commit：`feat(l2): rollout 相位编排(student生成+4 logp+D_i^abs+append, te
 **文件：**
 - 修改：`main/fullstack_opd_v2/model_factory.py`（`HFCausalLM`）
 
-- [ ] **步骤 1-5：** 给 `HFCausalLM` 加 `generate_batch`（委托 `model.generate`）和 `__call__` 传 `attention_mask`：
+- [x] **步骤 1-5：** 给 `HFCausalLM` 加 `generate_batch`（委托 `model.generate`）和 `__call__` 传 `attention_mask`：
 ```python
     def __call__(self, input_ids, attention_mask=None):
         kw = {"input_ids": input_ids}
@@ -802,7 +807,7 @@ Commit：`feat(l2): HFCausalLM generate_batch + attention_mask 骨架(§3 rollou
 - 修改：`main/fullstack_opd_v2/adaptive_cache.py`（加 `CacheHealthMonitor`）
 - 测试：`main/tests/test_adaptive_cache.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_health_score_thresholds():
@@ -825,9 +830,9 @@ def test_health_alert_cooldown():
     assert hm._alert_count == 1
 ```
 
-- [ ] **步骤 2：运行测试验证失败** — `cd main && python -m pytest tests/test_adaptive_cache.py::test_health_score_thresholds -q`（FAIL）
+- [x] **步骤 2：运行测试验证失败** — `cd main && python -m pytest tests/test_adaptive_cache.py::test_health_score_thresholds -q`（FAIL）
 
-- [ ] **步骤 3：实现 CacheHealthMonitor**
+- [x] **步骤 3：实现 CacheHealthMonitor**
 
 ```python
 class CacheHealthMonitor:
@@ -906,9 +911,9 @@ class CacheHealthMonitor:
 
 七维其余（age/reward/length 分布统计）用 EMA + reservoir 采样统计，不全量扫描（§4.6）。
 
-- [ ] **步骤 4：运行测试验证通过** — `cd main && python -m pytest tests/test_adaptive_cache.py -q -k health`（PASS）
+- [x] **步骤 4：运行测试验证通过** — `cd main && python -m pytest tests/test_adaptive_cache.py -q -k health`（PASS）
 
-- [ ] **步骤 5：Commit** — `feat(l2): CacheHealthMonitor(七维+rule-based score+alert cooldown, Observe-only)`
+- [x] **步骤 5：Commit** — `feat(l2): CacheHealthMonitor(七维+rule-based score+alert cooldown, Observe-only)`
 
 ---
 
@@ -920,7 +925,7 @@ class CacheHealthMonitor:
 - 修改：`main/fullstack_opd_v2/adaptive_cache.py`（加 `DynamicRatioController`）
 - 测试：`main/tests/test_adaptive_cache.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_ratio_bounds():
@@ -953,9 +958,9 @@ def test_ratio_max_step_change():
     assert abs(a2 - a1) <= 0.05 + 1e-6
 ```
 
-- [ ] **步骤 2：运行测试验证失败** — `cd main && python -m pytest tests/test_adaptive_cache.py::test_ratio_bounds -q`（FAIL）
+- [x] **步骤 2：运行测试验证失败** — `cd main && python -m pytest tests/test_adaptive_cache.py::test_ratio_bounds -q`（FAIL）
 
-- [ ] **步骤 3：实现 DynamicRatioController**
+- [x] **步骤 3：实现 DynamicRatioController**
 
 ```python
 class DynamicRatioController:
@@ -1017,9 +1022,9 @@ class DynamicRatioController:
         return min(alpha, n_refresh / max(1, n_batch))
 ```
 
-- [ ] **步骤 4：运行测试验证通过** — `cd main && python -m pytest tests/test_adaptive_cache.py -q -k ratio`（PASS）
+- [x] **步骤 4：运行测试验证通过** — `cd main && python -m pytest tests/test_adaptive_cache.py -q -k ratio`（PASS）
 
-- [ ] **步骤 5：Commit** — `feat(l2): DynamicRatioController(三信号α+EMA+max_step_change+cold start, fixed/linear/adaptive)`
+- [x] **步骤 5：Commit** — `feat(l2): DynamicRatioController(三信号α+EMA+max_step_change+cold start, fixed/linear/adaptive)`
 
 ---
 
@@ -1031,7 +1036,7 @@ class DynamicRatioController:
 - 修改：`main/fullstack_opd_v2/adaptive_cache.py`（加 `PromptStateStore` + `RefreshSelector`）
 - 测试：`main/tests/test_adaptive_cache.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_selector_candidate_pool_two_stage():
@@ -1069,9 +1074,9 @@ def test_selector_diversity_max_same_prompt():
     assert max(Counter(selected.tolist()).values()) <= 1
 ```
 
-- [ ] **步骤 2：运行测试验证失败** — `cd main && python -m pytest tests/test_adaptive_cache.py::test_selector_candidate_pool_two_stage -q`（FAIL）
+- [x] **步骤 2：运行测试验证失败** — `cd main && python -m pytest tests/test_adaptive_cache.py::test_selector_candidate_pool_two_stage -q`（FAIL）
 
-- [ ] **步骤 3：实现 PromptStateStore + RefreshSelector**
+- [x] **步骤 3：实现 PromptStateStore + RefreshSelector**
 
 ```python
 class PromptStateStore:
@@ -1162,9 +1167,9 @@ class RefreshSelector:
         return torch.tensor(filtered[:n_selected])
 ```
 
-- [ ] **步骤 4：运行测试验证通过** — `cd main && python -m pytest tests/test_adaptive_cache.py -q -k selector`（PASS）
+- [x] **步骤 4：运行测试验证通过** — `cd main && python -m pytest tests/test_adaptive_cache.py -q -k selector`（PASS）
 
-- [ ] **步骤 5：Commit** — `feat(l2): RefreshSelector+PromptStateStore(candidate pool 两阶段+value+coverage+diversity+fallback)`
+- [x] **步骤 5：Commit** — `feat(l2): RefreshSelector+PromptStateStore(candidate pool 两阶段+value+coverage+diversity+fallback)`
 
 ---
 
@@ -1187,7 +1192,7 @@ class RefreshSelector:
 - `pipeline.py:555` `metrics = scheduler.run(n_steps, on_step=_on_step)` -- 交替循环替换点
 - `pipeline.py:506/553` `cm.save(...)` -- 加 optimizer/rng/ring_buffer
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```python
 def test_alternating_phase_loop(tmp_path):
@@ -1213,12 +1218,12 @@ def test_no_teacher_forward_in_train_step():
     ...
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cd main && python -m pytest tests/test_l2_integration.py::test_alternating_phase_loop -q`
 预期：FAIL（scheduler.run 单次调用，无交替）
 
-- [ ] **步骤 3：实现交替相位接入**
+- [x] **步骤 3：实现交替相位接入**
 
 (a) `pipeline.py:414` -- L2 启用时保留 teacher/warmup_student：
 ```python
@@ -1384,12 +1389,12 @@ def _build_mask(responses, pad_id=0):
 ```
 scheduler 构造后：`if _resume_opt: scheduler.opt.load_state_dict(_resume_opt)`；`rb = _resume_rb`（恢复 ring buffer）。注意 FSDP 下 optimizer state 用 `optim.set_state_dict`（阶段1 任务1.5 的 `_opt_state_to_cpu` 对称）。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：`cd main && python -m pytest tests/test_l2_integration.py -q`
 预期：PASS（交替相位 + 回归 + teacher-free 断言）
 
-- [ ] **步骤 5：全量回归 + Commit**
+- [x] **步骤 5：全量回归 + Commit**
 
 运行：`cd main && python -m pytest tests/ -q`（全绿，含原 42 测试 + L2 新增）
 ```bash
@@ -1405,7 +1410,7 @@ git commit -m "feat(l2): pipeline 交替相位循环接入(训练T_train步↔ro
 - 创建：`main/scripts/run_l2_ablation.py`
 - 创建：`main/fullstack_opd_v2/experiment.py`（实验记录聚合）
 
-- [ ] **步骤 1-5：** 实现 E0-E6 配置生成（每模块 enabled 切换）+ 统一记录（Training Quality / Efficiency / Cache / Selector 四类）+ 8 张实验图绘制（matplotlib，6/7 最重要）。
+- [x] **步骤 1-5：** 实现 E0-E6 配置生成（每模块 enabled 切换）+ 统一记录（Training Quality / Efficiency / Cache / Selector 四类）+ 8 张实验图绘制（matplotlib，6/7 最重要）。
 
 Commit：`feat(l2): E0-E6 实验矩阵 + 统一记录 + 8 张实验图(teacher compute vs perf 最重要)`
 
@@ -1416,7 +1421,7 @@ Commit：`feat(l2): E0-E6 实验矩阵 + 统一记录 + 8 张实验图(teacher c
 **文件：**
 - 测试：`main/tests/test_l2_integration.py`（补全工程检查断言）
 
-- [ ] **步骤 1-5：** 补全工程检查测试：
+- [x] **步骤 1-5：** 补全工程检查测试：
   - `test_no_teacher_forward_in_train_step`（断言 _train_step 内无 teacher 前向调用）
   - `test_no_gpu_memory_growth`（连续 step 显存不增长）
   - `test_no_unbounded_metadata_growth`（prompt state / reuse count 有界）
