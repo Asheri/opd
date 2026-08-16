@@ -206,6 +206,7 @@ class RefreshRingBuffer:
         self._prompt_idx: list[int] = []            # fat_prompts 索引（定位 prompt）
         self._response: list[torch.Tensor] = []     # (T,) 生成 response
         self._status: list[str] = []                # Stage 2：rollout status（eos/budget_stop）
+        self._source: list[str] = []                # IMP-1c：rollout_source（student/teacher，诊断用）
         self._write_pos = 0     # 环形写指针
         self.size = 0           # 当前有效样本数
 
@@ -239,7 +240,8 @@ class RefreshRingBuffer:
                token_mask: torch.Tensor, disagreement_abs: float,
                prompt_idx: int, response: torch.Tensor,
                s_old_ids: torch.Tensor, s_old_logp: torch.Tensor,
-               status: str = "budget_stop") -> int:
+               status: str = "budget_stop",
+               source: str = "student") -> int:
         """append 一条样本（ids/delta_k/s_old_ids/s_old_logp: (T,K)）。满则 FIFO 淘汰。
 
         status：Stage 2 rollout 状态（eos/budget_stop），默认 budget_stop 兼容旧调用。
@@ -271,6 +273,7 @@ class RefreshRingBuffer:
             self._prompt_idx[pos] = prompt_idx
             self._response[pos] = response
             self._status[pos] = status
+            self._source[pos] = source
         else:
             self._gen_steps.append(generation_step)
             self._resp_lens.append(response_length)
@@ -280,6 +283,7 @@ class RefreshRingBuffer:
             self._prompt_idx.append(prompt_idx)
             self._response.append(response)
             self._status.append(status)
+            self._source.append(source)
         # 价值保护：高于分位的样本标记（G7：U_i 驱动，None 退回 disagreement）。
         # ⚠️ 先更新 size（新样本已写入槽位，属有效样本），否则首条 append 时
         # _value_threshold 按 size=0 构造空张量 → quantile 崩。
@@ -336,6 +340,7 @@ class RefreshRingBuffer:
             "prompt_idx": torch.tensor([self._prompt_idx[i] for i in il], dtype=torch.long),
             "responses": torch.stack([self._response[i] for i in il]),
             "status": [self._status[i] for i in il],
+            "source": [self._source[i] for i in il],
         }
 
     def sample(self, n: int, generator: torch.Generator) -> torch.Tensor:
@@ -414,6 +419,7 @@ class RefreshRingBuffer:
             "prompt_idx": self._prompt_idx[:self.size],
             "responses": [r.detach().cpu() for r in self._response[:self.size]],
             "status": self._status[:self.size],
+            "source": self._source[:self.size],
         }
 
     def load_state_dict(self, sd: dict):
@@ -436,6 +442,8 @@ class RefreshRingBuffer:
         self._prompt_idx = list(sd["prompt_idx"][:self.size])
         self._response = list(sd["responses"][:self.size])
         self._status = list(sd.get("status", ["budget_stop"] * self.size)[:self.size])  # 兼容旧断点
+        # IMP-1c：兼容旧断点（无 source 字段时默认 student）
+        self._source = list(sd.get("source", ["student"] * self.size)[:self.size])
 
     def mean_disagreement(self) -> float:
         """池内平均 disagreement（§5 刷新质量信号 / §4 监控）。"""
@@ -493,6 +501,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       loop_periods=(2, 3, 4),      # IMP-1b：尾部周期检测周期集合（默认 (2,3,4)）
                       repetition_penalty: float = 1.0,  # IMP-1c：>1 抑制已见 token 重复
                       loop_min_len: int = 8,            # IMP-1c：detect_loop 最小长度门槛
+                      rollout_source: str = "student",  # IMP-1c：rollout 来源 student/teacher（仅诊断）
                       pad_id=0,
                       temperature: float = 0.7,    # IMP-1a：采样温度（默认 0.7 降循环率；1.0 旧行为）
                       budgets=None,                # Stage 3：per-sample budget (M,) long；None→单预算
@@ -547,7 +556,9 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                                      temperature=temperature, loop_periods=loop_periods,
                                      repetition_penalty=repetition_penalty,
                                      loop_min_len=loop_min_len)
-        return _default_gen(student, pb, max_new=max_new, eos_token_id=eos_token_id,
+        # IMP-1c：按 rollout_source 选生成模型（teacher=仅诊断/上界；student=主路径）。
+        _gen_model = teacher_rl if rollout_source == "teacher" else student
+        return _default_gen(_gen_model, pb, max_new=max_new, eos_token_id=eos_token_id,
                             loop_detection=loop_detection, pad_id=pad_id,
                             temperature=temperature, loop_periods=loop_periods,
                             repetition_penalty=repetition_penalty,
@@ -604,7 +615,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                 "loop_periods": tuple(loop_periods),
                 "temperature": float(temperature),
                 "repetition_penalty": float(repetition_penalty),
-                "loop_min_len": int(loop_min_len)}
+                "loop_min_len": int(loop_min_len),
+                "source": rollout_source}
     p_b_v = p_b[valid]
     resp_v = responses[valid]
     # 行为策略：生成完立即取当前 student 完整分布 top-K（s_old，精确行为策略 §2）。
@@ -641,7 +653,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
             disagreement_abs=D_vals[j],
             prompt_idx=int(cand[i]), response=resp_v[j],
             s_old_ids=s_old_ids[j], s_old_logp=s_old_logp[j],
-            status=statuses[i])
+            status=statuses[i], source=rollout_source)
         # G2：写回 PromptState（rollout 结果 -> prompt 历史 -> 下次 selection 闭环）。
         if prompt_state is not None:
             rew = ring_buffer.reward_estimate(pos)
@@ -658,7 +670,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
             "loop_periods": tuple(loop_periods),
             "temperature": float(temperature),
             "repetition_penalty": float(repetition_penalty),
-            "loop_min_len": int(loop_min_len)}
+            "loop_min_len": int(loop_min_len),
+            "source": rollout_source}
 class CacheHealthMonitor:
     """§4 Cache Health Monitor（只 Observe->Diagnose，不自动改训练）。
 

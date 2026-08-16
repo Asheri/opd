@@ -300,7 +300,8 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
                        "loop_periods": (2, 3, 4),
                        "temperature": 0.7,
                        "repetition_penalty": 1.0,
-                       "loop_min_len": 8}
+                       "loop_min_len": 8,
+                       "source": "student"}
     assert rb.size == 2
     # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
     assert sorted(rb._status) == ["budget_stop", "eos"]
@@ -388,7 +389,8 @@ def test_run_refresh_phase_all_loop_no_append():
                        "loop_periods": (2, 3, 4),
                        "temperature": 0.7,
                        "repetition_penalty": 1.0,
-                       "loop_min_len": 8}
+                       "loop_min_len": 8,
+                       "source": "student"}
     assert rb.size == 0
 
 
@@ -418,9 +420,10 @@ def test_pipeline_l2_rollout_consumes_max_new_and_records_status(tmp_path):
     # IMP-1b：rollout/loop_periods 随 summary 一并落盘（tuple 值 CSV 字符串化，不崩）
     assert "rollout/loop_periods" in headers
     assert "rollout/temperature" in headers
-    # IMP-1c：repetition_penalty / loop_min_len 随 summary 落盘
+    # IMP-1c：repetition_penalty / loop_min_len / source 随 summary 落盘
     assert "rollout/repetition_penalty" in headers
     assert "rollout/loop_min_len" in headers
+    assert "rollout/source" in headers
 
 
 def test_pipeline_l2_rollout_fallback_cache_max_resp(tmp_path):
@@ -714,3 +717,93 @@ def test_run_refresh_phase_repetition_controls_passed():
     assert seen["loop_min_len"] == 16
     assert summary["repetition_penalty"] == 1.3
     assert summary["loop_min_len"] == 16
+# --------------------------- IMP-1c：teacher rollout capability（仅诊断） ---------------------------
+def test_l2_rollout_source_config():
+    """IMP-1c：rollout_source 默认 student（禁止默认启用 teacher）；可覆盖 teacher；非法值拒绝。"""
+    cfg = load_config(overrides=["l2.enabled=true"])
+    assert cfg["l2"]["rollout"]["rollout_source"] == "student"
+    cfg2 = load_config(overrides=["l2.rollout.rollout_source=teacher"])
+    assert cfg2["l2"]["rollout"]["rollout_source"] == "teacher"
+    with pytest.raises(ConfigError):
+        load_config(overrides=["l2.rollout.rollout_source=ref"])
+
+
+def test_run_refresh_phase_teacher_source_uses_teacher_rl(monkeypatch):
+    """IMP-1c：rollout_source=teacher 时默认生成调用 teacher_rl（y~pi_teacher_rl，诊断专用）。"""
+    from fullstack_opd_v2 import model as _model_mod
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    calls = {}
+
+    def fake_gen(m, prompts, max_new, **kw):
+        calls["model"] = m
+        n = prompts.size(0)
+        return {"responses": torch.ones(n, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * n,
+                "lengths": [max_new] * n,
+                "eos_pos": [None] * n, "looped": [False] * n}
+
+    monkeypatch.setattr(_model_mod, "generate_with_status", fake_gen)
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=2,
+                                max_resp_len=6, top_k=3, device="cpu",
+                                rollout_source="teacher")
+    assert calls["model"] is t_rl          # teacher RL generate 被调用
+    assert summary["source"] == "teacher"   # teacher source 明确记录
+    assert rb._source == ["teacher", "teacher"]   # 逐样本 metadata 保存 source
+
+
+def test_run_refresh_phase_student_source_uses_student(monkeypatch):
+    """IMP-1c：rollout_source=student（默认）时默认生成调用 student（y~pi_student）。"""
+    from fullstack_opd_v2 import model as _model_mod
+    V = 8
+    stu, t_rl, t_ref, s_ref = _make_toy(V), _make_toy(V), _make_toy(V), _make_toy(V)
+    rb = RefreshRingBuffer(capacity=8, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    prompts = torch.randint(0, V, (2, 5))
+    calls = {}
+
+    def fake_gen(m, prompts, max_new, **kw):
+        calls["model"] = m
+        n = prompts.size(0)
+        return {"responses": torch.ones(n, max_new, dtype=torch.long),
+                "statuses": ["budget_stop"] * n,
+                "lengths": [max_new] * n,
+                "eos_pos": [None] * n, "looped": [False] * n}
+
+    monkeypatch.setattr(_model_mod, "generate_with_status", fake_gen)
+    summary = run_refresh_phase(stu, t_rl, t_ref, s_ref, None, rb, disag,
+                                prompts, step=1, version=1, m_selected=2,
+                                max_resp_len=6, top_k=3, device="cpu")
+    assert calls["model"] is stu           # student generate 被调用
+    assert summary["source"] == "student"
+    assert rb._source == ["student", "student"]
+
+
+def test_refresh_ring_buffer_source_metadata_roundtrip():
+    """IMP-1c：ring buffer 逐样本保存 rollout_source，state_dict 往返保留 + get 暴露。"""
+    V = 8
+    rb = RefreshRingBuffer(capacity=4, top_k=3, vocab=V)
+    rb.append(torch.zeros(3, 3, dtype=torch.long), torch.zeros(3, 3),
+              generation_step=1, response_length=3,
+              token_mask=torch.ones(3, dtype=torch.long),
+              disagreement_abs=0.5, prompt_idx=0,
+              response=torch.zeros(3, dtype=torch.long),
+              s_old_ids=torch.zeros(3, 3, dtype=torch.long),
+              s_old_logp=torch.zeros(3, 3), status="budget_stop",
+              source="teacher")
+    rb.append(torch.zeros(3, 3, dtype=torch.long), torch.zeros(3, 3),
+              generation_step=2, response_length=3,
+              token_mask=torch.ones(3, dtype=torch.long),
+              disagreement_abs=0.6, prompt_idx=1,
+              response=torch.ones(3, dtype=torch.long),
+              s_old_ids=torch.zeros(3, 3, dtype=torch.long),
+              s_old_logp=torch.zeros(3, 3), status="budget_stop")
+    sd = rb.state_dict()
+    rb2 = RefreshRingBuffer(capacity=4, top_k=3, vocab=V)
+    rb2.load_state_dict(sd)
+    assert rb2._source == ["teacher", "student"]
+    assert rb2.get(torch.tensor([0, 1]))["source"] == ["teacher", "student"]

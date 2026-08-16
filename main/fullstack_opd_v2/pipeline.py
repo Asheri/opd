@@ -762,6 +762,12 @@ class FullStackOPDv2:
                             # IMP-1c：抗退化采样（repetition_penalty>1 抑制重复；loop_min_len 放宽误报）。
                             repetition_penalty = float(rollcfg.get("repetition_penalty", 1.0))
                             loop_min_len = int(rollcfg.get("loop_min_len", 8))
+                            # IMP-1c：rollout 来源（默认 student=主路径；teacher=仅诊断/上界）。
+                            rollout_source = str(rollcfg.get("rollout_source", "student"))
+                            if rollout_source == "teacher":
+                                logger.warning(
+                                    "[L2] rollout_source=teacher 是诊断/上界实验专用（y~pi_teacher_rl），"
+                                    "禁止默认启用、禁止混进主 E5；teacher 轨迹不构成主 on-policy 数据。")
                             # P1.5：真实 pad 判定——HF 学生用 config 真实 pad_token_id
                             # 替代 pad_id=0 近似（toy 默认 0 无碍；Qwen3 真实 pad≈1516xx）。
                             _pad_id = int(rollcfg.get("pad_id", 0))
@@ -776,6 +782,10 @@ class FullStackOPDv2:
                             if rollout_engine is not None:
                                 _rollout_gen = getattr(rollout_engine,
                                                        "generate_with_status", None)
+                            elif rollout_source == "teacher":
+                                # IMP-1c：teacher rollout 用 teacher_rl 的生成器（诊断专用）
+                                _rollout_gen = (getattr(teacher_rl, "generate_with_status_kv", None)
+                                                or getattr(teacher_rl, "generate_with_status", None))
                             elif hasattr(student, "generate_with_status_kv"):
                                 _rollout_gen = student.generate_with_status_kv
                             else:
@@ -816,6 +826,7 @@ class FullStackOPDv2:
                                 temperature=temperature,
                                 repetition_penalty=repetition_penalty,
                                 loop_min_len=loop_min_len,
+                                rollout_source=rollout_source,
                                 compute_disagreement=bool(
                                     (l2_cfg.get("disagreement") or {}).get("enabled", True)),
                                 cand=indices, budgets=budgets, budget_t=budget_t)

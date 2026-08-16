@@ -133,6 +133,10 @@ class L2RolloutCfg(_Strict):
     # 最小有效长度门槛，默认 8=旧行为；真实模型短预算下可调高以降低误报。
     repetition_penalty: float = 1.0
     loop_min_len: int = 8
+    # IMP-1c（teacher rollout）：rollout 采样来源。student=主实验路径（y~pi_student）；
+    # teacher=仅诊断/上界实验（y~pi_teacher_rl）。默认 student（禁止默认启用 teacher）；
+    # teacher 轨迹不构成主 L2 on-policy 数据，禁止混进主 E5。逐样本 metadata 记录 source。
+    rollout_source: Literal["student", "teacher"] = "student"
     pad_id: int = 0                    # 变长 batch 右 pad 值（不参与判定，仅占位）
     token_budget_per_refresh: int | None = None   # §六：每轮刷新全局 rollout token 预算；None=无上限
 
