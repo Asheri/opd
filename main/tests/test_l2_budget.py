@@ -107,7 +107,8 @@ def test_enforce_budget_none():
 
 def test_compute_rollout_metrics():
     summary = dict(n_total=100, n_appended=40, n_eos=30, n_budget=20,
-                   n_loop=10, n_invalid=5, rollout_tokens=200)
+                   n_loop=10, n_invalid=5, rollout_tokens=200,
+                   generated_tokens=500, valid_tokens=200, wall_time=10.0)
     m = compute_rollout_metrics(summary, budget_t=200)
     assert m['rollout/rollout_tokens'] == 200
     assert m['rollout/budget_utilization'] == pytest.approx(1.0)
@@ -117,6 +118,9 @@ def test_compute_rollout_metrics():
     assert m['rollout/accuracy_proxy'] == pytest.approx(0.4)
     # IMP-1d：valid_rate = valid/generated（= accuracy_proxy，40/100）
     assert m['rollout/valid_rate'] == pytest.approx(0.4)
+    # IMP-1d：effective rollout throughput
+    assert m['rollout/raw_tok_per_sec'] == pytest.approx(50.0)    # 500/10
+    assert m['rollout/valid_tok_per_sec'] == pytest.approx(20.0)  # 200/10
     assert m['rollout/useful_per_token'] == pytest.approx(0.2)  # 40/200
 
 
@@ -341,7 +345,7 @@ def test_pipeline_adaptive_budget_smoke():
     assert sorted(set(log)) == sorted(set(budgets.tolist()))
     # token 效率指标：7 键 + useful_per_token 合法 float
     rm = compute_rollout_metrics(summary, budgets, budget_t)
-    assert len(rm) == 8   # 7 + rollout/valid_rate（IMP-1d）
+    assert len(rm) == 10  # 8 + raw/valid_tok_per_sec（IMP-1d）
     assert all(k.startswith("rollout/") for k in rm)
     assert isinstance(rm["rollout/useful_per_token"], float)
     assert rm["rollout/rollout_tokens"] == summary["rollout_tokens"]

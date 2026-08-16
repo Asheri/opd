@@ -293,16 +293,21 @@ def test_run_refresh_phase_inject_generator_and_status_roundtrip():
     # summary：loop/invalid 跳过 append，只 2 个进池
     # 成本字段（P1.3）：valid=[eos(3),budget_stop(6)] → rollout=9；名义预算=4×6=24；
     # teacher 前向=2×(3+6)=18
-    assert summary == {"n_total": 4, "n_appended": 2, "n_eos": 1,
-                       "n_budget": 1, "n_loop": 1, "n_invalid": 0,
-                       "n_empty": 1, "valid_rate": 0.5,     # 2/4（IMP-1d）
-                       "rollout_tokens": 9, "expected_rollout_tokens": 24,
-                       "budgets_used": 24, "teacher_forward_tokens": 18,
-                       "loop_periods": (2, 3, 4),
-                       "temperature": 0.7,
-                       "repetition_penalty": 1.0,
-                       "loop_min_len": 8,
-                       "source": "student"}
+    # IMP-1d：summary 含运行时 wall_time（非确定）→ 精确键子集断言 + wall_time 非负
+    expected = {"n_total": 4, "n_appended": 2, "n_eos": 1,
+                "n_budget": 1, "n_loop": 1, "n_invalid": 0,
+                "n_empty": 1, "valid_rate": 0.5,     # 2/4（IMP-1d）
+                "generated_tokens": 15, "valid_tokens": 9,   # 3+6+6+0 / 3+6
+                "rollout_tokens": 9, "expected_rollout_tokens": 24,
+                "budgets_used": 24, "teacher_forward_tokens": 18,
+                "loop_periods": (2, 3, 4),
+                "temperature": 0.7,
+                "repetition_penalty": 1.0,
+                "loop_min_len": 8,
+                "source": "student"}
+    for k, v in expected.items():
+        assert summary[k] == v, k
+    assert summary["wall_time"] >= 0       # 生成 wall time 非负
     assert rb.size == 2
     # ring buffer 存的 status 只含 valid 子集（eos/budget_stop）
     assert sorted(rb._status) == ["budget_stop", "eos"]
@@ -383,16 +388,20 @@ def test_run_refresh_phase_all_loop_no_append():
                                 prompts, step=1, version=1, m_selected=n,
                                 max_resp_len=6, top_k=3, device="cpu",
                                 rollout_generator=gen)
-    assert summary == {"n_total": 2, "n_appended": 0, "n_eos": 0,
-                       "n_budget": 0, "n_loop": 2, "n_invalid": 0,
-                       "n_empty": 0, "valid_rate": 0.0,    # 0/2（IMP-1d）
-                       "rollout_tokens": 0, "expected_rollout_tokens": 12,
-                       "budgets_used": 12, "teacher_forward_tokens": 0,
-                       "loop_periods": (2, 3, 4),
-                       "temperature": 0.7,
-                       "repetition_penalty": 1.0,
-                       "loop_min_len": 8,
-                       "source": "student"}
+    expected = {"n_total": 2, "n_appended": 0, "n_eos": 0,
+                "n_budget": 0, "n_loop": 2, "n_invalid": 0,
+                "n_empty": 0, "valid_rate": 0.0,    # 0/2（IMP-1d）
+                "generated_tokens": 12, "valid_tokens": 0,   # 6+6（loop 仍生成 token）/ 0
+                "rollout_tokens": 0, "expected_rollout_tokens": 12,
+                "budgets_used": 12, "teacher_forward_tokens": 0,
+                "loop_periods": (2, 3, 4),
+                "temperature": 0.7,
+                "repetition_penalty": 1.0,
+                "loop_min_len": 8,
+                "source": "student"}
+    for k, v in expected.items():
+        assert summary[k] == v, k
+    assert summary["wall_time"] >= 0
     assert rb.size == 0
 
 
@@ -895,5 +904,9 @@ def test_run_refresh_phase_valid_rate_breakdown():
     assert summary["n_invalid"] == 1 and summary["n_empty"] == 1
     assert summary["n_appended"] == 2                    # valid = eos + budget_stop
     assert summary["valid_rate"] == pytest.approx(0.4)   # 2/5（>=0.50 目标）
+    # IMP-1d：effective rollout throughput
+    assert summary["generated_tokens"] == 19            # 3+6+6+4+0（含 loop/invalid/empty）
+    assert summary["valid_tokens"] == 9                 # 3+6（仅 valid）
+    assert summary["wall_time"] >= 0
     assert rb.size == 2                                  # loop/invalid/empty 不进池
     assert sorted(rb._status) == ["budget_stop", "eos"]

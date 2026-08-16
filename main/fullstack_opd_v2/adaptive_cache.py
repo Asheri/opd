@@ -21,6 +21,8 @@
 """
 from __future__ import annotations
 
+import time
+
 import torch
 
 def assign_budgets(v_values: torch.Tensor,
@@ -132,6 +134,10 @@ def compute_rollout_metrics(summary: dict, budgets=None,
     n_loop = summary.get('n_loop', 0)
     n_invalid = summary.get('n_invalid', 0)
     rollout_tokens = summary.get('rollout_tokens', 0)
+    # IMP-1d：effective rollout throughput（rollout quality 评价用）
+    gen_tok = summary.get('generated_tokens', 0)
+    val_tok = summary.get('valid_tokens', rollout_tokens)   # 兼容旧 summary（回落 rollout_tokens）
+    wall = summary.get('wall_time', 0.0)
 
     def safe_div(num, den):
         return float(num / den) if den else 0.0
@@ -146,6 +152,9 @@ def compute_rollout_metrics(summary: dict, budgets=None,
         # IMP-1d：有效样本率 = valid / generated（主验收指标，目标 >= 0.50）。
         # 与 accuracy_proxy 同值但语义显式（valid=non_empty∧¬loop∧token 有效）。
         'rollout/valid_rate': safe_div(n_appended, n_total),
+        # IMP-1d：raw/valid token per second（wall_time=rollout 生成 wall time）
+        'rollout/raw_tok_per_sec': safe_div(gen_tok, wall),
+        'rollout/valid_tok_per_sec': safe_div(val_tok, wall),
         'rollout/useful_per_token': safe_div(n_appended, rollout_tokens),
     }
 
@@ -581,6 +590,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                             loop_min_len=loop_min_len)
 
     M = cand.size(0)
+    _t_gen = time.perf_counter()      # IMP-1d：rollout 生成 wall time（含全部 _gen 调用）
     if budgets is not None:
         # Stage 3：per-sample budget 分桶。先 enforce（超全局预算降级）。
         if budget_t is not None:
@@ -615,6 +625,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         eos_pos = out["eos_pos"]
         expected = m_selected * max_resp_len
         budgets_used = m_selected * max_resp_len
+    _gen_wall = time.perf_counter() - _t_gen
     # loop/invalid 样本跳过 teacher 前向与 append（需求 4），仍计入 summary
     # 有效样本定义（IMP-1d）：non_empty ∧ ¬loop_detected ∧ token 序列有效。
     #   valid = eos + budget_stop（budget_stop 的 clean trajectory 可保留）；
@@ -627,10 +638,18 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     valid_lens = [lengths[i] for i in valid]
     # P1.3：rollout_tokens=进 refresh 池的有效样本 token 数（非名义预算）。
     actual = int(sum(valid_lens))
+    # IMP-1d：effective rollout throughput——generated_tokens=全部生成（含 loop/invalid/empty），
+    # valid_tokens=有效样本 token（=rollout_tokens），wall_time=生成 wall time。
+    generated_tokens = int(sum(lengths))
+    valid_tokens = actual
+    wall_time = float(_gen_wall)
     if not valid:
         return {"n_total": len(statuses), "n_appended": 0, "n_eos": n_eos,
                 "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
                 "n_empty": n_empty, "valid_rate": 0.0,
+                "generated_tokens": generated_tokens,
+                "valid_tokens": valid_tokens,
+                "wall_time": wall_time,
                 "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
                 "budgets_used": int(budgets_used),
                 "teacher_forward_tokens": 0,
@@ -688,6 +707,9 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
             "n_budget": n_budget, "n_loop": n_loop, "n_invalid": n_invalid,
             "n_empty": n_empty,
             "valid_rate": (len(valid) / len(statuses)) if len(statuses) else 0.0,
+            "generated_tokens": generated_tokens,
+            "valid_tokens": valid_tokens,
+            "wall_time": wall_time,
             "rollout_tokens": actual, "expected_rollout_tokens": int(expected),
             "budgets_used": int(budgets_used),
             "teacher_forward_tokens": 2 * int(sum(valid_lens)),
