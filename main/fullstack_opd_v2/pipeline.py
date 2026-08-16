@@ -667,7 +667,8 @@ class FullStackOPDv2:
                     from .adaptive_cache import (RefreshRingBuffer, DisagreementComputer,
                                                  CacheHealthMonitor, DynamicRatioController,
                                                  RefreshSelector, PromptStateStore,
-                                                 run_refresh_phase, compute_rollout_metrics)
+                                                 run_refresh_phase, compute_rollout_metrics,
+                                                 refresh_cold_start_decision)
                     l2c = l2_cfg.get("cache", {})
                     rb = RefreshRingBuffer(
                         capacity=int(l2c.get("refresh_size", 5000)),
@@ -881,14 +882,35 @@ class FullStackOPDv2:
                             n_refresh = int(round(alpha_act / max(1e-6, 1 - alpha_act) * n_phase))
                             n_refresh = max(0, min(n_refresh, n_phase))  # 不超 base 步数
                             if n_refresh > 0:
-                                scheduler.metrics = []
-                                done = scheduler.train_refresh_phase(
-                                    rb, alpha_act, n_refresh, step_done, _on_step)
-                                metrics.extend(scheduler.metrics)
-                                step_done += done
-                                logger.info(
-                                    f"[L2] α={alpha:.3f}→实际{alpha_act:.3f}，"
-                                    f"refresh 训练 {done} 步（池 {rb.size}）")
+                                # IMP-1d：refresh pool 冷启动保护——池 < min_refresh_pool 时跳过
+                                # refresh 训练（不调 _train_step_refresh）；rollout metrics 照常、
+                                # ring buffer 样本不丢，记录 skip reason 与 pool size。
+                                min_refresh_pool = int(l2c.get("min_refresh_pool", 8))
+                                skip_train, skip_reason = refresh_cold_start_decision(
+                                    rb.size, min_refresh_pool)
+                                guard = {"refresh_train/skipped": skip_train,
+                                         "refresh_train/skip_reason": skip_reason,
+                                         "refresh_pool/size": rb.size}
+                                mr.record(guard)
+                                # 并入本轮 rollout 行（不新增 phase 行，避免 n_steps 统计与
+                                # rollout 行 n_appended 断言被稀释）
+                                for _m in reversed(metrics):
+                                    if isinstance(_m, dict) and _m.get("phase") == "rollout":
+                                        _m.update(guard)
+                                        break
+                                if skip_train:
+                                    logger.info(
+                                        f"[L2] refresh 训练跳过（冷启动：池 {rb.size} < "
+                                        f"min_refresh_pool={min_refresh_pool}）")
+                                else:
+                                    scheduler.metrics = []
+                                    done = scheduler.train_refresh_phase(
+                                        rb, alpha_act, n_refresh, step_done, _on_step)
+                                    metrics.extend(scheduler.metrics)
+                                    step_done += done
+                                    logger.info(
+                                        f"[L2] α={alpha:.3f}→实际{alpha_act:.3f}，"
+                                        f"refresh 训练 {done} 步（池 {rb.size}）")
                 else:
                     metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         finally:

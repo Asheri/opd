@@ -108,6 +108,9 @@ class L2CacheCfg(_Strict):
     value_protect_quantile: float = 0.9   # §2 Q3 价值保护
     refresh_min_interval: int = 50    # §2 Q1 触发约束
     refresh_max_interval: int = 150
+    # IMP-1d：refresh pool 冷启动门槛——池样本数 < 此值时跳过 refresh 训练（不调
+    # _train_step_refresh），rollout metrics 照常、ring buffer 样本不丢，记录 skip reason。
+    min_refresh_pool: int = 8
     delta_slope_eps: float = 0.001
 
 

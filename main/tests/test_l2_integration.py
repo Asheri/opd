@@ -75,7 +75,9 @@ def test_alternating_phase_loop(tmp_path, monkeypatch):
         "stage2.batch_size=4", "l2.m_refresh=4",
         "l2.cache.refresh_size=8", "l2.cache.max_response_length=4",
         # G4：refresh_min_interval 调低，使相位边界 5/10 都触发刷新（验证多次刷新）
-        "l2.cache.refresh_min_interval=3"])
+        "l2.cache.refresh_min_interval=3",
+        # IMP-1d：本测试验证双池闭环（训练必须发生）→ 关冷启动门槛（池小也要训练）
+        "l2.cache.min_refresh_pool=0"])
     opd = FullStackOPDv2(cfg, device="cpu")
     out = opd.run(run_dir=str(tmp_path))
     # G1 闭环：base 12 步 + refresh 补充步（refresh 样本真正进训练），故 ≥ 12
@@ -241,6 +243,8 @@ def test_l2_refresh_fires_without_selective_rollout(tmp_path):
         "l2.cache.refresh_size=8", "l2.cache.max_response_length=4",
         "l2.cache.refresh_min_interval=3",
         "l2.selective_rollout.enabled=false",   # selector=None，均匀随机
+        # IMP-1d：验证双池闭环（训练必须发生）→ 关冷启动门槛
+        "l2.cache.min_refresh_pool=0",
     ])
     out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
     rollout_rows = [m for m in out["metrics"]

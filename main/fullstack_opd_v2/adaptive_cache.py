@@ -491,6 +491,19 @@ class DisagreementComputer:
         return log_dists.gather(2, responses.unsqueeze(-1)).squeeze(-1)
 
 
+def refresh_cold_start_decision(pool_size: int, min_refresh_pool: int) -> tuple[bool, str]:
+    """IMP-1d：refresh pool 冷启动保护决策（纯函数，可单测）。
+
+    pool_size < min_refresh_pool → (True, "cold_start_pool_too_small")：跳过 refresh 训练
+    （不调 _train_step_refresh），避免在池样本不足时用噪声/极少样本训练污染双池 feeder；
+    pool_size == min_refresh_pool（达标）或更大 → (False, "")：正常训练。
+    返回 (should_skip, skip_reason)。
+    """
+    if int(pool_size) < int(min_refresh_pool):
+        return True, "cold_start_pool_too_small"
+    return False, ""
+
+
 def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       selector, ring_buffer, disag, prompts, step, version,
                       m_selected, max_resp_len, top_k, device,

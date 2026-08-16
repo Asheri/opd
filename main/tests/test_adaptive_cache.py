@@ -179,3 +179,15 @@ def test_g7_utility_math_and_value_protection():
     _append(rb2, 10, 1.0, 1)
     assert rb2._protected[1] is True
     assert rb2._protected[0] is False
+# --------------------------- IMP-1d：Refresh Pool 冷启动保护 ---------------------------
+from fullstack_opd_v2.adaptive_cache import refresh_cold_start_decision
+
+
+def test_refresh_cold_start_decision_sizes():
+    """IMP-1d：pool size 0/1/7 < 8 → 跳过（冷启动）；8（=门槛）与 >8 → 不跳过。"""
+    assert refresh_cold_start_decision(0, 8) == (True, "cold_start_pool_too_small")
+    assert refresh_cold_start_decision(1, 8) == (True, "cold_start_pool_too_small")
+    assert refresh_cold_start_decision(7, 8) == (True, "cold_start_pool_too_small")
+    assert refresh_cold_start_decision(8, 8) == (False, "")      # 达标即训练
+    assert refresh_cold_start_decision(9, 8) == (False, "")      # > 门槛训练
+    assert refresh_cold_start_decision(0, 0) == (False, "")      # min=0 关门槛（opt-out）
