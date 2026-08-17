@@ -641,6 +641,18 @@ class FullStackOPDv2:
                     # gpu_memory_utilization=0.9 独占）。tp_size=1 单卡 rollout；权重由
                     # 每次 rollout 相位前 update_weights 同步（on-policy）。
                     rollout_device = s2cfg.get("rollout_device", "cuda:1")
+                    # P2（OOM 修复）：vLLM 按【总显存】比例预留（gpu_mem×total），
+                    # 无视训练进程已占——建引擎前查剩余显存，不够立即 fail-fast
+                    # （把 OOM 从训练中提前到启动，并打印双方占用）。
+                    if str(rollout_device).startswith("cuda") and torch.cuda.is_available():
+                        _free_gb = torch.cuda.mem_get_info(rollout_device)[0] / 2**30
+                        _eng_gb = float(s2cfg.get("rollout_gpu_mem", 0.9)) * 96.0
+                        _min_free = float(s2cfg.get("rollout_min_free_gb", 25.0))
+                        if _free_gb < _eng_gb + _min_free:
+                            raise RuntimeError(
+                                f"[L2] 剩余显存 {_free_gb:.1f}GB < vLLM 引擎预留 "
+                                f"{_eng_gb:.1f}GB + 训练预留 {_min_free}GB；请调低 "
+                                "stage2.rollout_gpu_mem 或减少同卡并发（避免训练中 OOM）。")
                     rollout_engine = VLLMRolloutEngine(
                         # rollout 模型默认回落 student_path（on-policy 同构）；
                         # rollout_model 显式覆盖仅作诊断用。
@@ -653,6 +665,7 @@ class FullStackOPDv2:
                         # 训练+vLLM 共卡时调低 rollout_gpu_mem（如 0.5）防 OOM。
                         gpu_memory_utilization=float(s2cfg.get("rollout_gpu_mem", 0.9)),
                         max_model_len=int(s2cfg.get("rollout_max_model_len", 2048)),
+                        max_num_seqs=int(s2cfg.get("rollout_max_num_seqs", 256)),
                         vocab_size=_engine_vocab,
                         full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
                         device=rollout_device)

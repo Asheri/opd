@@ -238,9 +238,10 @@ class HFCausalLM:
         return {"responses": responses, "statuses": statuses, "lengths": lengths,
                 "eos_pos": eos_pos, "looped": looped}
 
-    def response_dists(self, prompts: torch.Tensor, responses: torch.Tensor):
+    def response_dists(self, prompts: torch.Tensor, responses: torch.Tensor,
+                       dtype: torch.dtype | None = None):
         from .model import response_dists
-        return response_dists(self, prompts, responses)
+        return response_dists(self, prompts, responses, dtype=dtype)
 
     # ---- 训练/权重接口：委托给 HF 模块 ----
     def train(self, mode: bool = True):

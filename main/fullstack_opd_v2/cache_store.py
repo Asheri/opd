@@ -276,6 +276,18 @@ class DiskTeacherCache:
         return expand_student_topk_delta(ids_bs, delta_bs, student_topk_ids,
                                          self.vocab, vocab_out, fill, mask)
 
+    def delta_at_student_topk(self, idxs, student_topk_ids, device=None):
+        """P0：稀疏 Δ_T 展开到 s_cur top-K 支撑（(B,T,Ks)），不建稠密 (B,T,V)。
+
+        与 delta_for_student_topk 同 searchsorted 语义；磁盘 batch-local 拉取。
+        """
+        ids_bs, delta_bs = self._fetch(idxs)
+        if student_topk_ids.device != ids_bs.device:
+            student_topk_ids = student_topk_ids.to(ids_bs.device)
+        from .cache import expand_student_topk_delta_sparse
+        out = expand_student_topk_delta_sparse(ids_bs, delta_bs, student_topk_ids)
+        return out if device is None else out.to(device)
+
     def get_delta(self, idxs):
         if self.mode != "dense":
             raise RuntimeError("稀疏缓存请用 delta_for_student_topk()（磁盘存储仅 top-K）")

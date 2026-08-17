@@ -52,26 +52,33 @@ class CausalToyLM(nn.Module):
         return self.head(h)
 
     def response_dists(self, prompts: torch.Tensor,
-                       responses: torch.Tensor) -> torch.Tensor:
+                       responses: torch.Tensor,
+                       dtype: torch.dtype | None = None) -> torch.Tensor:
         """(B,P),(B,T) -> (B,T,V) log-softmax（同模块级 response_dists 语义）。
 
         抽出为方法，使 scheduler._train_step 可统一用 self.student.response_dists(...)
         调用 toy 与 Megatron 两种 learner（Megatron 版在内部 all-gather 词表分片）。
+        dtype：P5 透传，前向内部立即转 bf16（避免 fp32 大张量离开函数）。
         """
-        return response_dists(self, prompts, responses)
+        return response_dists(self, prompts, responses, dtype=dtype)
 
 
 def response_dists(model: CausalToyLM, prompts: torch.Tensor,
-                   responses: torch.Tensor) -> torch.Tensor:
+                   responses: torch.Tensor,
+                   dtype: torch.dtype | None = None) -> torch.Tensor:
     """(B,P),(B,T) -> (B,T,V) log-softmax。
 
     第 t 行 = 预测 response 第 t 个 token 的 next-token 分布（上下文 = prompt + a_{<t}），
     即 OPD 里的 π(·|s_t)。一次批量前向完成。
+    dtype（P5）：HF lm_head 在 autocast 下仍 fp32，(B,T,V) 大张量 fp32→bf16 转换期
+    双份共存推高峰值；传 dtype 时前向内立即转 bf16 再返回（fp32 不离开本函数）。
     """
     P = prompts.size(1)
     T = responses.size(1)
     full = torch.cat([prompts, responses], dim=1)          # (B, P+T)
     logp = F.log_softmax(model(full), dim=-1)              # (B, P+T, V)
+    if dtype is not None and logp.dtype != dtype:
+        logp = logp.to(dtype)
     return logp[:, P - 1:P - 1 + T]                        # (B, T, V)
 
 

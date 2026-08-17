@@ -64,6 +64,25 @@ def expand_student_topk_delta(ids_sorted: torch.Tensor,
     return out
 
 
+def expand_student_topk_delta_sparse(
+        ids_sorted: torch.Tensor,
+        delta_k_sorted: torch.Tensor,
+        student_topk_ids: torch.Tensor,
+        fill: float = 0.0) -> torch.Tensor:
+    """P0：把 teacher top-K 展开成【稀疏 (B,T,Ks)】到 s_cur 支撑，不建稠密 (B,T,V)。
+
+    与 expand_student_topk_delta 同 searchsorted 语义，只是不 scatter 回词表维度：
+    - student top-K token 在 teacher top-K 命中 → 取 teacher delta；
+    - 未命中（含跨词表 student 超出 teacher 词表）→ fill（默认 0）。
+    供 TensorTeacherCache / DiskTeacherCache 的 delta_at_student_topk 共用。
+    """
+    B, T, Kt = ids_sorted.shape
+    pos = torch.searchsorted(ids_sorted, student_topk_ids.contiguous()).clamp(max=Kt - 1)
+    found = ids_sorted.gather(-1, pos) == student_topk_ids
+    return delta_k_sorted.gather(-1, pos).where(
+        found, torch.full_like(delta_k_sorted.gather(-1, pos), fill))
+
+
 class TensorTeacherCache:
     def __init__(self, enforce_consistency: bool = True, top_k: int = 0):
         """
@@ -185,6 +204,19 @@ class TensorTeacherCache:
         teacher_delta_sorted = self.delta_k_sorted[idxs]       # (B, T, Kt)
         return expand_student_topk_delta(teacher_ids_sorted, teacher_delta_sorted,
                                          student_topk_ids, self.vocab, vocab_out, fill)
+
+    def delta_at_student_topk(self, idxs: torch.Tensor,
+                              student_topk_ids: torch.Tensor,
+                              device=None) -> torch.Tensor:
+        """P0：稀疏 Δ_T 展开到 s_cur top-K 支撑（返回 (B,T,Ks)，不建稠密 (B,T,V)）。
+
+        与 delta_for_student_topk 同 searchsorted 匹配语义（含跨词表未命中=0），
+        只是结果留在支撑维度，供 base 池稀疏 PG（scheduler._train_step P0）。
+        """
+        ids_s = self.ids_sorted[idxs]
+        delta_s = self.delta_k_sorted[idxs]
+        out = expand_student_topk_delta_sparse(ids_s, delta_s, student_topk_ids)
+        return out if device is None else out.to(device)
 
     # --------------------------- 设备迁移 ---------------------------
     def to(self, device) -> "TensorTeacherCache":

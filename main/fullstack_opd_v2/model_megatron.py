@@ -212,7 +212,8 @@ class MegatronCausalToyLM(nn.Module):
         return logits
 
     def response_dists(self, prompts: torch.Tensor,
-                       responses: torch.Tensor) -> torch.Tensor:
+                       responses: torch.Tensor,
+                       dtype: torch.dtype | None = None) -> torch.Tensor:
         """与 CausalToyLM.response_dists 同语义：(B,P),(B,T) -> (B,T,V) log-softmax。
 
         forward 产出词表分片的 logits，这里 all-gather 回完整词表再 log_softmax，
@@ -224,4 +225,6 @@ class MegatronCausalToyLM(nn.Module):
         logits = self.forward(full)                            # (B, P+T, V/tp)
         logits_full = gather_from_tensor_model_parallel_region(logits)  # (B, P+T, V)
         logp = F.log_softmax(logits_full, dim=-1)
+        if dtype is not None and logp.dtype != dtype:          # P5：前向内转 bf16
+            logp = logp.to(dtype)
         return logp[:, P - 1:P - 1 + T]                        # (B, T, V)

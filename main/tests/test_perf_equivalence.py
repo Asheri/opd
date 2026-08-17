@@ -173,10 +173,13 @@ def test_response_dists_topk_shape_and_keys():
     assert logps.device.type == device
 
     # 2) 索引与 logprob 与手工 prompt_logprobs 输入逐位一致
+    #    ⚠️ 实现按 logprob 降序排序（152142e：vLLM dict 迭代顺序不保证有序，必须显式
+    #    排序否则 K 截断/searchsorted 支撑错乱）——测试按同一契约排序后比对。
     for b, plp in ((0, plp0), (1, plp1)):
         for t in range(T):
             d = plp[P + t]
             items = list(d.items())
+            items.sort(key=lambda kv: kv[1].logprob, reverse=True)
             for j, (tid, lp) in enumerate(items):
                 assert ids[b, t, j].item() == tid, (b, t, j)
                 # float32 落盘有舍入误差，比较用容差
@@ -223,9 +226,10 @@ def test_response_dists_topk_padding_is_log_zero():
     # 每位置只填 3 项，剩余 k-3 槽位 logp 必须 = _LOG_ZERO（非 0.0）
     assert (lps[..., 3:] == _LOG_ZERO).all(), "padding logp 应为 _LOG_ZERO"
     assert (lps[..., :3] != _LOG_ZERO).all(), "真实项的 logp 不应被填充覆盖"
+    # 实现按 logprob 降序排序（152142e）：真实项顺序 = i=2,1,0（t+0.2,t+0.1,t+0.0）
     for t in range(T):
         for j in range(3):
-            assert abs(lps[0, t, j].item() - (float(t) + j * 0.1)) < 1e-6
+            assert abs(lps[0, t, j].item() - (float(t) + (2 - j) * 0.1)) < 1e-6
 
 
 def test_searchsorted_match_equals_full_compare():

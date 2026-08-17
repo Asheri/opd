@@ -268,7 +268,7 @@ class AsyncBatchedScheduler:
                 with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
                                         enabled=self.amp):
                     s_old = response_dists(self.worker, self.prompts[idxs_dev],
-                                           self.responses[idxs_dev])  # (B,T,V)
+                                           self.responses[idxs_dev], dtype=self.dtype)  # (B,T,V)
                 if self.dtype is not None and s_old.dtype != self.dtype:
                     s_old = s_old.to(self.dtype)
             try:
@@ -360,37 +360,52 @@ class AsyncBatchedScheduler:
             # 与 s_cur 同设备同精度，保证 ratio 一致（M2：分布式路径 s_old 由 worker 进程
             # 回传在 CPU，此前只转 dtype 不转 device → s_cur-s_old 设备不匹配崩溃）。
             s_old = s_old.to(self.device, dtype=s_cur.dtype)
-            # P2-2：缓存 p_old 供 pg_loss 与 adv 监控复用，省掉 expected_reward 内部那次 s_old.exp()；全 1 mask 走 None 快路径
-            # ⚠️ mask 快路径前提：调度器无 padding（responses 等长），恒全 1。
-            #    若将来引入真实 padding mask 必须改回传 mask。
-            p_old = s_old.exp()
+            # P0：稀疏 base（默认开）不物化稠密 p_old=s_old.exp()（T=4096 下 ~5GB 浪费），
+            # 改在支撑上取 s_old_at.exp()。仅稠密兜底路径需要 p_old。
+            _sparse_base = bool(self.use_topk and self.cfg.get("base_sparse_pg", True))
+            if not _sparse_base:
+                # P2-2：缓存 p_old 供 pg_loss 与 adv 监控复用；全 1 mask 走 None 快路径
+                # ⚠️ mask 快路径前提：调度器无 padding（responses 等长），恒全 1。
+                p_old = s_old.exp()
 
             # ★ Direct-OPD 迁移对象：按 student 自身 top-K 支撑取 Δ_T（L4 稀疏缓存）
+            # P0（OOM 根治，base_sparse_pg 默认开）：base 池 PG 只在 student top-K 支撑
+            # 上计算——与 refresh 路径（_train_step_refresh）同构，中间量从 (B,T,V=151936)
+            # 缩到 (B,T,K=256) ≈ 缩小 594 倍，T=4096 的 base 步峰值 ~80GB → 几 GB。
+            # 数值等价：稠密版 delta 仅支撑非零且在【同一支撑】上重归一，稀疏版直接
+            # 把支撑值喂 pg_loss（delta_at / s_old_at / values），分母一致。
             if self.use_topk:
-                s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
-                # 方案 A（对齐论文）：展开维度按 student 词表（7B=152064 > teacher 151936），
-                # student 超出 teacher 词表的 top-K id 在 searchsorted 未命中 → Δ=0。
-                delta_d = self.cache.delta_for_student_topk(
-                    idxs_dev, s_topk.indices,
-                    vocab_out=getattr(self.student, "vocab", None))  # (B,T,V) 支撑外=0
-                # P-显存修复：磁盘缓存 delta 为 fp32，与 bf16 的 s_cur 运算会拉回 fp32
-                # （torch 类型提升），pg_loss 中间又堆 fp32 大张量；Δ_T 无梯度其值已
-                # delta_clip 到 ±2，bf16 足够。转同 dtype 让 pg_loss 全 bf16（砍半）。
-                if self.dtype is not None and delta_d.dtype != self.dtype:
-                    delta_d = delta_d.to(self.dtype)
-                # P2-G（二次审查）：renormalize 时把【完整 student top-K】掩码显式传给
-                # pg_loss，与 low_var_kl_support 的支撑（也是完整 student top-K）一致——
-                # 否则 pg 用 delta!=0（student∩teacher 交集）归一、KL 用完整 top-K 归一，
-                # 分母不同 → λ_kl 权衡漂移。未覆盖 token 的 Δ=0 贡献 0、但计入分母。
-                pg_support = None
-                if self.renormalize_topk:
-                    pg_support = torch.zeros_like(delta_d, dtype=torch.bool)
-                    pg_support.scatter_(-1, s_topk.indices, True)
-                loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps, p_old=p_old,
-                                  log_ratio_max=LOG_RATIO_MAX,
-                                  log_ratio_clip=BASE_LOG_RATIO_CLIP,
-                                  renormalize_support=self.renormalize_topk,
-                                  support=pg_support, delta_clip=self.delta_clip)
+                s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)   # (B,T,K)
+                if _sparse_base:
+                    delta_at = self.cache.delta_at_student_topk(
+                        idxs_dev, s_topk.indices, self.device)           # (B,T,K)
+                    if self.dtype is not None and delta_at.dtype != self.dtype:
+                        delta_at = delta_at.to(self.dtype)
+                    # s_old 稠密 → 在 s_cur top-K 支撑上 gather（精确，无需 tail 语义）
+                    s_old_at = s_old.gather(-1, s_topk.indices)          # (B,T,K)
+                    sup = torch.ones_like(s_topk.values, dtype=torch.bool)
+                    loss_pg = pg_loss(s_topk.values, s_old_at, delta_at, None,
+                                      self.clip_eps, p_old=s_old_at.exp(),
+                                      log_ratio_max=LOG_RATIO_MAX,
+                                      log_ratio_clip=BASE_LOG_RATIO_CLIP,
+                                      renormalize_support=self.renormalize_topk,
+                                      support=sup, delta_clip=self.delta_clip)
+                else:
+                    # 旧稠密路径（兜底，base_sparse_pg=false 回退）
+                    delta_d = self.cache.delta_for_student_topk(
+                        idxs_dev, s_topk.indices,
+                        vocab_out=getattr(self.student, "vocab", None))  # (B,T,V) 支撑外=0
+                    if self.dtype is not None and delta_d.dtype != self.dtype:
+                        delta_d = delta_d.to(self.dtype)
+                    pg_support = None
+                    if self.renormalize_topk:
+                        pg_support = torch.zeros_like(delta_d, dtype=torch.bool)
+                        pg_support.scatter_(-1, s_topk.indices, True)
+                    loss_pg = pg_loss(s_cur, s_old, delta_d, None, self.clip_eps,
+                                      p_old=p_old, log_ratio_max=LOG_RATIO_MAX,
+                                      log_ratio_clip=BASE_LOG_RATIO_CLIP,
+                                      renormalize_support=self.renormalize_topk,
+                                      support=pg_support, delta_clip=self.delta_clip)
                 # 稀疏 KL 锚点
                 if self.kl_mode == "topk":
                     ref_at = self._ref_logp_at_student_topk(
@@ -425,8 +440,14 @@ class AsyncBatchedScheduler:
 
         version = self._publish()
         with torch.no_grad():
-            reward = expected_reward(s_cur.detach(), delta_d, None, p_dists=s_cur.detach().exp()).mean()
-            adv = expected_reward(s_old, delta_d, None, p_dists=p_old.detach()).mean()
+            if _sparse_base:
+                p_cur = s_topk.values.exp()                        # (B,T,K) 支撑上 E
+                reward = (p_cur * delta_at).sum(-1).mean()
+                adv = (s_old_at.exp() * delta_at).sum(-1).mean()
+            else:
+                reward = expected_reward(s_cur.detach(), delta_d, None,
+                                         p_dists=s_cur.detach().exp()).mean()
+                adv = expected_reward(s_old, delta_d, None, p_dists=p_old.detach()).mean()
 
         # C3：热路径 5 个标量收集成一个大张量一次 device→cpu，避免逐 .item() 各触发
         # 一次同步。autocast 下 loss 族可能为 bf16/fp16，adv/reward 在 no_grad 外为
@@ -870,7 +891,7 @@ class _RayRolloutWorkerImpl:
             else:
                 self.worker.eval()
                 s_old = response_dists(self.worker, self.prompts[idxs_dev],
-                                       self.responses[idxs_dev])              # (B,T,V)
+                                       self.responses[idxs_dev], dtype=self.dtype)              # (B,T,V)
         # 3) 稀疏：只透传 idxs；Δ_T 在 learner 现场按 student 支撑展开
         return idxs.cpu(), s_old.cpu(), version
 
