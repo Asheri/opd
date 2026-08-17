@@ -31,6 +31,8 @@ ratio(v) = π_cur(v)/π_old(v)，需要完整的 π_old 分布。
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:                                                    # pragma: no cover
