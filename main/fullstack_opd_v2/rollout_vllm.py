@@ -96,6 +96,35 @@ class VLLMRolloutEngine:
                 raise RuntimeError(
                     "无法从 vLLM engine 推断词表大小，请显式传入 vocab_size=。") from e
 
+    # --------------------------- generate 版本兼容 ---------------------------
+    def _generate(self, seqs, sampling):
+        """vLLM 版本兼容的批量生成入口。
+
+        - vLLM 0.6~0.9x : LLM.generate(prompt_token_ids=seqs, ...)
+        - vLLM >= 0.1x  : 移除该 kwarg，改传 TokensPrompt dict
+          (prompts=[{"prompt_token_ids": s}, ...])。
+        首次调用探测一次后缓存风格，后续零开销。
+        """
+        style = getattr(self, "_gen_style", None)
+        if style == "kwarg":
+            return self.llm.generate(prompt_token_ids=seqs,
+                                     sampling_params=sampling)
+        if style == "tokens_prompt":
+            return self.llm.generate(
+                prompts=[{"prompt_token_ids": list(s_)} for s_ in seqs],
+                sampling_params=sampling)
+        try:
+            outs = self.llm.generate(prompt_token_ids=seqs,
+                                     sampling_params=sampling)
+            self._gen_style = "kwarg"
+            return outs
+        except TypeError:
+            outs = self.llm.generate(
+                prompts=[{"prompt_token_ids": list(s_)} for s_ in seqs],
+                sampling_params=sampling)
+            self._gen_style = "tokens_prompt"
+            return outs
+
     # --------------------------- 权重同步 ---------------------------
     def update_weights(self, state_dict: dict) -> bool:
         """把 learner 的新权重推入 vLLM（取代线程版 load_state_dict）。
@@ -192,7 +221,7 @@ class VLLMRolloutEngine:
         k = max(1, k)
         sampling = SamplingParams(temperature=0.0, prompt_logprobs=k, logprobs=0)
         seqs = self._prompt_seq(prompts, responses)
-        outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
+        outs = self._generate(seqs, sampling)
 
         # M3：logp 填充用 _LOG_ZERO（≈log 0）而非 0.0——0.0 是合法高概率，稀疏支撑匹配
         # 会把未填充槽位当成「token id=0 处 logp=0.0」从而污染 searchsorted 匹配 / 伪高置信。
@@ -230,7 +259,7 @@ class VLLMRolloutEngine:
         k = V if V <= self.full_cap else self.full_cap
         sampling = SamplingParams(temperature=0.0, prompt_logprobs=k, logprobs=0)
         seqs = self._prompt_seq(prompts, responses)
-        outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
+        outs = self._generate(seqs, sampling)
 
         out = torch.full((B * T * V,), _LOG_ZERO, dtype=torch.float32)
         pos_l: list[int] = []
@@ -264,7 +293,7 @@ class VLLMRolloutEngine:
         T = responses.size(1)
         sampling = SamplingParams(temperature=0.0, prompt_logprobs=1, logprobs=0)
         seqs = [torch.cat([prompts[b], responses[b]]).tolist() for b in range(B)]
-        outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
+        outs = self._generate(seqs, sampling)
         out = torch.zeros((B, T), dtype=torch.float32)
         for b, o in enumerate(outs):
             plp = o.prompt_logprobs
@@ -290,7 +319,7 @@ class VLLMRolloutEngine:
         sampling = SamplingParams(
             temperature=max(temperature, 1e-6), top_p=0.9, max_tokens=max_new)
         seqs = [prompts[b].tolist() for b in range(B)]
-        outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
+        outs = self._generate(seqs, sampling)
         res = torch.zeros((B, max_new), dtype=torch.long)
         for b, o in enumerate(outs):
             toks = o.outputs[0].token_ids[:max_new]
@@ -318,7 +347,7 @@ class VLLMRolloutEngine:
             eos_token_id=eos_token_id,
             repetition_penalty=max(float(repetition_penalty), 1.0))
         seqs = [prompts[b].tolist() for b in range(B)]
-        outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
+        outs = self._generate(seqs, sampling)
         parsed = parse_vllm_outputs(outs, max_new, eos_token_id,
                                     loop_detection, loop_periods, loop_min_len)
         # 组装 responses：(B,max_new) 按 lengths 写入、pad 填充
