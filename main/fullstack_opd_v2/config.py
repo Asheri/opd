@@ -94,6 +94,9 @@ class Stage2Cfg(_Strict):
     base_sparse_pg: bool = True
     staleness_queue_min: int = 16
     rollout_stall_timeout: float = 900.0
+    # IMP-2/P1：vLLM>=0.16 权重同步模式——"auto"（NCCL WeightTransferEngine，on-policy）
+    # / "off"（逃生舱：警告一次并回落初始权重）。旧版 vLLM 不受影响。
+    rollout_weight_sync: str = "auto"
     # ---- 顶层部署键下渗槽位（A5 解法 + T2 死槽位清理）----
     # load_config 在下渗后才校验，这些键须在 stage schema 有合法位置，否则
     # extra="forbid" 会把下渗结果当未知键拒掉。只保留 stage2 真正消费的键

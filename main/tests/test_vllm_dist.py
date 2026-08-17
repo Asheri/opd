@@ -1,3 +1,22 @@
+import torch
+
+
+def test_build_nccl_update_info():
+    """NCCL update_info 纯函数：names/dtype/shapes 与 state_dict 一致、is_checkpoint_format=True。"""
+    from fullstack_opd_v2.rollout_vllm import _build_nccl_update_info
+    sd = {
+        "model.embed_tokens.weight": torch.zeros(16, 8, dtype=torch.bfloat16),
+        "model.layers.0.self_attn.q_proj.weight": torch.ones(4, 8, dtype=torch.float32),
+    }
+    info = _build_nccl_update_info(sd)
+    assert info["backend"] == "nccl"
+    assert info["names"] == list(sd.keys())
+    assert info["dtype_names"] == ["bfloat16", "float32"]
+    assert info["shapes"] == [[16, 8], [4, 8]]
+    assert info["is_checkpoint_format"] is True
+    assert info["packed"] is False
+
+
 """IMP-2/P0：run_refresh_phase 分布引擎 vLLM 接入的纯函数单测。
 
 覆盖 _gather_support（ref top-K 在 rl 支撑的 logp）、_dist_topk_cached（引擎/HF 回落）、

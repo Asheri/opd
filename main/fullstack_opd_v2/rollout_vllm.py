@@ -86,11 +86,13 @@ class VLLMRolloutEngine:
     def __init__(self, model, *, tp_size: int = 1, dtype: str = "auto",
                  gpu_memory_utilization: float = 0.9, max_model_len: int = 2048,
                  vocab_size: int | None = None, full_logprobs_cap: int = 4096,
-                 device: str = "cuda:0", **engine_kwargs):
+                 device: str = "cuda:0", weight_sync_mode: str = "auto",
+                 **engine_kwargs):
         if not _VLLM_AVAILABLE:
             raise RuntimeError(
                 "vLLM 未安装（统一 GPU 环境应含 vllm）。L3 rollout 需要 vLLM 引擎。")
         self.tp_size = int(tp_size)
+        self._wt_sync_mode = weight_sync_mode  # auto=0.16 NCCL 同步；off=逃生舱
         self.dtype = dtype
         self.device = device
         self.full_cap = int(full_logprobs_cap)
@@ -131,6 +133,7 @@ class VLLMRolloutEngine:
     # --------------------------- 清理 ---------------------------
     def shutdown(self) -> None:
         """关闭 vLLM 引擎，避免 EngineCore 子进程残留（实测 ~40GB/卡）。
+        同时销毁 trainer 侧 NCCL weight-transfer 组。
 
         vLLM V1 的 EngineCore 是独立进程；主进程 kill 不会带走它。
         多版本适配：先试 LLM.shutdown()（>=0.16），再尝试
@@ -155,6 +158,14 @@ class VLLMRolloutEngine:
         except Exception as e:     # noqa: BLE001
             import logging
             logging.getLogger(__name__).warning(f"vLLM shutdown 第二路失败：{e}")
+        # 销毁 trainer 侧 NCCL weight-transfer 组
+        g = getattr(self, "_wt_group", None)
+        if g is not None:
+            try:
+                del g
+            except Exception:          # noqa: BLE001
+                pass
+            self._wt_group = None
 
     # --------------------------- generate 版本兼容 ---------------------------
     def _generate(self, seqs, sampling):
@@ -208,14 +219,16 @@ class VLLMRolloutEngine:
                 _params = []
             if _params and _params[0].name == "request":
                 # vLLM >= 0.16：request-style WeightTransferEngine API。
-                if not getattr(self, "_wt_warned", False):
-                    self._wt_warned = True
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "vLLM>=0.16 权重同步需 NCCL WeightTransferEngine"
-                        "（init+update 协议 + HF→vLLM 合并层名称映射），尚未接入；"
-                        "rollout 将用引擎现有权重（初始策略）。正式训练前必须接入。")
-                return False
+                # 逃生舱：rollout_weight_sync=off 时回落旧行为（warn 一次 + 返回 False）。
+                if str(getattr(self, "_wt_sync_mode", "auto")).lower() == "off":
+                    if not getattr(self, "_wt_warned", False):
+                        self._wt_warned = True
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "vLLM>=0.16 权重同步被 rollout_weight_sync=off 关闭；"
+                            "rollout 将用引擎现有权重（初始策略）。正式训练请开启 NCCL 同步。")
+                    return False
+                return self._weight_transfer_update_16(state_dict)
             try:
                 self.llm.update_weights(state_dict)
                 return True
@@ -231,6 +244,69 @@ class VLLMRolloutEngine:
             raise RuntimeError(
                 "vLLM 权重同步失败：请按你的 vLLM 版本调整 update_weights "
                 f"（>=0.6 用 LLM.update_weights）。底层错误：{e}")
+
+    # --------------------------- vLLM>=0.16 NCCL 权重同步 ---------------------------
+    def _weight_transfer_init_16(self) -> None:
+        """懒初始化 NCCL weight-transfer 组（trainer=rank0，worker 从 rank_offset 起）。
+
+        vLLM 0.16 的 WeightTransferEngine：trainer 建 NCCL 组（master_addr/port 共享），
+        worker 侧 init_weight_transfer_engine 加入。world_size = 1(trainer) + tp_size。
+        """
+        if getattr(self, "_wt_group", None) is not None:
+            return
+        try:
+            from vllm.distributed.weight_transfer.nccl_engine import (
+                NCCLWeightTransferEngine)
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(f"vLLM NCCL WeightTransferEngine 不可用：{e}")
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self._wt_init_info = {
+            "master_address": "127.0.0.1",
+            "master_port": int(port),
+            "rank_offset": 1,                     # trainer=0，worker 从 1 起
+            "world_size": 1 + int(self.tp_size),
+        }
+        # trainer 侧 NCCL 组（rank 0，用当前 CUDA 设备）
+        self._wt_group = NCCLWeightTransferEngine.trainer_init(self._wt_init_info)
+        # worker 侧加入（EngineCore 上建 group）——在 trainer 组就绪后调用，避免握手错位
+        self.llm.init_weight_transfer_engine({"init_info": self._wt_init_info})
+
+    def _weight_transfer_update_16(self, state_dict: dict) -> bool:
+        """0.16 NCCL 广播：update_info + 后台线程发权重。
+
+        worker 端 update_weights → receive_weights 阻塞等 NCCL 广播；trainer 侧
+        必须【并发】广播（同步 update_weights 会等 worker 返回，而 worker 在等广播）。
+        故：后台线程 trainer_send_weights（顺序=state_dict.items()，与 update_info.names
+        同序），主线程同步调用 llm.update_weights(update_info)。is_checkpoint_format=True
+        → worker 用 model.load_weights（自动处理 HF→vLLM 合并层 qkv/gate_up 映射）。
+        """
+        import threading
+        self._weight_transfer_init_16()
+        update_info = _build_nccl_update_info(state_dict)
+        from vllm.distributed.weight_transfer.nccl_engine import (
+            NCCLWeightTransferEngine)
+        err: list[Exception] = []
+
+        def _send():
+            try:
+                NCCLWeightTransferEngine.trainer_send_weights(
+                    iter(state_dict.items()), self._wt_group,
+                    stream=torch.cuda.current_stream())
+            except Exception as e:  # noqa: BLE001 —— 广播失败记入并让主线程抛
+                err.append(e)
+
+        t = threading.Thread(target=_send, daemon=True)
+        t.start()
+        try:
+            self.llm.update_weights({"update_info": update_info})
+        finally:
+            t.join(timeout=900)
+        if err:
+            raise RuntimeError(f"vLLM NCCL 权重广播失败：{err[0]}")
+        return True
 
     def update_weights_from_flat(self, tensors: list) -> bool:
         """按引擎参数顺序用拉取的扁平张量重建 state_dict 并推入 vLLM。
@@ -448,6 +524,22 @@ class VLLMRolloutEngine:
                 res[b, len(toks)] = int(eos_token_id if eos_token_id is not None else pad_id)
         parsed["responses"] = res.to(self.device)
         return parsed
+
+
+def _build_nccl_update_info(state_dict: dict) -> dict:
+    """从 HF state_dict 构建 vLLM>=0.16 NCCL update_info（纯函数，CPU 可单测）。
+
+    names/dtype_names/shapes 与 trainer_send_weights 的迭代顺序一致（state_dict.items()）。
+    is_checkpoint_format=True → worker 用 model.load_weights（HF→vLLM 合并层映射自动）。
+    """
+    return {
+        "backend": "nccl",
+        "names": list(state_dict.keys()),
+        "dtype_names": [str(t.dtype).split(".")[-1] for t in state_dict.values()],
+        "shapes": [list(t.shape) for t in state_dict.values()],
+        "packed": False,
+        "is_checkpoint_format": True,
+    }
 
 
 def parse_vllm_outputs(outs, max_new: int, eos_token_id=None,

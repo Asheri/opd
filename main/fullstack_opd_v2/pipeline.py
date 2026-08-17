@@ -668,6 +668,7 @@ class FullStackOPDv2:
                         max_num_seqs=int(s2cfg.get("rollout_max_num_seqs", 256)),
                         vocab_size=_engine_vocab,
                         full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
+                        weight_sync_mode=s2cfg.get("rollout_weight_sync", "auto"),
                         device=rollout_device)
                     # IMP-2/P0：rollout 相位 4 个分布前向（s_old/rl/ref/ref_anchor）切 vLLM
                     # （workflow-runner 计划）。可配置 l2.rollout.dist_engines（默认 false）；
@@ -694,6 +695,7 @@ class FullStackOPDv2:
                                     vocab_size=_engine_vocab,
                                     full_logprobs_cap=int(
                                         s2cfg.get("rollout_logprobs_cap", 4096)),
+                                    weight_sync_mode=s2cfg.get("rollout_weight_sync", "auto"),
                                     device=rollout_device)
                 scheduler = AsyncBatchedScheduler(
                     student, cache, fat_prompts, fat_responses,
