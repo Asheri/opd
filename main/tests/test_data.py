@@ -134,6 +134,49 @@ def test_jsonl_loader_apply_chat_template(tmp_path, monkeypatch):
     assert prompts[0].tolist() == [1, 2, 3, 4, 5, 6, 7, 8]  # 前 8 个模板字符 id
 
 
+def test_jsonl_loader_raw_prompt_texts(tmp_path, monkeypatch):
+    """C3：JsonLinesDataLoader 暴露与 prompts 行对齐的原始 prompt 文本（未套模板）。"""
+    import json
+    _mock_tokenizer(monkeypatch)
+    cfg, path = _jsonl_cfg(tmp_path)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"prompt": "abc", "response": "def"}) + "\n")
+        f.write(json.dumps({"prompt": "xyz", "response": "uvw"}) + "\n")
+    dl = JsonLinesDataLoader(cfg, "cpu")
+    prompts, _, _ = dl.load()
+    assert dl.raw_prompt_texts == ["abc", "xyz"]
+    assert prompts.shape[0] == 2
+
+
+def test_build_teacher_prompts_applies_own_template(monkeypatch):
+    """C3：build_teacher_prompts 用教师自己的 tokenizer+模板编码（区别于学生 raw）。"""
+    import torch
+    import transformers
+    class FakeTok:
+        pad_token = "<pad>"
+        pad_token_id = 0
+        def __init__(self, *a, **k):
+            pass
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return cls()
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+            return "||T:" + msgs[0]["content"] + "||A:"
+        def encode(self, text, add_special_tokens=False, truncation=True,
+                   max_length=None):
+            n = len(text)
+            if max_length is not None:
+                n = min(n, max_length)
+            return list(range(1, n + 1))
+    monkeypatch.setattr(transformers, "AutoTokenizer", FakeTok)
+    from fullstack_opd_v2.data import build_teacher_prompts
+    out = build_teacher_prompts(["abc"], "teacher-path", P=8)
+    assert out.shape == (1, 8)
+    # "||T:abc||A:" = 11 字符 → 11 ids，截断到 8：前 8 个模板字符 id
+    assert out[0].tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert out.dtype == torch.long
+
+
 def test_jsonl_loader_missing_path_raises(monkeypatch):
     cfg, _ = _jsonl_cfg(type("T", (), {"__truediv__": lambda s, o: str(o)})())
     cfg["dataset"]["path"] = "/nonexistent/x.jsonl"

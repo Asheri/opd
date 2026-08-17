@@ -67,7 +67,7 @@ def _cmd_train(args) -> int:
 
 def _cmd_cache(args) -> int:
     from .model_factory import build_model
-    from .pipeline import FullStackOPDv2, stage1_build_cache
+    from .pipeline import FullStackOPDv2, _teacher_format_prompts, stage1_build_cache
 
     device = _device_arg(args)
     cfg = _load_cfg(args.config, args.set)
@@ -78,9 +78,14 @@ def _cmd_cache(args) -> int:
         s1cfg["cache_path"] = args.out
     # L1：warmup 需要初始 student（student_init 采样）；toy 下即初始 CausalToyLM
     warmup_student = build_model(cfg, device, role="student")
+    _prl, _pref = _teacher_format_prompts(
+        cfg, opd.raw_prompt_texts, opd.prompts.size(1), device)
     cache, _, _ = stage1_build_cache(
         opd.prompts, opd.responses, teacher_rl, teacher_ref, s1cfg,
-        warmup_student=warmup_student)
+        warmup_student=warmup_student,
+        prompt_format=("chat" if bool((cfg.get("dataset") or {}).get(
+            "apply_chat_template", False)) else "raw"),
+        prompts_rl=_prl, prompts_ref=_pref)
     print(f"[cache] Δ_T 缓存已构建: {s1cfg['cache_path']} "
           f"mode={cfg['cache_mode']} top_k={cfg['top_k_teacher']}")
     return 0

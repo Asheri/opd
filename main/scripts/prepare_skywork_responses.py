@@ -41,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=2048, help="生成长度（=论文 MAX_RESP_LENGTH）")
     p.add_argument("--temperature", type=float, default=1.0, help="采样温度（on-policy 初始分布）")
     p.add_argument("--top-p", type=float, default=0.95, help="top-p 采样")
+    p.add_argument("--apply-chat-template", action="store_true",
+                   help="C3（2026-08-18）：生成前用模型自身 apply_chat_template 把 "
+                        "prompt 包成 user 角色（Qwen3 chat 格式），否则裸数学题生成乱码+loop")
     # Stage 0 增强：限抽样 + 分片并行 + resume
     p.add_argument("--max-samples", type=int, default=None,
                    help="只生成前 N 条 todo（配合 --seed 可复现限抽样）")
@@ -197,8 +200,18 @@ def main() -> None:
         for start in range(0, len(remaining), bs):
             batch_idx = remaining[start:start + bs]
             batch_prompts = [rows[i]["prompt"] for i in batch_idx]
-            enc = tok(batch_prompts, return_tensors="pt", padding=True,
-                      truncation=True, max_length=2048).to(args.device)
+            if args.apply_chat_template:
+                # 套 Qwen chat 模板（user 角色 + generation prompt），模板含全部
+                # 特殊标记 → add_special_tokens=False（避免多余 BOS/EOS 混入）。
+                batch_prompts = [tok.apply_chat_template(
+                    [{"role": "user", "content": p}], tokenize=False,
+                    add_generation_prompt=True) for p in batch_prompts]
+                enc = tok(batch_prompts, return_tensors="pt", padding=True,
+                          truncation=True, max_length=2048,
+                          add_special_tokens=False).to(args.device)
+            else:
+                enc = tok(batch_prompts, return_tensors="pt", padding=True,
+                          truncation=True, max_length=2048).to(args.device)
             seq_len = enc["input_ids"].size(1)
             t0 = time.time()
             with torch.no_grad():

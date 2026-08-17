@@ -111,7 +111,14 @@ class TensorTeacherCache:
     # --------------------------- 构建 ---------------------------
     @torch.no_grad()
     def build(self, prompts, responses, teacher_rl, teacher_ref,
-              batch_size: int = 16, device=None) -> "TensorTeacherCache":
+              batch_size: int = 16, device=None,
+              prompts_rl=None, prompts_ref=None) -> "TensorTeacherCache":
+        """C3（2026-08-18）：教师可用各自模板格式的 prompt（prompts_rl/prompts_ref）。
+
+        默认 None 时两教师共用 `prompts`（原行为）。C3 场景：student prompt 套 Qwen3
+        模板，teacher_rl/teacher_ref 用各自 tokenizer+chat template 编码的 prompt，
+        使教师 Δ_T 在学生格式上下文上而不是教师原生格式上算。
+        """
         if self.enforce:
             ok = (
                 type(teacher_rl) is type(teacher_ref)
@@ -129,13 +136,19 @@ class TensorTeacherCache:
         teacher_rl.eval()
         teacher_ref.eval()
         N = prompts.size(0)
+        prl = prompts if prompts_rl is None else prompts_rl
+        pref = prompts if prompts_ref is None else prompts_ref
+        if prl.size(0) != N or pref.size(0) != N:
+            raise ValueError(
+                f"教师格式 prompt 行数须与 responses 一致：responses={N}, "
+                f"prompts_rl={prl.size(0)}, prompts_ref={pref.size(0)}")
 
         if self.mode == "dense":
             rl_full, ref_full = [], []
             for i in range(0, N, batch_size):
                 sl = slice(i, min(i + batch_size, N))
-                rl_full.append(response_dists(teacher_rl, prompts[sl], responses[sl]))
-                ref_full.append(response_dists(teacher_ref, prompts[sl], responses[sl]))
+                rl_full.append(response_dists(teacher_rl, prl[sl], responses[sl]))
+                ref_full.append(response_dists(teacher_ref, pref[sl], responses[sl]))
             rl_full = torch.cat(rl_full)
             ref_full = torch.cat(ref_full)
             self.vocab = rl_full.size(-1)
@@ -149,8 +162,8 @@ class TensorTeacherCache:
             self.vocab = 0
             for i in range(0, N, batch_size):
                 sl = slice(i, min(i + batch_size, N))
-                rl_c = response_dists(teacher_rl, prompts[sl], responses[sl])   # (c,T,V)
-                ref_c = response_dists(teacher_ref, prompts[sl], responses[sl])
+                rl_c = response_dists(teacher_rl, prl[sl], responses[sl])   # (c,T,V)
+                ref_c = response_dists(teacher_ref, pref[sl], responses[sl])
                 self.vocab = rl_c.size(-1)
                 Kt = min(self.top_k, self.vocab)
                 # teacher 自己的 top-K（Direct-OPD 迁移对象定义在 teacher 高概率支撑上）

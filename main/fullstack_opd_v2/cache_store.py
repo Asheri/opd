@@ -119,7 +119,8 @@ def write_cache_disk(cache, prefix: str, responses: torch.Tensor | None = None,
                      pad_id: int = 0, hashes: dict | None = None,
                      max_response_len: int = 8192, max_prompt_len: int = 0,
                      dtype: str = "bf16", dataset_size: int = 0,
-                     chunk: int = 256) -> dict:
+                     chunk: int = 256,
+                     prompt_format: str = "raw") -> dict:
     """把已 build 的 TensorTeacherCache（top-K）写为磁盘 mmap 三件套 + metadata。
 
     只落盘最小 sufficient statistics：ids_sorted(int32) + delta_k_sorted(fp32) +
@@ -164,6 +165,10 @@ def write_cache_disk(cache, prefix: str, responses: torch.Tensor | None = None,
         "reference_model_hash": hashes.get("reference_model_hash", ""),
         "generation_model_hash": hashes.get("generation_model_hash", ""),
         "checksum": checksum,
+        # 2026-08-18 C2 守卫：prompt 格式标记（"raw"|"chat"）。不进 METADATA_KEYS
+        # （旧 cache 缺该键仍可加载，默认 raw）；verify_consistency 据此防
+        # apply_chat_template=true 配旧裸 prompt cache 静默错位。
+        "prompt_format": prompt_format,
     }
     with open(f"{prefix}.metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -234,6 +239,17 @@ def verify_consistency(meta: dict, cfg: dict, hashes_now: dict | None = None) ->
             f"缓存 max_response_len={meta_len} 与 dataset.max_response_len={_data_len} "
             "不一致（缓存用旧配置建则需对齐 dataset.max_response_len 或重建缓存，"
             "否则 teacher top-K 支撑与训练响应维度错配 → searchsorted 崩溃）。")
+    # 2026-08-18 C2：prompt 格式一致性。开启 apply_chat_template 的 cache 必须带
+    # prompt_format="chat"；旧 cache 缺该字段默认 "raw"。错配 fail-fast，
+    # 防止用裸 prompt 预建的 Δ_T 配模板化 prompt 静默错位。
+    cache_pf = meta.get("prompt_format", "raw")
+    want_pf = "chat" if bool(_data_cfg.get("apply_chat_template", False)) else "raw"
+    if cache_pf != want_pf:
+        raise CacheConsistencyError(
+            f"缓存 prompt_format={cache_pf} 与当前配置 apply_chat_template="
+            f"{_data_cfg.get('apply_chat_template', False)}（需 {want_pf}）不一致，"
+            "不准加载——Δ_T 是在该格式的 prompt 上预建的，格式错配会静默错位。"
+            "需用同配置重建缓存。")
 
 
 class DiskTeacherCache:

@@ -126,6 +126,63 @@ def test_disk_consistency_topk_mismatch_fails_fast(tmp_path):
                                                   "reference_model_hash": meta["reference_model_hash"]})
 
 
+# ------------------------------- C2 prompt_format 守卫 -------------------------------
+def _pf_cfg(pf=True):
+    """verify_consistency 用 cfg：hashes 为空（write 未传）→ hashes_now 用 meta 值对齐。"""
+    return {"dataset": {"apply_chat_template": pf}}
+
+
+def test_disk_prompt_format_written(tmp_path):
+    """C2：write_cache_disk 按 prompt_format 参数写入 metadata。"""
+    cache, prompts, responses = _build_topk_cache()
+    prefix = str(tmp_path / "c")
+    meta = write_cache_disk(cache, prefix, responses=responses, pad_id=0,
+                            prompt_format="chat")
+    assert meta["prompt_format"] == "chat"
+    reloaded = load_cache_metadata(prefix)
+    assert reloaded["prompt_format"] == "chat"
+
+
+def test_disk_prompt_format_mismatch_fails_fast(tmp_path):
+    """C2：cache 为 raw 而配置开模板 → fail-fast（防 Δ_T 静默错位）。"""
+    cache, prompts, responses = _build_topk_cache()
+    prefix = str(tmp_path / "c")
+    meta = write_cache_disk(cache, prefix, responses=responses, pad_id=0)  # 默认 raw
+    with pytest.raises(CacheConsistencyError):
+        verify_consistency(meta, _pf_cfg(pf=True),
+                           hashes_now={"tokenizer_hash": meta["tokenizer_hash"],
+                                       "teacher_model_hash": meta["teacher_model_hash"],
+                                       "reference_model_hash": meta["reference_model_hash"]})
+
+
+def test_disk_prompt_format_old_missing_field_defaults_raw(tmp_path):
+    """C2：旧 cache 缺 prompt_format 字段 → 默认 raw：模板关时放行、开时拒绝。"""
+    cache, prompts, responses = _build_topk_cache()
+    prefix = str(tmp_path / "c")
+    meta0 = write_cache_disk(cache, prefix, responses=responses, pad_id=0)
+    meta = {k: v for k, v in meta0.items() if k != "prompt_format"}  # 模拟旧 cache
+    h = {"tokenizer_hash": meta["tokenizer_hash"],
+         "teacher_model_hash": meta["teacher_model_hash"],
+         "reference_model_hash": meta["reference_model_hash"]}
+    # 模板关（raw 配置）→ 放行
+    verify_consistency(meta, _pf_cfg(pf=False), hashes_now=h)
+    # 模板开 → 拒绝
+    with pytest.raises(CacheConsistencyError):
+        verify_consistency(meta, _pf_cfg(pf=True), hashes_now=h)
+
+
+def test_disk_prompt_format_chat_matches_passes(tmp_path):
+    """C2：cache 为 chat 且配置开模板 → 放行（正向路径）。"""
+    cache, prompts, responses = _build_topk_cache()
+    prefix = str(tmp_path / "c")
+    meta = write_cache_disk(cache, prefix, responses=responses, pad_id=0,
+                            prompt_format="chat")
+    h = {"tokenizer_hash": meta["tokenizer_hash"],
+         "teacher_model_hash": meta["teacher_model_hash"],
+         "reference_model_hash": meta["reference_model_hash"]}
+    verify_consistency(meta, _pf_cfg(pf=True), hashes_now=h)
+
+
 def test_disk_variable_length_padding_excluded(tmp_path):
     """两条样本长度 3/6（T_max=6）：delta 在 >实际长度 处为 0；total_tokens=ΣL。"""
     cache, prompts, responses = _build_topk_cache(N=2, T=6, K=7)

@@ -28,6 +28,30 @@ def test_dense_build_delta_shape_and_value():
     assert torch.allclose(cache.delta, expected, atol=1e-5)
 
 
+def test_dense_build_per_teacher_prompts():
+    """C3（2026-08-18）：prompts_rl/prompts_ref 时两教师各用自己的格式评分。
+    delta = response_dists(rl, prl, R) - response_dists(ref, pref, R)。"""
+    prompts, responses, rl, ref = _make()
+    prl = torch.randint(0, rl.vocab, (responses.size(0), 6))      # 独立教师格式 prompt
+    pref = torch.randint(0, rl.vocab, (responses.size(0), 5))
+    cache = TensorTeacherCache(True, 0)
+    cache.build(prompts, responses, rl, ref, batch_size=4,
+                prompts_rl=prl, prompts_ref=pref)
+    expected = response_dists(rl, prl, responses) - response_dists(ref, pref, responses)
+    assert cache.delta.shape == (prompts.size(0), responses.size(1), rl.vocab)
+    assert torch.allclose(cache.delta, expected, atol=1e-5)
+
+
+def test_build_per_teacher_prompt_row_mismatch_raises():
+    """C3：prompts_rl/ref 行数 ≠ responses → 显式报错（防错位）。"""
+    prompts, responses, rl, ref = _make()
+    prl = torch.randint(0, rl.vocab, (responses.size(0) - 1, 4))
+    pref = torch.randint(0, rl.vocab, (responses.size(0), 4))
+    with pytest.raises(ValueError):
+        TensorTeacherCache(True, 0).build(prompts, responses, rl, ref,
+                                          prompts_rl=prl, prompts_ref=pref)
+
+
 def test_dense_get_delta_indexing():
     prompts, responses, rl, ref = _make()
     cache = TensorTeacherCache(True, 0).build(prompts, responses, rl, ref)

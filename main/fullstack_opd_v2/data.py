@@ -82,6 +82,7 @@ class JsonLinesDataLoader(DataLoader):
         self.max_prompt_len = int(ds.get("max_prompt_len", 256))
         self.max_response_len = int(ds.get("max_response_len", 384))
         self.tokenizer_path = ds.get("tokenizer_path") or cfg.get("student_path")
+        self._raw_prompt_texts: list[str] = []      # C3：原始 prompt 文本（未套模板），供教师各自模板重编码
         # 2026-08-17 根因（rollout 质量）：Qwen3 是 chat 模型，裸数学题 prompt 不套
         # <|im_start|> 模板会生成乱码+loop（实测裸 prompt "*. 202951173." vs 套模板
         # "We are given a system of six linear equations..."）。apply_chat_template=true
@@ -124,6 +125,7 @@ class JsonLinesDataLoader(DataLoader):
                 r_text = str(row.get(self.response_key, ""))
                 if not p_text or not r_text:
                     continue
+                self._raw_prompt_texts.append(p_text)   # C3：存原始文本（未套模板）
                 if self.apply_chat_template:
                     # Qwen chat 格式：user 角色 + generation prompt（模型才有推理上下文）
                     p_text = tok.apply_chat_template(
@@ -145,6 +147,13 @@ class JsonLinesDataLoader(DataLoader):
                        lambda r: torch.zeros_like(r, dtype=torch.float32))
         return self._cache
 
+    @property
+    def raw_prompt_texts(self) -> list[str]:
+        """C3：已加载行的原始 prompt 文本（与 prompts 行对齐，未套任何模板）。"""
+        if self._cache is None:
+            raise DataError("raw_prompt_texts 需先 load()")
+        return list(self._raw_prompt_texts)
+
 
 def build_data_loader(cfg: dict, device: str = "cpu") -> DataLoader:
     """按 `cfg["dataset"]["type"]` 构造数据加载器。未知类型抛 `DataError`。"""
@@ -157,3 +166,29 @@ def build_data_loader(cfg: dict, device: str = "cpu") -> DataLoader:
 
 
 __all__ = ["DataLoader", "ToyDataLoader", "JsonLinesDataLoader", "build_data_loader"]
+
+
+# ---------------------------------------------------------------------------
+# C3（2026-08-18）：教师各自模板格式的 prompt 编码
+# ---------------------------------------------------------------------------
+def build_teacher_prompts(raw_texts, tokenizer_path, P: int, device: str = "cpu",
+                          role: str = "user") -> torch.Tensor:
+    """用教师自己的 tokenizer + chat template 把原始 prompt 文本编码为 (N,P) 定长。
+
+    C3 语义：student prompt 套 Qwen3 模板后，教师（JustRL/R1-Distill 等）不应看到
+    学生格式的 token——用各自原生模板包裹 user 角色 + generation prompt，使教师
+    Δ_T 的上下文匹配各自训练分布。返回 (N,P) long；截断右 pad（教师 tokenizer 的
+    pad_token_id，缺省 0）。
+    """
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    pad = tok.pad_token_id if tok.pad_token_id is not None else 0
+    rows: list[list[int]] = []
+    for t in raw_texts:
+        s = tok.apply_chat_template([{"role": role, "content": t}],
+                                    tokenize=False, add_generation_prompt=True)
+        ids = tok.encode(s, add_special_tokens=False, truncation=True,
+                         max_length=P)
+        ids = ids[:P] + [pad] * max(0, P - len(ids))
+        rows.append(ids)
+    return torch.tensor(rows, dtype=torch.long).to(device)
