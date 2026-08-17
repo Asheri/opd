@@ -77,6 +77,12 @@ class Stage2Cfg(_Strict):
     rollout_model: str = "Qwen/Qwen2.5-7B"
     rollout_dtype: Literal["auto", "bf16", "fp8"] = "auto"
     rollout_logprobs_cap: int = 4096
+    # vLLM 引擎放置/显存/上下文（IMP-2/P1）：rollout_device 为输出张量回落设备
+    # （训练卡同卡最优）；物理卡位由进程 CUDA_VISIBLE_DEVICES 决定。rollout_gpu_mem
+    # 默认 0.9（独占）；训练+vLLM 共卡并行时调低（如 0.45）。
+    rollout_device: str = "cuda:1"
+    rollout_gpu_mem: float = 0.9
+    rollout_max_model_len: int = 2048
     # ---- 顶层部署键下渗槽位（A5 解法 + T2 死槽位清理）----
     # load_config 在下渗后才校验，这些键须在 stage schema 有合法位置，否则
     # extra="forbid" 会把下渗结果当未知键拒掉。只保留 stage2 真正消费的键
