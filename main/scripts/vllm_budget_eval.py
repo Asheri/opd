@@ -24,7 +24,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fullstack_opd_v2.budget_eval import extract_final_answer, format_prompt
-from fullstack_opd_v2.budget_eval import DATASET_REGISTRY, BudgetEvaluator
+from fullstack_opd_v2.budget_eval import BudgetEvaluator
 from fullstack_opd_v2.eval_aime import _grade_answer_sympy
 
 
@@ -50,6 +50,42 @@ def _load_problems(dataset_ref: str, n_limit: int | None):
     if n_limit is not None:
         problems = problems[:int(n_limit)]
     return problems
+
+
+def _aggregate_budget(problems, outs, budget: int, label: str) -> dict:
+    """纯函数：vLLM RequestOutput 列表 → 聚合结果（可单测，不依赖 vLLM）。
+
+    隐含协议（与 budget_eval 一致）：outcome=预算内自然产出正确最终答案；status 按
+    finish_reason（stop=eos / length=budget_stop）显式区分；reasoning_tokens=生成 token 数。
+    """
+    n_outcome = n_noans = n_eos = rt_sum = 0
+    rows = []
+    for (problem, gt), o in zip(problems, outs):
+        text = o.outputs[0].text
+        rt = len(o.outputs[0].token_ids)
+        is_eos = o.outputs[0].finish_reason == "stop"
+        fa = extract_final_answer(text)
+        ok = False
+        if fa is not None:
+            ok = _grade_answer_sympy(fa, gt)
+        else:
+            n_noans += 1
+        n_outcome += int(ok)
+        n_eos += int(is_eos)
+        rt_sum += rt
+        rows.append({"problem_id": len(rows), "budget": budget, "label": label,
+                     "status": "eos" if is_eos else "budget_stop",
+                     "reasoning_tokens": rt, "has_final_answer": fa is not None,
+                     "outcome_correct": ok, "ground_truth": gt,
+                     "final_answer": fa, "response": text})
+    Nn = len(rows)
+    return {"label": label, "budget": budget, "n": Nn,
+            "accuracy": n_outcome / Nn if Nn else 0.0,
+            "eos_rate": n_eos / Nn if Nn else 0.0,
+            "budget_stop_rate": (Nn - n_eos) / Nn if Nn else 0.0,
+            "avg_reasoning_tokens": rt_sum / Nn if Nn else 0.0,
+            "no_answer_rate": n_noans / Nn if Nn else 0.0,
+            "rows": rows}
 
 
 def main() -> None:
@@ -83,41 +119,16 @@ def main() -> None:
             t1 = time.time()
             params = SamplingParams(temperature=0.0, max_tokens=B)
             outs = llm.generate(prompts, sampling_params=params)
-            n_outcome = n_noans = n_prefix_ok = n_eos = rt_sum = 0
-            rows = []
-            for (problem, gt), o in zip(problems, outs):
-                text = o.outputs[0].text
-                rt = len(o.outputs[0].token_ids)
-                is_eos = o.outputs[0].finish_reason == "stop"
-                fa = extract_final_answer(text)
-                ok = False
-                if fa is not None:
-                    ok = _grade_answer_sympy(fa, gt)
-                else:
-                    n_noans += 1
-                n_outcome += int(ok)
-                n_eos += int(is_eos)
-                rt_sum += rt
-                rows.append({"problem_id": len(rows), "budget": B, "label": label,
-                             "status": "eos" if is_eos else "budget_stop",
-                             "reasoning_tokens": rt, "has_final_answer": fa is not None,
-                             "outcome_correct": ok, "ground_truth": gt,
-                             "final_answer": fa, "response": text})
-            Nn = len(rows)
-            res = {"label": label, "budget": B, "dataset": args.dataset,
-                   "n": Nn, "accuracy": n_outcome / Nn if Nn else 0.0,
-                   "eos_rate": n_eos / Nn if Nn else 0.0,
-                   "budget_stop_rate": (Nn - n_eos) / Nn if Nn else 0.0,
-                   "avg_reasoning_tokens": rt_sum / Nn if Nn else 0.0,
-                   "no_answer_rate": n_noans / Nn if Nn else 0.0,
-                   "seconds": round(time.time() - t1, 1)}
+            res = _aggregate_budget(problems, outs, B, label)
+            res["seconds"] = round(time.time() - t1, 1)
             all_results.append(res)
+            rows = res.pop("rows", [])
             with open(os.path.join(args.out_dir, f"{label}__{args.dataset}__B{B}.jsonl"),
                       "w", encoding="utf-8") as f:
                 for r in rows:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
             print(f"  {label} @B{B}: acc={res['accuracy']:.3f} eos={res['eos_rate']:.3f} "
-                  f"avg_rt={res['avg_reasoning_tokens']:.0f} n={Nn} {res['seconds']}s", flush=True)
+                  f"avg_rt={res['avg_reasoning_tokens']:.0f} n={res['n']} {res['seconds']}s", flush=True)
         del llm
         import torch
         torch.cuda.empty_cache()
