@@ -89,6 +89,11 @@ def _mock_tokenizer(monkeypatch):
             if max_length is not None:
                 n = min(n, max_length)
             return list(range(1, n + 1))
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+            # 伪模板：包成 "||user:CONTENT||assistant:"，长度变化可被测试捕获
+            content = msgs[0]["content"]
+            s = "||user:" + content + "||assistant:"
+            return s if not tokenize else self.encode(s)
     monkeypatch.setattr(transformers, "AutoTokenizer", FakeTok)
     return FakeTok
 
@@ -112,6 +117,21 @@ def test_jsonl_loader_encodes_to_fixed_length(tmp_path, monkeypatch):
     # reward_fn 占位（HF 路径不用）：返回 0
     assert torch.equal(reward_fn(responses),
                        torch.zeros_like(responses, dtype=torch.float32))
+
+
+def test_jsonl_loader_apply_chat_template(tmp_path, monkeypatch):
+    """2026-08-17 根因：apply_chat_template=true 时 prompt 先套 chat 模板再编码
+    （Qwen 裸 prompt 生成乱码+loop）。验证模板包裹改变了编码输入。"""
+    import json
+    _mock_tokenizer(monkeypatch)
+    cfg, path = _jsonl_cfg(tmp_path, apply_chat_template=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"prompt": "abc", "response": "def"}) + "\n")
+    prompts, _, _ = JsonLinesDataLoader(cfg, "cpu").load()
+    # 模板 "||user:abc||assistant:" = 22 字符 → 22 ids，截断到 max_prompt_len=8
+    # 与未套模板（"abc"=3 ids）不同 → 模板确实生效
+    assert prompts.shape == (1, 8)
+    assert prompts[0].tolist() == [1, 2, 3, 4, 5, 6, 7, 8]  # 前 8 个模板字符 id
 
 
 def test_jsonl_loader_missing_path_raises(monkeypatch):

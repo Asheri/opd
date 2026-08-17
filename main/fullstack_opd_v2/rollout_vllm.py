@@ -418,10 +418,13 @@ class VLLMRolloutEngine:
                 items = list(d.items())
                 # 按 logprob 降序（vLLM dict 迭代顺序不保证有序）
                 items.sort(key=lambda kv: kv[1].logprob, reverse=True)
-                ids[b, t, :len(items)] = torch.tensor([int(tid) for tid, _ in items],
-                                                      dtype=torch.long)
-                lps[b, t, :len(items)] = torch.tensor([v.logprob for _, v in items],
-                                                      dtype=torch.float32)
+                # clamp：vLLM prompt_logprobs=k 个别位置可能返回 k+1 项（含特殊 token）
+                # ——超出的截断，不写越界（2026-08-17 实测 len=33 vs k=32）。
+                _n = min(len(items), k)
+                ids[b, t, :_n] = torch.tensor([int(tid) for tid, _ in items[:_n]],
+                                              dtype=torch.long)
+                lps[b, t, :_n] = torch.tensor([v.logprob for _, v in items[:_n]],
+                                              dtype=torch.float32)
         return ids.to(self.device), lps.to(self.device)
 
     def response_dists(self, prompts: torch.Tensor,

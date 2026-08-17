@@ -82,6 +82,12 @@ class JsonLinesDataLoader(DataLoader):
         self.max_prompt_len = int(ds.get("max_prompt_len", 256))
         self.max_response_len = int(ds.get("max_response_len", 384))
         self.tokenizer_path = ds.get("tokenizer_path") or cfg.get("student_path")
+        # 2026-08-17 根因（rollout 质量）：Qwen3 是 chat 模型，裸数学题 prompt 不套
+        # <|im_start|> 模板会生成乱码+loop（实测裸 prompt "*. 202951173." vs 套模板
+        # "We are given a system of six linear equations..."）。apply_chat_template=true
+        # 时把 prompt 包成 user 角色再编码。⚠️ 会改变 prompt token → 预建 teacher cache
+        # 必须用同配置重建（否则 Δ_T 错位）。默认 false 保护现有 cache。
+        self.apply_chat_template = bool(ds.get("apply_chat_template", False))
         self.device = device
         self._cache = None
 
@@ -118,6 +124,11 @@ class JsonLinesDataLoader(DataLoader):
                 r_text = str(row.get(self.response_key, ""))
                 if not p_text or not r_text:
                     continue
+                if self.apply_chat_template:
+                    # Qwen chat 格式：user 角色 + generation prompt（模型才有推理上下文）
+                    p_text = tok.apply_chat_template(
+                        [{"role": "user", "content": p_text}],
+                        tokenize=False, add_generation_prompt=True)
                 p_ids = tok.encode(p_text, add_special_tokens=False, truncation=True,
                                    max_length=P)
                 r_ids = tok.encode(r_text, add_special_tokens=False, truncation=True,
