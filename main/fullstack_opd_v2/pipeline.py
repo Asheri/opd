@@ -639,6 +639,10 @@ class FullStackOPDv2:
                         model=s2cfg.get("rollout_model", "Qwen/Qwen2.5-7B"),
                         tp_size=int(s2cfg.get("rollout_tp_size", 1)),
                         dtype=s2cfg.get("rollout_dtype", "auto"),
+                        # 显存占比/上下文上限可配（默认 0.9/2048 不变）；双卡并行实验
+                        # 训练+vLLM 共卡时调低 rollout_gpu_mem（如 0.5）防 OOM。
+                        gpu_memory_utilization=float(s2cfg.get("rollout_gpu_mem", 0.9)),
+                        max_model_len=int(s2cfg.get("rollout_max_model_len", 2048)),
                         vocab_size=vocab,
                         full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
                         device=rollout_device)

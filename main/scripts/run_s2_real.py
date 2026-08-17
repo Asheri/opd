@@ -60,6 +60,9 @@ def parse_args() -> argparse.Namespace:
                         "batch 4→2 把训练激活减半防 OOM；默认继承 config）")
     p.add_argument("--refresh-size", type=int, default=None,
                    help="覆盖 l2.cache.refresh_size（默认 5000×T×K 预分配 GPU OOM，pilot 用 ~64）")
+    p.add_argument("--set", dest="extra_sets", action="append", default=[],
+                   metavar="KEY=VALUE",
+                   help="额外 config 覆盖（可重复），如 --set stage2.rollout_engine=vllm")
     return p.parse_args()
 
 
@@ -94,6 +97,7 @@ def main() -> None:
         if args.cache_path:
             overrides.append(f"stage1.cache_path={args.cache_path}")
         overrides.append(f"stage1.load_cache={'true' if args.load_cache else 'false'}")
+        overrides += list(args.extra_sets)   # --set 透传：rollout_engine=vllm 等任意覆盖
         cfg = load_config(path=args.config, overrides=overrides)
 
         d = os.path.join(args.run_dir, name)
