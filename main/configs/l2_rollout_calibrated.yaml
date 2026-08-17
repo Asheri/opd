@@ -1,0 +1,5 @@
+'#': scripts/calibrate_rollout.py 校准产物——建议覆盖 l2.rollout（IMP-1b）
+l2:
+  rollout:
+    loop_periods: []
+    eos_token_id: 151645

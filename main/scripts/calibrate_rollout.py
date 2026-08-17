@@ -218,7 +218,10 @@ def write_calibration_report(sweep_results: dict, out_path: Path | str,
     L.append("")
     L.append("## 方法学")
     L.append("")
-    L.append("1. 真实 rollout N 条（temperature=1.0，短预算 `max_new`，新生成 token 序列去 pad）。")
+    L.append(f"1. 真实 rollout N 条（chat_template={meta.get('chat', False)}，"
+             f"temperature={meta.get('temperature', '?')}，"
+             f"repetition_penalty={meta.get('repetition_penalty', '?')}，"
+             "短预算 `max_new`，新生成 token 序列去 pad）。")
     L.append("2. 对每条 rollout，用与训练完全一致的 `detect_loop`（尾部周期自相关 + min_len 门槛）判定。")
     L.append("3. 对每种 (periods, min_len) 配置统计：`loop_detected_count` / `loop_rate` /")
     L.append("   `samples_flagged`；有**人工标注**时另算 `false_positive_rate` / `false_negative_cases`。")
