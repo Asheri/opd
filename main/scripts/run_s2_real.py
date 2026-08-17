@@ -23,6 +23,14 @@ import argparse
 import json
 import os
 
+import os
+import sys
+
+# 脚本位于 main/scripts/ 下；直接运行（python scripts/xxx.py）时 sys.path[0] 是 scripts/
+# 而非 repo 根，导致 `from fullstack_opd_v2 ...` 失败。显式把 main/ 加入 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 from fullstack_opd_v2.config import load_config
 from fullstack_opd_v2.experiment import STAGE2_ROLLOUT_MATRIX
 

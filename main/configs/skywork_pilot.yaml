@@ -1,0 +1,91 @@
+# IMP-3 pilot：200 行 Skywork，max_response_len=2048，cache=cache_pilot_200.pt
+# 1.7B 学生 Skywork 数据重训练配置（docs/2026-08-14-skywork-1.7b-retrain-plan.md）
+#
+# 数据：Skywork-OR1 math 10K 子集（prepare_skywork_jsonl.py + prepare_skywork_responses.py 产出）
+# 健康超参：复用服务器 ms_17b 实测收敛配置（lr=3e-5/kl=0.5/delta_clip=2.0/top_k=256）
+# 教师对：JustRL-DeepSeek-1.5B（rl）/ DeepSeek-R1-Distill-Qwen-1.5B（ref），同 R1/Qwen2.5 家族
+#
+# 用法（服务器恢复后）：
+#   建缓存：python -m fullstack_opd_v2 train --config configs/skywork_17b.yaml \
+#             --run-dir <run_dir> --device cuda:0 --set stage1.load_cache=false
+#   训练：  python -m fullstack_opd_v2 train --config configs/skywork_17b.yaml \
+#             --run-dir <run_dir> --device cuda:0 --set stage1.load_cache=true
+
+model_kind: hf
+student_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+teacher_rl_path: /root/autodl-tmp/models/JustRL-DeepSeek-1.5B
+teacher_ref_path: /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-1.5B
+
+dtype: bf16
+cache_mode: topk
+offload_to_cpu: true
+# Stage 1：统一 K 存储架构（§1）——磁盘 mmap 驻留；K 实验范围 {32,64,128,256}。
+# top_k 仅允许 0/32/64/128/256（0=dense）。storage=disk：GPU/RAM 只驻当前 batch 行。
+# K=256 由 Stage 1.5 K 校准定案（完整 8192 域 ρ_64=0.51 不满足判据，需 256 才 ρ=1）。
+cache:
+  top_k: 256
+  storage: disk
+
+# ---- 数据：Skywork 50K prompt universe（response 由 prepare_skywork_responses.py 预生成）----
+# ⚠️ 规模（50K universe + 5K materialized 静态锚点）由 Stage 0 实测决定（见
+# gen_benchmark.py / stage0_scale_probe.py）：K=256×4096 下盘体 ~0.4TB（S1-7 外推折半）。
+dataset:
+  type: jsonl
+  path: /root/autodl-tmp/datasets/skywork_pilot_200.jsonl
+  prompt_key: prompt
+  response_key: response
+  max_prompt_len: 1024            # 对齐论文 MAX_PROMPT_LENGTH
+  max_response_len: 1024          # pilot OOM 修复：seq=1024+1024=2048，logits 减半
+  tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  prompt_universe_size: 200     # prompt 池总规模（50K universe）
+
+# ---- Stage 0 规模概念：materialized 静态锚点（仅数据结构，不接算法）----
+# 只生成 materialized_size 条 response（JsonLinesDataLoader 跳过空 response 行 →
+# 训练只看到这 5K 静态锚点），其余 45K prompt 留空待 L2 在线 refresh（本阶段不实现）。
+base:
+  materialized_size: 200
+
+stage0:
+  n_rl_steps: 20                  # hf 路径跳过 Stage0 RL（_stage0_teachers 直接用预下载教师对），仅占位
+
+stage1:
+  enforce_teacher_consistency: true
+  cache_path: /root/autodl-tmp/cache_pilot_200.pt
+  load_cache: false               # 首次建缓存 false；训练阶段置 true（跳过 Stage0/1）
+  build_batch_size: 4             # pilot：降 batch 防缓存构建阶段显存峰值（OOM 修复）
+  warmup_M: 0                     # L0（HF 无 generate_batch；L1 用 prepare 脚本预生成多 response 实现）
+  warmup_source: none
+  warmup_temperature: 1.0
+
+stage2:
+  scheduling_mode: fully_async
+  staleness_threshold: 4
+  queue_size: 2                  # OOM 修复：s_old (B,T,V) 大张量队列 8->2（调度器实测值）
+  kl_reg_coef: 0.5                # ← ms_17b 健康值（非默认 0.05，防塌陷）
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 3.0e-5                      # ← ms_17b 健康值（非默认 1e-3，保守防爆）
+  n_steps: 200                    # ← step120 最优、step199 过训（复现 + 监测）
+  batch_size: 8                   # ← ms_17b 健康值
+  distributed: false              # 单卡线程版调度器
+  rollout_engine: toy             # scorer 朴素前向（单卡，不用 vLLM TP）
+  renormalize_topk_support: true  # 对齐原始 Direct-OPD 稀疏支撑归一化
+  delta_clip: 2.0                 # ← Δ_T 数值护栏（真实词表 log-ratio 差 ±10 -> PG 爆炸）
+  dtype: bf16
+  # top_k_student 由 cache.top_k（=256）回落驱动（scheduler.py:97-98），不再写死。
+  offload_to_cpu: false           # 单卡 batch=8 显存够，learner 不 offload
+
+run:
+  checkpoint_every: 20            # step20/40/.../200 共 10 断点（捕捉 step120 最优）
+
+eval:
+  model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  n_samples: 8                    # 待 10min flash 实测定（n=8 或 16）
+  temperature: 0.7
+  max_new_tokens: 8192            # 待实测定（8192 或 16384）
+  top_p: 0.95
+  metric: ave
+  prompt_style: boxed
+  scoring: sympy
+  chat_template: true
+  attn_implementation: flash_attention_2
