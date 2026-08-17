@@ -37,8 +37,10 @@ PY
 cd /root/opd/main
 CUDA_VISIBLE_DEVICES=1,0 /root/miniconda3/bin/python scripts/verify_weight_sync.py
 ```
-- 通过标准：扰动（每层注入 +0.1 后 vLLM logp 变化 >0.01、复原<0.01）；分布级
-  ≥512 位置 top1≥0.99、topK logp MAE<0.03；贪心 4×128 位置一致率≥0.99。
+- 布局与通过探针一致：CUDA_VISIBLE_DEVICES=1,0 + engine device=cuda:1 →
+  NCCL rank0（+HF state_dict 源）在物理卡0，vLLM worker 落可见 cuda:0=物理卡1
+  （交叉，勿改动）。通过标准：扰动（注入 +0.1 后 logp 变化>0.01、复原<0.01）；
+  分布级 ≥512 位置 top1≥0.99、topK logp MAE<0.03；贪心 4×128 位置一致率≥0.99。
 - 通过后报告措辞才可升级为"权重加载正确"；未通过则继续排查（不静默）。
 
 ## 3. 按模板重生成 base responses（C3）
@@ -47,12 +49,12 @@ CUDA_VISIBLE_DEVICES=1,0 /root/miniconda3/bin/python scripts/verify_weight_sync.
 只处理 response 为空的 todo 行 → 如需整体重生成，先清空 response 列或新建副本）：
 
 ```
-# 副本保护原 jsonl
+# 副本保护原 jsonl + --force 覆盖已填 response（模板重生成）
 cp /root/autodl-tmp/datasets/skywork_math_500.jsonl{,.raw}
 /root/miniconda3/bin/python scripts/prepare_skywork_responses.py \
   --jsonl /root/autodl-tmp/datasets/skywork_math_500.jsonl \
   --model /root/autodl-tmp/models/Qwen__Qwen3-1.7B --device cuda:0 \
-  --max-samples 500 --apply-chat-template
+  --max-samples 500 --apply-chat-template --force
 ```
 - 样本检查：抽 2-3 条 decode 前 200 字符（应为正常推理，非乱码 token soup）。
 

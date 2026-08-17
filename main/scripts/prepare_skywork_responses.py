@@ -45,6 +45,9 @@ def parse_args() -> argparse.Namespace:
                    help="C3（2026-08-18）：生成前用模型自身 apply_chat_template 把 "
                         "prompt 包成 user 角色（Qwen3 chat 格式），否则裸数学题生成乱码+loop")
     # Stage 0 增强：限抽样 + 分片并行 + resume
+    p.add_argument("--force", action="store_true",
+                   help="C3（2026-08-18）：即使 response 已填也重新生成"
+                        "（--apply-chat-template 重生成 base responses 用）")
     p.add_argument("--max-samples", type=int, default=None,
                    help="只生成前 N 条 todo（配合 --seed 可复现限抽样）")
     p.add_argument("--seed", type=int, default=None, help="todo 采样种子（可复现）")
@@ -160,8 +163,9 @@ def main() -> None:
 
     rows = load_rows(args.jsonl)
     n = len(rows)
-    # 待生成：response 为空/缺失的行
-    todo = [i for i, r in enumerate(rows) if not r.get("response")]
+    # 待生成：response 为空/缺失的行；--force 时全部行重生成（C3 模板重生成用）
+    todo = list(range(n)) if args.force else [
+        i for i, r in enumerate(rows) if not r.get("response")]
     # Stage 0：限抽样 + 分片（各 shard 的 todo 互不重合）
     todo = select_todo(todo, args.max_samples, args.seed,
                        args.shard_rank, args.num_shards)

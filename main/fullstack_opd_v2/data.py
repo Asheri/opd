@@ -184,16 +184,23 @@ __all__ = ["DataLoader", "ToyDataLoader", "JsonLinesDataLoader", "build_data_loa
 # C3（2026-08-18）：教师各自模板格式的 prompt 编码
 # ---------------------------------------------------------------------------
 def build_teacher_prompts(raw_texts, tokenizer_path, P: int, device: str = "cpu",
-                          role: str = "user") -> torch.Tensor:
+                          role: str = "user",
+                          vocab_size: int | None = None) -> torch.Tensor:
     """用教师自己的 tokenizer + chat template 把原始 prompt 文本编码为 (N,P) 定长。
 
     C3 语义：student prompt 套 Qwen3 模板后，教师（JustRL/R1-Distill 等）不应看到
     学生格式的 token——用各自原生模板包裹 user 角色 + generation prompt，使教师
     Δ_T 的上下文匹配各自训练分布。返回 (N,P) long；截断右 pad（教师 tokenizer 的
-    pad_token_id，缺省 0）。
+    pad_token_id，缺省 0）。vocab_size：教师模型词表；提供时校验 tokenizer 词表
+    兼容（跨词表 id 喂教师模型 = 垃圾上下文）。
     """
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    if vocab_size is not None and getattr(tok, "vocab_size", None) and             int(tok.vocab_size) > int(vocab_size):
+        raise DataError(
+            f"教师 tokenizer 词表 {tok.vocab_size} > 教师模型词表 {vocab_size}："
+            f"{tokenizer_path} tokenizer 与模型不匹配，教师格式 prompt 会是跨词表 "
+            "垃圾 id——请检查 teacher 路径/tokenizer 配置。")
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
     rows: list[list[int]] = []
     for t in raw_texts:

@@ -232,6 +232,38 @@ def test_jsonl_loader_template_truncation_keeps_generation_marker(tmp_path, monk
     assert row[1] != 0          # 非 pad
 
 
+def test_build_teacher_prompts_vocab_mismatch_raises(monkeypatch):
+    """C3：教师 tokenizer 词表 > 教师模型词表 → 显式报错（防跨词表垃圾 id）。"""
+    import pytest
+    import transformers
+    from fullstack_opd_v2.data import DataError, build_teacher_prompts
+
+    class SmallVocabTok:
+        vocab_size = 100
+        pad_token_id = 0
+        def __init__(self, *a, **k):
+            pass
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return cls()
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+            return "<U>" + msgs[0]["content"] + "<A>"
+        def encode(self, text, add_special_tokens=False, truncation=True,
+                   max_length=None):
+            ids = [50] * len(text)
+            if max_length is not None:
+                ids = ids[:max_length]
+            return ids
+        def decode(self, ids):
+            return "x" * len(ids)
+
+    monkeypatch.setattr(transformers, "AutoTokenizer", SmallVocabTok)
+    with pytest.raises(DataError):
+        build_teacher_prompts(["abc"], "t", P=8, vocab_size=64)   # 100 > 64
+    out = build_teacher_prompts(["abc"], "t", P=8, vocab_size=200)  # 100 <= 200 放行
+    assert out.shape == (1, 8)
+
+
 def test_jsonl_loader_missing_path_raises(monkeypatch):
     cfg, _ = _jsonl_cfg(type("T", (), {"__truediv__": lambda s, o: str(o)})())
     cfg["dataset"]["path"] = "/nonexistent/x.jsonl"

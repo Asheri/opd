@@ -194,11 +194,13 @@ def stage0_small_rl(prompts, reward_fn, cfg: dict, device,
 
 
 # ----------------------------- Stage 1 -----------------------------
-def _teacher_format_prompts(cfg: dict, raw_texts, P: int, device: str):
+def _teacher_format_prompts(cfg: dict, raw_texts, P: int, device: str,
+                             teacher_rl=None, teacher_ref=None):
     """C3：apply_chat_template 开启时构建教师各自模板格式的 prompt 张量对。
 
     返回 (prompts_rl, prompts_ref)：teacher_rl/teacher_ref 分别用各自 tokenizer 的
     原生 chat template 编码 raw_texts；未开启或 raw_texts 不可用时返回 (None, None)。
+    vocab 守卫用已加载教师实例的词表（跨词表 id = 垃圾上下文）。
     """
     from .data import build_teacher_prompts
     if not raw_texts or not bool((cfg.get("dataset") or {}).get(
@@ -210,8 +212,12 @@ def _teacher_format_prompts(cfg: dict, raw_texts, P: int, device: str):
         raise DataError(
             "apply_chat_template=true 且需重建 Δ_T 时必须有 teacher_rl_path/"
             "teacher_ref_path（教师各自模板重编码 prompt）")
-    prl = build_teacher_prompts(raw_texts, rl_path, P, device=device)
-    pref = build_teacher_prompts(raw_texts, ref_path, P, device=device)
+    prl = build_teacher_prompts(
+        raw_texts, rl_path, P, device=device,
+        vocab_size=getattr(teacher_rl, "vocab", None))
+    pref = build_teacher_prompts(
+        raw_texts, ref_path, P, device=device,
+        vocab_size=getattr(teacher_ref, "vocab", None))
     return prl, pref
 
 
@@ -514,7 +520,8 @@ class FullStackOPDv2:
             # cache_mode/top_k_teacher（顶层 CLOUD_CONFIG 风格也生效）；这里直接取用。
             # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
             _prl, _pref = _teacher_format_prompts(
-                self.cfg, self.raw_prompt_texts, self.prompts.size(1), self.device)
+                self.cfg, self.raw_prompt_texts, self.prompts.size(1), self.device,
+                teacher_rl=teacher_rl, teacher_ref=teacher_ref)
             cache, fat_prompts, fat_responses = stage1_build_cache(
                 self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
                 warmup_student=warmup_student,

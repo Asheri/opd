@@ -79,7 +79,8 @@ def _cmd_cache(args) -> int:
     # L1：warmup 需要初始 student（student_init 采样）；toy 下即初始 CausalToyLM
     warmup_student = build_model(cfg, device, role="student")
     _prl, _pref = _teacher_format_prompts(
-        cfg, opd.raw_prompt_texts, opd.prompts.size(1), device)
+        cfg, opd.raw_prompt_texts, opd.prompts.size(1), device,
+        teacher_rl=teacher_rl, teacher_ref=teacher_ref)
     cache, _, _ = stage1_build_cache(
         opd.prompts, opd.responses, teacher_rl, teacher_ref, s1cfg,
         warmup_student=warmup_student,
