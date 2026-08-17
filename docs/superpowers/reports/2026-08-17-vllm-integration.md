@@ -1,7 +1,9 @@
 # IMP-2/P0 报告：训练管线 vLLM 提速接入
 
-> 日期：2026-08-17 ｜ 状态：**代码完成 + 本地单测通过；P1 GPU 端到端验证待服务器恢复**
-> 服务器：2x RTX PRO 6000 Blackwell（vLLM 0.16.0，FP8 sm_120 已确认）｜ 服务器当前不可达
+> 日期：2026-08-17，更新 2026-08-18 ｜ 状态：**代码完成 + 单测全绿；GPU 端到端验证已跑通
+> （NCCL 权重同步 + E1/E2 20 步 pilot 完成，无权重同步 warning）；三件套（C2 守卫已落地 /
+> C3 教师模板一致性代码已落地 / C1 加强验证探针待服务器恢复）**
+> 服务器：2x RTX PRO 6000 Blackwell（vLLM 0.16.0，FP8 sm_120 已确认）
 
 ## 1. 已修改文件
 
@@ -47,28 +49,38 @@
 - 回归：test_l2_rollout + test_adaptive_cache + test_pipeline 92 passed（dist_engines 默认 None 零回归）。
 - 上一提交 test_budget_eval / curve 44 passed（评估批量修复）。
 
-## 6. GPU validation requirement（P1，待服务器恢复）
+## 6. GPU validation（2026-08-17 已完成，2026-08-18 复核）
 
-计划：
-- run_s2_real.py --set stage2.rollout_engine=vllm 双卡（cuda:0/1）并行 S2_E1/E2 20 步 pilot。
-- 验收：rollout valid_rate~1.0 / n_loop~0（与 toy 一致）；refresh kl_loss~1.5-1.8（不回旧锚点错位量级）；无 OOM。
-- vLLM 权重同步 update_weights 若在本机版本不工作 → 明确版本适配说明（>=0.6 用 LLM.update_weights），不伪造通过。
-- 顺带验证 vllm_budget_eval.py（FP8 / 投机解码吞吐对比）。
+- **权重同步打通**：vLLM 0.16 NCCL WeightTransferEngine（`weight_transfer_config` 引擎启动注入 +
+  交叉分卡 trainer@GPU0/vLLM@GPU1）。探针 INIT + UPDATE-1/2 均 `True`；同步后 vLLM vs HF
+  logits `top1_match=0.875`、`topk_logp_absdiff=0.072`（**静态一致性初步通过**；扰动/贪心
+  加强验证见 §7 风险①，待服务器恢复执行）。
+- **E1/E2 pilot 完成**：各 20 步，reward≈-0.19 / pg_loss≈0.22-0.23 / kl_loss≈0.84-0.89，
+  **无权重同步 warning**。
+- **rollout 质量根因（2026-08-18 实测）**：生成内容为乱码+loop，根因是 prompt 未套 Qwen
+  chat template（裸 prompt `*. 202951173.` vs 套模板正常推理、0 loop）→ C2/C3 修复。
+- **验收条款（C3 模板生效后判定）**：valid_rate ≥ 0.5（IMP-1 原目标）；refresh pool ≥ 8
+  （不再触发冷启动跳过）；报告中附 2-3 条完整 decode 的 rollout 样本供人工检查。
 
-当前阻塞：服务器 connect.westd.seetacloud.com:35318 持续不可达（NoValidConnectionsError），
-P1 无法执行。恢复后立即按上述验收跑。
+## 7. Remaining risks（2026-08-18 复核后）
 
-## 7. Remaining risks
-
-- 4 个 vLLM 引擎共存显存/启动：低 gpu_memory_utilization 方案需 GPU 实测（fp8 小模型 ~2GB/个，
-  预计 OK，但以实测为准）。
-- update_weights 版本兼容：vLLM 0.16 的 LLM.update_weights 签名待实测；失败会 warning 降级
-  （引擎用初始权重，破坏 on-policy——报告会明确标注，不静默）。
-- teacher 分布前向 vLLM 数值对齐：_gather_support 的 searchsorted 与 HF gather 等价性
-  需 P1 端到端核对（delta_k 一致性）。
-- compute_disagreement=True 分支的 token_logprobs 仍 HF（计划标注待办，未改）。
+① **权重同步验证仅为静态一致性**（同步协议打通、logits 初步一致）；"扰动测试 + ≥512 位置
+   greedy 逐 token 对比（一致率≥0.99、logit MAE<0.03）" 尚未执行（C1，待服务器恢复）——通过前
+   报告措辞不升级为"权重加载正确"。
+② **base response / 教师模板一致性未验证**：C3 代码已落地（prepare_skywork_responses
+   --apply-chat-template、教师各自模板 Δ_T、cache metadata prompt_format 守卫 C2），
+   但 Qwen3 generation prompt 结尾确认（是否含 thinking 前缀）+ 按模板重生成 base responses +
+   教师模板 Δ_T 重建 + 抽样 decode 校验需服务器恢复后执行。
+③ **单卡共置布局从此不可用**：NCCL 权重同步要求 trainer(rank0) 与 vLLM worker(rank1) 异卡
+   （Duplicate GPU detected），单卡共置必然卡死；4 卡/DP 布局规划须预留互斥物理卡对。
+④ **is_checkpoint_format=True 走完整 load_weights**：TP=1 下官方快路径是 merge_map +
+   param.copy_ 直接拷贝；当前实现每次 update 都调 model.load_weights（is_checkpoint_format），
+   200-step 正式训练前应评估每步同步耗时，必要时切 direct-copy。
 
 ## 8. 是否允许进入下一阶段
 
-本地代码层放行（单测 + 回归绿）；GPU 端到端验证待服务器恢复后执行 P1，届时按验收
-项核对后正式放行。若服务器长期不可达，需用户确认是否换地址/恢复。
+本地代码层放行（单测 + 回归绿）；GPU 端到端验证已跑通（权重同步 + E1/E2 pilot，无 warning）。
+**放行条件（C3 模板启用后）**：C2 守卫已生效（fail-fast）；C3 Step 0（Qwen3 模板结尾确认）+
+  按模板重生成 base responses + 教师各自模板重建 Δ_T + 抽样 decode 校验；C1 扰动/贪心验证通过；
+  模板 pilot 复测满足验收条款（valid_rate≥0.5 / refresh pool≥8 / 附 decode 样本）。
+  本次会话累计 24 笔提交（含本次），关键 3 笔：NCCL 权重同步打通、top_p 对齐、chat template 根因。

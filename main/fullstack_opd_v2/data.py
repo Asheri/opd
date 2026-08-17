@@ -127,7 +127,19 @@ class JsonLinesDataLoader(DataLoader):
                     continue
                 self._raw_prompt_texts.append(p_text)   # C3：存原始文本（未套模板）
                 if self.apply_chat_template:
-                    # Qwen chat 格式：user 角色 + generation prompt（模型才有推理上下文）
+                    # Qwen chat 格式：user 角色 + generation prompt（模型才有推理上下文）。
+                    # C3 截断防护：先估模板串长度，超 P 时先截题干再套模板，保证
+                    # assistant 生成标记不被 max_prompt_len 右截断切掉（否则模型无
+                    # assistant 上下文 → 退化生成，2026-08-18 设计）。
+                    _tpl = tok.apply_chat_template(
+                        [{"role": "user", "content": p_text}],
+                        tokenize=False, add_generation_prompt=True)
+                    if len(tok.encode(_tpl, add_special_tokens=False)) > P:
+                        _cnt_ids = tok.encode(p_text, add_special_tokens=False)
+                        _ovh = (len(tok.encode(_tpl, add_special_tokens=False))
+                                - len(_cnt_ids))
+                        _keep = max(8, P - _ovh)
+                        p_text = tok.decode(_cnt_ids[:_keep])
                     p_text = tok.apply_chat_template(
                         [{"role": "user", "content": p_text}],
                         tokenize=False, add_generation_prompt=True)
@@ -187,6 +199,13 @@ def build_teacher_prompts(raw_texts, tokenizer_path, P: int, device: str = "cpu"
     for t in raw_texts:
         s = tok.apply_chat_template([{"role": role, "content": t}],
                                     tokenize=False, add_generation_prompt=True)
+        # 截断防护（同数据层）：超长时先截题干再套模板，保住生成标记尾部。
+        if len(tok.encode(s, add_special_tokens=False)) > P:
+            _cnt_ids = tok.encode(t, add_special_tokens=False)
+            _ovh = len(tok.encode(s, add_special_tokens=False)) - len(_cnt_ids)
+            t = tok.decode(_cnt_ids[:max(8, P - _ovh)])
+            s = tok.apply_chat_template([{"role": role, "content": t}],
+                                        tokenize=False, add_generation_prompt=True)
         ids = tok.encode(s, add_special_tokens=False, truncation=True,
                          max_length=P)
         ids = ids[:P] + [pad] * max(0, P - len(ids))

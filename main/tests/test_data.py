@@ -94,6 +94,11 @@ def _mock_tokenizer(monkeypatch):
             content = msgs[0]["content"]
             s = "||user:" + content + "||assistant:"
             return s if not tokenize else self.encode(s)
+        def decode(self, ids):
+            # 伪解码：id i → 第 i 个字符（id 与 encode 的 "每字符一个 id" 伪规则一致）
+            import string
+            alphabet = string.printable
+            return "".join(alphabet[i] if i < len(alphabet) else "?" for i in ids)
     monkeypatch.setattr(transformers, "AutoTokenizer", FakeTok)
     return FakeTok
 
@@ -168,6 +173,10 @@ def test_build_teacher_prompts_applies_own_template(monkeypatch):
             if max_length is not None:
                 n = min(n, max_length)
             return list(range(1, n + 1))
+        def decode(self, ids):
+            import string
+            alphabet = string.printable
+            return "".join(alphabet[i] if i < len(alphabet) else "?" for i in ids)
     monkeypatch.setattr(transformers, "AutoTokenizer", FakeTok)
     from fullstack_opd_v2.data import build_teacher_prompts
     out = build_teacher_prompts(["abc"], "teacher-path", P=8)
@@ -175,6 +184,52 @@ def test_build_teacher_prompts_applies_own_template(monkeypatch):
     # "||T:abc||A:" = 11 字符 → 11 ids，截断到 8：前 8 个模板字符 id
     assert out[0].tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
     assert out.dtype == torch.long
+
+
+def test_jsonl_loader_template_truncation_keeps_generation_marker(tmp_path, monkeypatch):
+    """C3/max_prompt_len：✓ 长题干 + 模板 == 先截题干、保留 assistant 生成标记尾部。
+
+    裸右截断会先切模板尾部（无 assistant 上下文 → 退化生成）；内容优先截断保证
+    模板结构完整。用可区分 marker 的 tokenizer 精确断言首尾 id。
+    """
+    import json
+    import transformers
+    U, A = 900, 901      # user 开启 / assistant 生成标记
+
+    class MarkerTok:
+        pad_token = "<pad>"
+        pad_token_id = 0
+        def __init__(self, *a, **k):
+            pass
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return cls()
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+            return chr(U) + msgs[0]["content"] + chr(A)
+        def encode(self, text, add_special_tokens=False, truncation=True,
+                   max_length=None):
+            ids = [U if ch == chr(U) else (A if ch == chr(A) else ord(ch))
+                   for ch in text]
+            if max_length is not None:
+                ids = ids[:max_length]
+            return ids
+        def decode(self, ids):
+            return "".join(chr(i) if i not in (U, A)
+                           else (chr(U) if i == U else chr(A)) for i in ids)
+
+    monkeypatch.setattr(transformers, "AutoTokenizer", MarkerTok)
+    cfg, path = _jsonl_cfg(tmp_path, apply_chat_template=True, max_prompt_len=20)
+    long_q = "abcdefghijklmnopqrstuvwxyz0123"     # 30 字符 > 截断预算
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"prompt": long_q, "response": "rs"}) + "\n")
+    prompts, _, _ = JsonLinesDataLoader(cfg, "cpu").load()
+    row = prompts[0].tolist()
+    assert len(row) == 20
+    assert row[0] == U          # 模板开头保留
+    assert row[-1] == A         # assistant 生成标记保留（未被右截断切掉）
+    assert row[1:9] == [ord(c) for c in "abcdefgh"]   # 题干前段保留
+    assert row[1:-1] == [ord(c) for c in "abcdefghijklmnopqr"]  # 题干截到 18 字符
+    assert row[1] != 0          # 非 pad
 
 
 def test_jsonl_loader_missing_path_raises(monkeypatch):

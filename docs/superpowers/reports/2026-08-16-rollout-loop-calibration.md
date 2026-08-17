@@ -1,5 +1,12 @@
 # Rollout Loop Detector 校准报告（IMP-1）
 
+> ⚠️ **校准作废声明（2026-08-18，C3 模板一致性）**：本报告所有统计均基于**裸 prompt** rollout。
+> 根因定位（2026-08-18）：训练 rollout 一直没套 Qwen chat template → 裸数学题生成乱码+loop；
+> 套模板后（`<|im_start|>user...<|im_start|>assistant`）实测 0 loop、正常推理。因此本报告的
+> loop 率/误报统计在新模板格式下**全部失效（stale）**，`loop_periods/min_len` 需在模板数据上
+> 重新抽样校准（模板下分布更接近正常 CoT，检测器可能可以收紧）。详见
+> `2026-08-17-imp1-rollout-loop-rootcause.md` 修正注记与 `2026-08-18` 会话记录。
+
 > 日期：2026-08-17 ｜ 状态：**已填充实测结论** ｜ 模型：Qwen3-1.7B（服务器实跑）｜ N=100 ｜ max_new=512 ｜ eos_token_id=151645 ｜ temperature=1.0 ｜ 人工标注：无
 
 ## 背景与目标

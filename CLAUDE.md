@@ -159,6 +159,13 @@ vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。L2 �
   `--device cuda:0/1` 分别起进程），而非单卡串行 200 条。
 - **训练 / 建缓存**：batch/样本可分片时优先多卡并行（FSDP / 数据并行）；规模超过单卡内存时
   用多卡分载（如 2×RTX PRO 6000 96GB 双卡）。
+- **NCCL 权重同步布局硬约束（vLLM ≥0.16 WeightTransferEngine）**：trainer(rank0) 与
+  vLLM worker(rank1) **必须落在不同物理 GPU**，否则 NCCL 报 `Duplicate GPU detected`
+  且卡死（2026-08-17 GPU 实测）。因此任何含 vLLM on-policy 权重同步（L2 刷新相位 /
+  训练侧 VLLMRolloutEngine）的布局都必须是**交叉分卡**（E1 训练@GPU0+vLLM@GPU1、
+  E2 反之），单卡共置布局从此不可用；规划 4 卡 / DP 布局时须为每对 (训练, vLLM) 预留
+  两组互斥的物理卡。参考实现：`FullStackOPDv2._weight_transfer_init_16` /
+  `trainer_init`（显式 set_device 训练卡）与 vLLM engine 的 `device` 参数。
 - 决策顺序：先判断任务是否可分片 → 可分片则**优先并行**；只有任务本身有顺序依赖 / 显存或
   通信瓶颈使并行无收益 / 用户显式指定单卡时，才回退单卡，且应说明原因。
 
