@@ -496,3 +496,22 @@ def test_l2_load_cache_loads_teachers_for_refresh(tmp_path):
                     if isinstance(m, dict) and m.get("phase") == "rollout"]
     assert rollout_rows, "L2+load_cache 刷新相位未执行（教师未加载 / 门控仍误跳）"
     assert all(r.get("rollout/n_appended", 0) > 0 for r in rollout_rows)
+
+
+def test_same_card_normalization():
+    from fullstack_opd_v2.pipeline import _same_card
+    assert _same_card("cuda:0", "cuda:0") is True
+    assert _same_card("cuda:0", "cuda:1") is False
+    assert _same_card("cuda", "cuda:0") is True   # "cuda" 归一为当前卡（CPU 测试回落 "0"）
+    assert _same_card("cuda", "cuda:1") is False
+    assert _same_card("cpu", "cuda:1") is False
+
+
+def test_l2_rollout_mem_enough_split_card():
+    """异卡：rollout 卡只要求引擎份额（0.9×96=86.4），不叠加训练侧 25GB。"""
+    from fullstack_opd_v2.pipeline import _l2_rollout_mem_enough
+    # 96GB 卡：引擎 86.4 + 训练 25 = 111.4 > 卡容量，同卡永远失败（符合预期）
+    assert _l2_rollout_mem_enough(94.4, 86.4, 25.0) is False
+    # 异卡 min_free=2.0：86.4+2=88.4 <= 94.4 → 通过
+    assert _l2_rollout_mem_enough(94.4, 86.4, 2.0) is True
+    assert _l2_rollout_mem_enough(85.0, 86.4, 2.0) is False

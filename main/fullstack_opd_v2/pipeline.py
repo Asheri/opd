@@ -317,6 +317,25 @@ def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
 
 
 # ----------------------------- 编排器 -----------------------------
+def _same_card(a: str, b: str) -> bool:
+    """训练卡与 rollout 卡是否同卡（"cuda"/"cuda:0" 按卡号归一）。"""
+    def _idx(x: str) -> str:
+        x = str(x)
+        if x.startswith("cuda") and ":" in x:
+            return x.split(":")[-1]
+        if x == "cuda":
+            return str(torch.cuda.current_device()) if torch.cuda.is_available() else "0"
+        return x
+    return _idx(a) == _idx(b)
+
+
+def _l2_rollout_mem_enough(free_gb: float, eng_gb: float, min_free: float) -> bool:
+    """L2/P2 显存预算：同卡（训练+rollout 共卡）需留训练侧余量 min_free；
+    异卡只需引擎份额（rollout 卡上没有训练驻留，叠加训练余量会假 OOM——
+    96GB 卡 0.9 引擎 + 25GB 训练预留 = 111GB > 卡容量，恒失败）。"""
+    return free_gb >= eng_gb + min_free
+
+
 class FullStackOPDv2:
     def __init__(self, cfg: dict | None = None, device: str = "cpu"):
         self.cfg = {**DEFAULT_CONFIG_V2, **(cfg or {})}
@@ -706,12 +725,16 @@ class FullStackOPDv2:
                     if str(rollout_device).startswith("cuda") and torch.cuda.is_available():
                         _free_gb = torch.cuda.mem_get_info(rollout_device)[0] / 2**30
                         _eng_gb = float(s2cfg.get("rollout_gpu_mem", 0.9)) * 96.0
-                        _min_free = float(s2cfg.get("rollout_min_free_gb", 25.0))
-                        if _free_gb < _eng_gb + _min_free:
+                        # 异卡（train@cuda:0 / rollout@cuda:1）时 rollout 卡无训练驻留，
+                        # 只要求引擎份额；同卡（训练+vLLM 共卡）才叠加训练侧预留。
+                        _min_free = (float(s2cfg.get("rollout_min_free_gb", 25.0))
+                                     if _same_card(self.device, rollout_device) else 2.0)
+                        if not _l2_rollout_mem_enough(_free_gb, _eng_gb, _min_free):
                             raise RuntimeError(
                                 f"[L2] 剩余显存 {_free_gb:.1f}GB < vLLM 引擎预留 "
-                                f"{_eng_gb:.1f}GB + 训练预留 {_min_free}GB；请调低 "
-                                "stage2.rollout_gpu_mem 或减少同卡并发（避免训练中 OOM）。")
+                                f"{_eng_gb:.1f}GB + 预留 {_min_free}GB（同卡训练余量/异卡 "
+                                "仅引擎）；请调低 stage2.rollout_gpu_mem 或减少同卡并发"
+                                "（避免训练中 OOM）。")
                     rollout_engine = VLLMRolloutEngine(
                         # rollout 模型默认回落 student_path（on-policy 同构）；
                         # rollout_model 显式覆盖仅作诊断用。
