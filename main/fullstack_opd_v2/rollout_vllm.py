@@ -529,7 +529,8 @@ class VLLMRolloutEngine:
                              pad_id: int = 0, loop_detection: bool = True,
                              loop_periods=(2, 3, 4),
                              repetition_penalty: float = 1.0,
-                             loop_min_len: int = 8) -> dict:
+                             loop_min_len: int = 8,
+                             top_p: float = 1.0) -> dict:
         """Stage 2：短预算 rollout（vLLM）——SamplingParams 定 max_new/eos，经
         parse_vllm_outputs 得 status，responses 变长右 pad 到 max_new。
 
@@ -542,7 +543,11 @@ class VLLMRolloutEngine:
         # 改用 stop_token_ids=[eos]：vLLM 在即将生成 eos 时提前停（stop token 不入输出），
         # parse_vllm_outputs 按 finish_reason="stop" 恢复 toy 语义（eos 位置=len、length=len+1
         # 并在 generate_with_status 补写 eos token）。Qwen3+短预算实际 eos≈0，多为 budget_stop。
-        _sp_kw = dict(temperature=max(temperature, 1e-6), top_p=0.9,
+        # top_p 默认 1.0（纯温度采样，与 HF generate_with_status 一致）——此前硬编码
+        # 0.9 的 nucleus 截断更贪婪，Qwen3+短预算下 loop 率显著升高（2026-08-17 实测
+        # vLLM 6/8 vs HF 0/8）。可配置覆盖。
+        _sp_kw = dict(temperature=max(temperature, 1e-6),
+                      top_p=float(top_p),
                       max_tokens=max_new,
                       repetition_penalty=max(float(repetition_penalty), 1.0))
         if eos_token_id is not None:
