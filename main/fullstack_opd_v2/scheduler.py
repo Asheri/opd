@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 
 import torch
 
-from .buffer import StalenessQueue, WeightStore
+from .buffer import StalenessQueue, WeightStore, _MIN_QUEUE_SIZE
 from .losses import pg_loss, low_var_kl, low_var_kl_support, expected_reward
 from .model import CausalToyLM, response_dists
 
@@ -135,7 +136,12 @@ class AsyncBatchedScheduler:
         # colocated CPU offload 钩子（L6）：rollout 阶段把 learner 权重换出到 CPU
         self.offload_to_cpu = bool(cfg.get("offload_to_cpu", False))
 
-        self.staleness_q = StalenessQueue(cfg.get("staleness_threshold", 4))
+        # IMP-2/P1 显存：staleness_q 深度可配（默认 16）。真实词表下在途 s_old 稠密
+        # (B,T,V) 大张量，槽位越多峰值显存越高；显存受限时用
+        # --set stage2.staleness_queue_min=2 收紧（会降低异步流水深度，不影响损失）。
+        self.staleness_q = StalenessQueue(
+            cfg.get("staleness_threshold", 4),
+            min_queue_size=int(cfg.get("staleness_queue_min", _MIN_QUEUE_SIZE)))
         # G5（§2 Q4 契约）：base 池样本是否跳过消费侧陈旧度截断。base 的 s_old 由
         # RolloutCollector 每次用当前权重重算、天然带新版本（恒新），截断从不误触发；
         # L2 交替相位把此标志置 False 显式落实「base 跳过、仅 refresh 受截断」契约。
@@ -153,6 +159,7 @@ class AsyncBatchedScheduler:
         self._n_dropped_qfull = 0    # 队列满丢弃数（rollout→scorer 或 scorer→staleness_q）
         self._rollout_idle = 0.0     # RolloutCollector 累计空转秒
         self._scorer_idle = 0.0      # TeacherScorer 累计空转秒
+        self._qfull_streak = 0       # I4：连续队满次数（自适应背压，不丢成品）
 
         # 优化器 + 超参提升为实例属性，供 _train_step 在两种调度器间复用
         self.kl_coef = cfg.get("kl_reg_coef", 0.05)
@@ -266,9 +273,13 @@ class AsyncBatchedScheduler:
                     s_old = s_old.to(self.dtype)
             try:
                 self._rq.put((idxs, s_old, self._loaded_ver), timeout=_PUT_TIMEOUT)
+                self._qfull_streak = 0
             except queue.Full:
-                self._rollout_idle += 0.5      # 因队列满等待 0.5s
-                self._n_dropped_qfull += 1     # M5：已算完的 rollout 因队满被丢弃
+                # I4：队满时自适应退避（连续队满 → 指数加长 sleep），不丢弃已算完的
+                # 成品 s_old（此前直接丢，积压期训练饿死+算力浪费）。
+                self._rollout_idle += 0.5
+                self._qfull_streak += 1
+                time.sleep(min(0.1 * self._qfull_streak, 2.0))
                 continue
 
     def _ref_logp_at_student_topk(self, idxs: torch.Tensor,
@@ -555,14 +566,18 @@ class AsyncBatchedScheduler:
             if on_step is not None:
                 try:
                     on_step(m)
-                except Exception:
-                    pass
+                except Exception as e:         # I3
+                    import logging
+                    logging.getLogger(__name__).warning(f"refresh on_step 回调异常：{e}")
             done += 1
             completed += 1
         return completed
 
     def _train_dispatcher(self, n_steps: int, on_step=None, start_step: int = 0):
         done = start_step
+        # C2：无进度 watchdog——线程活着但永不产出的“挂住”（如 vLLM IPC 死锁）也快速失败。
+        stall_timeout = float(self.cfg.get("rollout_stall_timeout", 900))
+        last_progress = time.monotonic()
         while done < start_step + n_steps:
             # 快速失败：任一 worker 线程死亡（异常）立即抛出，不空等（避免 GPU 0%）。
             with self._err_lock:
@@ -571,6 +586,10 @@ class AsyncBatchedScheduler:
                         "worker 线程异常（训练中止，避免空等）："
                         f"{type(self._thread_error).__name__}: {self._thread_error}") \
                         from self._thread_error
+            if time.monotonic() - last_progress > stall_timeout:
+                raise RuntimeError(
+                    f"rollout 停滞：{stall_timeout:.0f}s 无成功训练步"
+                    "（生产者在排队/IPC 上挂住；请查 collector/scorer 线程）")
             try:
                 (idxs, s_old, delta), ver, _ = self.staleness_q.get(timeout=_DISPATCH_GET_TIMEOUT)
             except queue.Empty:
@@ -579,12 +598,14 @@ class AsyncBatchedScheduler:
             if m is None:
                 self._n_dropped_consume += 1   # 消费侧因过旧丢弃
                 continue
+            last_progress = time.monotonic()
             self.metrics.append(m)
             if on_step is not None:            # T8：每成功一步回调（checkpoint/metrics 用）
                 try:
                     on_step(m)
-                except Exception:
-                    pass                       # 回调异常不影响训练
+                except Exception as e:         # I3：回调异常不得静默吞（至少告警）
+                    import logging
+                    logging.getLogger(__name__).warning(f"on_step 回调异常（训练继续）：{e}")
             done += 1
         self.stop.set()
 
@@ -594,11 +615,15 @@ class AsyncBatchedScheduler:
         self._rq: "queue.Queue" = queue.Queue(maxsize=self.cfg.get("queue_size", 8))
 
         def _guard(fn):
-            """把线程目标包一层：异常 → 记录 + 停其他线程（让主循环快速失败）。"""
+            """把线程目标包一层：异常 → 记录 + 停其他线程（让主循环快速失败）。
+
+            C1：捕获 BaseException 而非 Exception——SystemExit/KeyboardInterrupt 等
+            异常也可能出现在 worker 线程（vLLM/底层库），漏捕即永久 0% 空等。
+            """
             def _wrapped(*a, **k):
                 try:
                     fn(*a, **k)
-                except Exception as e:          # noqa: BLE001 —— 必须捕获全部线程异常
+                except BaseException as e:      # noqa: BLE001 —— 必须捕获全部线程异常
                     with self._err_lock:
                         if self._thread_error is None:
                             self._thread_error = e
@@ -809,8 +834,11 @@ class _RayRolloutWorkerImpl:
             self._param_buf = CausalToyLM(vocab=vocab, d_model=d_model,
                                           n_layers=n_layers).to(device)
             self.worker = VLLMRolloutEngine(
-                model=cfg.get("rollout_model", "Qwen/Qwen2.5-7B"),
-                tp_size=int(cfg.get("rollout_tp_size", 2)),
+                # C4：与主路径对齐——model 回落 student_path（HF 离线不联网下载）、
+                # tp 默认 1（单卡放置；多卡 TP 显式配置）。
+                model=(cfg.get("rollout_model") or cfg.get("student_path")
+                       or "Qwen/Qwen2.5-7B"),
+                tp_size=int(cfg.get("rollout_tp_size", 1)),
                 dtype=cfg.get("rollout_dtype", "auto"),
                 vocab_size=vocab,
                 full_logprobs_cap=int(cfg.get("rollout_logprobs_cap", 4096)),

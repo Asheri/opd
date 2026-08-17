@@ -108,13 +108,19 @@ def main() -> None:
             from fullstack_opd_v2.pipeline import FullStackOPDv2
             out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d)
             metrics = out["metrics"]
+            # M3：均值只统计【含该键】的训练步 metric——rollout 相位 metric 缺键时
+            # 旧实现 m.get(k, 0.0) 会往 reward/pg/kl 均值里混入大量 0，污染口径。
+            def _keyed_mean(key):
+                vals = [m[key] for m in metrics
+                        if isinstance(m, dict) and key in m]
+                return _mean(vals)
             summary = {
                 "experiment": name,
                 "n_steps": sum(1 for m in metrics
                                if isinstance(m, dict) and m.get("phase") != "rollout"),
-                "reward_mean": (_mean([m.get("reward", 0.0) for m in metrics]) if metrics else 0.0),
-                "pg_loss_mean": (_mean([m.get("pg_loss", 0.0) for m in metrics]) if metrics else 0.0),
-                "kl_loss_mean": (_mean([m.get("kl_loss", 0.0) for m in metrics]) if metrics else 0.0),
+                "reward_mean": _keyed_mean("reward"),
+                "pg_loss_mean": _keyed_mean("pg_loss"),
+                "kl_loss_mean": _keyed_mean("kl_loss"),
                 "total_s": round(out["timings"].get("total", 0.0), 3),
             }
             # rollout 状态计数（最后一个 refresh 相位）

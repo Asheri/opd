@@ -18,9 +18,13 @@ _MIN_QUEUE_SIZE = 16
 class StalenessQueue:
     """有界 FIFO + 版本号。入队侧截断过旧样本，消费侧再截一次（双保险）。"""
 
-    def __init__(self, staleness_threshold: int = 8):
+    def __init__(self, staleness_threshold: int = 8, min_queue_size: int | None = None):
         self.threshold = staleness_threshold
-        self._q: "queue.Queue" = queue.Queue(maxsize=max(_MIN_QUEUE_SIZE, staleness_threshold * 2))
+        # IMP-2/P1：min_queue_size 可配（默认 16）。真实词表下在途 s_old 是稠密
+        # (B,T,V=151936) 大张量，16 槽 × batch2×2.5GB ≈ 60GB 直接撑爆单卡；pilot/
+        # 生产可按显存收紧（如 2）以控制峰值（详见调度器构造处注释）。
+        _ms = int(_MIN_QUEUE_SIZE if min_queue_size is None else min_queue_size)
+        self._q: "queue.Queue" = queue.Queue(maxsize=max(_ms, staleness_threshold * 2))
         self._cur_version = 0
         self._lock = threading.Lock()
         self.n_rejected = 0          # P2-1：入队侧因过旧拒绝的样本数（只观测）

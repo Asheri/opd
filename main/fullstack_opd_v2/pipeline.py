@@ -869,9 +869,20 @@ class FullStackOPDv2:
                             # toy（rollout_engine=None）跳过，零回归。
                             if rollout_engine is not None and hasattr(rollout_engine, "update_weights"):
                                 try:
-                                    rollout_engine.update_weights(student.state_dict())
+                                    _ok = rollout_engine.update_weights(student.state_dict())
                                 except Exception as e:
                                     logger.warning(f"[L2] vLLM 权重同步失败（继续用引擎现有权重）：{e}")
+                                    _ok = False
+                                # I1：同步未通（如 vLLM>=0.16 尚未接入
+                                # WeightTransferEngine）不再静默——记录指标；
+                                # 配置 l2.rollout.require_weight_sync=true 时直接中止
+                                # （避免正式训练静默违约 on-policy）。
+                                if _ok is False:
+                                    mr.record({"rollout/weight_sync_failed": 1})
+                                    if (l2_cfg.get("rollout") or {}).get("require_weight_sync", False):
+                                        raise RuntimeError(
+                                            "[L2] update_weights 返回 False（权重同步未通）；"
+                                            "l2.rollout.require_weight_sync=true 已中止训练。")
                             # IMP-2/P0：s_old 分布引擎用当前 student 权重（on-policy）
                             if dist_engines and dist_engines.get("s_old") is not None:
                                 try:

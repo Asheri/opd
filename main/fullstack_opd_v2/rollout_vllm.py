@@ -51,6 +51,25 @@ def vllm_available() -> bool:
     return _VLLM_AVAILABLE
 
 
+# C3：进程级活跃引擎注册表 + atexit 兜底——实验失败/kill 主进程时强制关闭
+# vLLM V1 的 EngineCore 子进程（实测残留 ~40GB/卡，会卡死下一次引擎构建）。
+_ACTIVE_ENGINES: list["VLLMRolloutEngine"] = []
+_atexit_registered = False
+
+
+def _shutdown_all_engines() -> None:
+    for eng in list(_ACTIVE_ENGINES):
+        try:
+            eng.shutdown()
+        except Exception:          # noqa: BLE001 —— 清理路径绝不抛
+            pass
+    _ACTIVE_ENGINES.clear()
+
+
+import atexit
+atexit.register(_shutdown_all_engines)
+
+
 class VLLMRolloutEngine:
     """vLLM 包成的 rollout 引擎，接口对齐 model.response_dists。
 
@@ -95,6 +114,47 @@ class VLLMRolloutEngine:
             except Exception as e:   # pragma: no cover
                 raise RuntimeError(
                     "无法从 vLLM engine 推断词表大小，请显式传入 vocab_size=。") from e
+        # C5：vocab 交叉验证——错误 vocab 在构造期必须立即失败（否则训练线程深处
+        # out[idx] 才 IndexError，且落在 worker 线程 → 0% 空等）。fake/无 engine 时跳过。
+        try:
+            _real_vocab = int(self.llm.llm_engine.model_config.get_vocab_size())
+        except Exception:          # noqa: BLE001 —— 单测 fake LLM 无该属性
+            _real_vocab = None
+        if _real_vocab is not None and self.vocab_size != _real_vocab:
+            raise ValueError(
+                f"vocab_size 交叉校验失败：传入 {self.vocab_size} ≠ vLLM 引擎真实词表 "
+                f"{_real_vocab}。HF 路径应传 student.vocab（model.config.vocab_size），"
+                "toy 的 cfg['vocab_size']=64 会在此处被拦截。")
+        # C3：注册进进程级清理表
+        _ACTIVE_ENGINES.append(self)
+
+    # --------------------------- 清理 ---------------------------
+    def shutdown(self) -> None:
+        """关闭 vLLM 引擎，避免 EngineCore 子进程残留（实测 ~40GB/卡）。
+
+        vLLM V1 的 EngineCore 是独立进程；主进程 kill 不会带走它。
+        多版本适配：先试 LLM.shutdown()（>=0.16），再尝试
+        engine 层 API；都失败时通知注册表移除即可
+        （atexit 盘点）。可重入，无双次关闭副作用。
+        """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        try:
+            if self.llm is not None and hasattr(self.llm, "shutdown"):
+                self.llm.shutdown()
+                return
+        except Exception as e:     # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning(f"vLLM shutdown 第一路失败：{e}")
+        try:
+            me = self.llm.llm_engine
+            if hasattr(me, "shutdown"):
+                me.shutdown()
+                return
+        except Exception as e:     # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning(f"vLLM shutdown 第二路失败：{e}")
 
     # --------------------------- generate 版本兼容 ---------------------------
     def _generate(self, seqs, sampling):
@@ -232,6 +292,10 @@ class VLLMRolloutEngine:
         for b, o in enumerate(outs):
             plp = o.prompt_logprobs
             for t in range(T):
+                if P + t >= len(plp):
+                    raise RuntimeError(
+                        "vLLM prompt_logprobs 长度不足（chunked-prefill/首 token None 版本差异）："
+                        f"P+t={P + t} >= len(plp)={len(plp)}；请升级/降级对齐 vLLM 版本或降 context。")
                 d = plp[P + t]
                 if not d:
                     continue
@@ -256,6 +320,14 @@ class VLLMRolloutEngine:
         B, P = prompts.shape
         T = responses.size(1)
         V = self.vocab_size
+        # I2：真实词表禁用稠密重建路径（(B,T,V) 在 V=151936、T=4096 下 ~2.5GB/批，
+        # vLLM 逐 token prompt_logprobs 重建慢 ~50s/样本；应走 response_dists_topk）。
+        if V > self.full_cap:
+            raise RuntimeError(
+                f"response_dists 稠密重建路径仅支持小词表 "
+                f"(V={V} > full_logprobs_cap={self.full_cap})；请改用 "
+                "response_dists_topk（稀疏 (B,T,K)）。这是架构约束，"
+                "不是可以忽略的性能警告。")
         k = V if V <= self.full_cap else self.full_cap
         sampling = SamplingParams(temperature=0.0, prompt_logprobs=k, logprobs=0)
         seqs = self._prompt_seq(prompts, responses)
@@ -267,6 +339,10 @@ class VLLMRolloutEngine:
         for b, o in enumerate(outs):
             plp = o.prompt_logprobs
             for t in range(T):
+                if P + t >= len(plp):
+                    raise RuntimeError(
+                        "vLLM prompt_logprobs 长度不足："
+                        f"P+t={P + t} >= len(plp)={len(plp)}；请对齐 vLLM 版本。")
                 d = plp[P + t]
                 if not d:
                     continue
@@ -298,6 +374,10 @@ class VLLMRolloutEngine:
         for b, o in enumerate(outs):
             plp = o.prompt_logprobs
             for t in range(T):
+                if P + t >= len(plp):
+                    raise RuntimeError(
+                        "vLLM prompt_logprobs 长度不足："
+                        f"P+t={P + t} >= len(plp)={len(plp)}；请对齐 vLLM 版本。")
                 d = plp[P + t]
                 if not d:
                     continue
