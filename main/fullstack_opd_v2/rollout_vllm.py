@@ -314,6 +314,13 @@ class VLLMRolloutEngine:
         故：后台线程 trainer_send_weights（顺序=state_dict.items()，与 update_info.names
         同序），主线程同步调用 llm.update_weights(update_info)。is_checkpoint_format=True
         → worker 用 model.load_weights（自动处理 HF→vLLM 合并层 qkv/gate_up 映射）。
+
+        P0 修复（2026-08-18 C1 实测）：vLLM>=0.16 的 layerwise reload（initialize→
+        load_weights→finalize）把层参数先移到 meta、缓存权重、再【异步】拷回原存储。
+        变更后的【第一次】同步只部分生效（~3% logp 残留上一步权重，实测 0.036 均值）；
+        第二次相同同步后才精确收敛（0.000000）。训练每步只同步一次 → rollout 走的是
+        部分旧权重（off-policy）。解决：同权重双发（第二发强制收敛），~200ms/步
+        （1.7B bf16 全量 NCCL），可接受。重度优化：TP=1 时改 param.copy_ 直拷可省。
         """
         import threading
         self._weight_transfer_init_16()
@@ -346,6 +353,31 @@ class VLLMRolloutEngine:
             t.join(timeout=float(getattr(self, "_wt_timeout", 120.0)) + 30)
         if err:
             raise RuntimeError(f"vLLM NCCL 权重广播失败：{err[0]}")
+        if getattr(self, "_wt_double_send", True):
+            # P0 收敛修复：worker 端 layerwise reload 的异步拷回使「变更后首次同步」只部分
+            # 生效（实测 ~3% logp 残留）。同权重再发一次强制收敛（实测第二次精确 0.000000）。
+            # 关闭逃生舱：_wt_double_send=False（不推荐，训练会 off-policy）。
+            update_info2 = _build_nccl_update_info(sd_dev)
+            err2: list[Exception] = []
+
+            def _send2():
+                try:
+                    NCCLWeightTransferEngine.trainer_send_weights(
+                        iter(sd_dev.items()), self._wt_group,
+                        stream=torch.cuda.current_stream())
+                except Exception as e:  # noqa: BLE001
+                    err2.append(e)
+
+            t2 = threading.Thread(target=_send2, daemon=True)
+            t2.start()
+            try:
+                self.llm.llm_engine.collective_rpc(
+                    "update_weights", timeout=float(getattr(self, "_wt_timeout", 120.0)),
+                    kwargs={"update_info": update_info2})
+            finally:
+                t2.join(timeout=float(getattr(self, "_wt_timeout", 120.0)) + 30)
+            if err2:
+                raise RuntimeError(f"vLLM NCCL 权重广播失败（第 2 发）：{err2[0]}")
         return True
 
     def update_weights_from_flat(self, tensors: list) -> bool:
