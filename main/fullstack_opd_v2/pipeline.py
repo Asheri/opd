@@ -636,7 +636,11 @@ class FullStackOPDv2:
                     # 每次 rollout 相位前 update_weights 同步（on-policy）。
                     rollout_device = s2cfg.get("rollout_device", "cuda:1")
                     rollout_engine = VLLMRolloutEngine(
-                        model=s2cfg.get("rollout_model", "Qwen/Qwen2.5-7B"),
+                        # rollout 模型默认回落 student_path（on-policy 同构）；
+                        # rollout_model 显式覆盖仅作诊断用。
+                        model=(s2cfg.get("rollout_model")
+                               or self.cfg.get("student_path")
+                               or "Qwen/Qwen2.5-7B"),
                         tp_size=int(s2cfg.get("rollout_tp_size", 1)),
                         dtype=s2cfg.get("rollout_dtype", "auto"),
                         # 显存占比/上下文上限可配（默认 0.9/2048 不变）；双卡并行实验

@@ -100,15 +100,41 @@ class VLLMRolloutEngine:
     def update_weights(self, state_dict: dict) -> bool:
         """把 learner 的新权重推入 vLLM（取代线程版 load_state_dict）。
 
-        版本差异：
-          - vLLM >= 0.6 : LLM.update_weights(weights)
-          - 旧版        : llm.llm_engine.model_executor.model.load_weights(weights)
-        离线 demo 不调用；上线按实际版本调整。返回是否成功。
+        版本适配（按顺序探测）：
+          - vLLM 0.6~0.1x : LLM.update_weights(weights) —— 直接推 state_dict；
+          - vLLM >= 0.16  : LLM.update_weights(request: WeightTransferUpdateRequest)
+            改为 NCCL WeightTransferEngine 协议（init_weight_transfer_engine +
+            update），且需 HF→vLLM 合并层名称映射（qkv_proj/gate_up_proj）——
+            未接入前本方法警告一次并返回 False（rollout 用引擎现有权重，
+            即初始策略；短 pilot 影响可忽略，正式训练前必须接入）；
+          - 旧版 v0      : llm.llm_engine.model_executor.model.load_weights。
+        返回 True=同步成功；False=版本不支持（已警告）。
         """
-        try:
-            if hasattr(self.llm, "update_weights"):
+        if hasattr(self.llm, "update_weights"):
+            import inspect
+            try:
+                _params = list(inspect.signature(
+                    self.llm.update_weights).parameters.values())
+            except (TypeError, ValueError):  # pragma: no cover
+                _params = []
+            if _params and _params[0].name == "request":
+                # vLLM >= 0.16：request-style WeightTransferEngine API。
+                if not getattr(self, "_wt_warned", False):
+                    self._wt_warned = True
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "vLLM>=0.16 权重同步需 NCCL WeightTransferEngine"
+                        "（init+update 协议 + HF→vLLM 合并层名称映射），尚未接入；"
+                        "rollout 将用引擎现有权重（初始策略）。正式训练前必须接入。")
+                return False
+            try:
                 self.llm.update_weights(state_dict)
                 return True
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError(
+                    "vLLM 权重同步失败：请按你的 vLLM 版本调整 update_weights "
+                    f"（>=0.6 用 LLM.update_weights）。底层错误：{e}")
+        try:
             me = self.llm.llm_engine.model_executor.model
             me.load_weights(state_dict.items())
             return True
