@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n", type=int, default=32, help="采样条数")
     p.add_argument("--max-new", type=int, default=512, help="每 rollout 生成上限")
     p.add_argument("--eos-id", type=int, default=None, help="显式 eos 采样（None=不判 EOS）")
+    p.add_argument("--chat", action="store_true",
+                   help="prompt 套 Qwen chat template（C3 模板口径；旧校准裸 prompt 已 stale）")
+    p.add_argument("--temperature", type=float, default=0.7,
+                   help="采样温度（对齐 l2.rollout.temperature，默认为 E1/E2 口径）")
+    p.add_argument("--repetition-penalty", dest="repetition_penalty", type=float,
+                   default=1.0, help="repetition penalty（C3 三件套回退 1.0）")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", type=Path, default=None,
@@ -302,13 +308,21 @@ def main() -> None:
     t0 = time.time()
     for start in range(0, len(sample), args.batch_size):
         bs = sample[start:start + args.batch_size]
+        # C3 模板口径：--chat 时 prompt 先套 Qwen chat template（add_generation_prompt），
+        # 与 rollout_vllm/训练 rollout 完全同源；旧校准裸 prompt 已标注 stale。
+        if args.chat:
+            bs = [tok.apply_chat_template(
+                [{"role": "user", "content": s}],
+                tokenize=False, add_generation_prompt=True) for s in bs]
         enc = tok(bs, return_tensors="pt", padding=True, truncation=True,
                   max_length=1024).to(args.device)
         seq_len = enc["input_ids"].size(1)
         with torch.no_grad():
             out = model.generate(
                 **enc, max_new_tokens=args.max_new, do_sample=True,
-                temperature=1.0, top_p=0.95, num_return_sequences=1,
+                temperature=args.temperature, top_p=0.95,
+                repetition_penalty=args.repetition_penalty,
+                num_return_sequences=1,
                 pad_token_id=tok.pad_token_id,
                 eos_token_id=eos)          # eos=None → HF 用模型默认 eos（会自然停）
         for j in range(out.size(0)):
@@ -354,7 +368,9 @@ def main() -> None:
               f"rate={r['loop_rate']:.3f} FP_rate={fp} FN_cases={fn}", flush=True)
     if args.report is not None:
         meta = {"n": report["n"], "max_new": args.max_new, "model": str(args.model),
-                "eos_token_id": report["eos_tok"], "date": "2026-08-16",
+                "eos_token_id": report["eos_tok"], "date": "2026-08-18",
+                "chat": args.chat, "temperature": args.temperature,
+                "repetition_penalty": args.repetition_penalty,
                 "status": ("已填充" if all_new else "待服务器真实 rollout 数据填充"),
                 "labels_available": labels is not None}
         text = write_calibration_report(sweep, args.report, meta)
