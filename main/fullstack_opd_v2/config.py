@@ -269,6 +269,11 @@ class DatasetCfg(_Strict):
     max_prompt_len: int = 256
     max_response_len: int = 384
     tokenizer_path: str | None = None
+    # C3（2026-08-18）：prompt 先套模型 chat template（Qwen3 <|im_start|> 格式）再编码。
+    # 裸数学题 prompt 下 Qwen3 生成乱码+loop（2026-08-18 GPU 实测根因）；开启后必须用
+    # 同配置重建 teacher cache——cache metadata 落 prompt_format=chat，
+    # verify_consistency 对裸 cache 配模板配置 fail-fast（C2 守卫）。
+    apply_chat_template: bool = False
     # Stage 0 规模概念（50K prompt universe + materialized 静态锚点，见 base.materialized_size）：
     # prompt 池总规模（50K）。实际训练只读到「有 response 的」行（JsonLinesDataLoader 跳过
     # 空 response 行），其余 prompt 留空待 L2 在线 refresh。本字段仅作数据规模声明，不接算法。

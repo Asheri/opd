@@ -215,6 +215,14 @@ def test_l2_cfg_unknown_key_rejected():
         load_config(overrides=["l2.bogus=1"])
 
 
+def test_dataset_apply_chat_template_override():
+    """C3：dataset.apply_chat_template 可经 --set 覆盖（schema 声明，extra=forbid 不拒）。"""
+    cfg = load_config(None, overrides=["dataset.apply_chat_template=true"])
+    assert cfg["dataset"]["apply_chat_template"] is True
+    cfg2 = load_config(None)
+    assert cfg2["dataset"]["apply_chat_template"] is False
+
+
 def test_l2_cfg_enable_via_override():
     """点分覆盖可开 L2 + 传子键（E0-E6 矩阵按此生成）。"""
     from fullstack_opd_v2.config import load_config
