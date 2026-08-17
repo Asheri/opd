@@ -92,6 +92,47 @@ def test_cli_cache_end_to_end(tmp_path, capsys):
     assert os.path.isfile(out)
 
 
+def test_cli_cache_injects_topk_storage_prompt_format(tmp_path, monkeypatch):
+    """P-回归（2026-08-18 GPU OOM）：_cmd_cache 必须把顶层 cache.top_k 注入 s1cfg，
+    storage/prompt_format 与 TrainPipeline 解析一致；否则真实词表走 dense (N,T,V) OOM。"""
+    import fullstack_opd_v2.cli as cli_mod
+    import fullstack_opd_v2.pipeline as pipe_mod  # _cmd_cache 内局部 import 从这里取
+
+    captured = {}
+
+    def fake_build(prompts, responses, teacher_rl, teacher_ref, cfg, **kw):
+        captured["s1cfg"] = dict(cfg)
+        captured["storage"] = kw.get("storage")
+        captured["prompt_format"] = kw.get("prompt_format")
+
+        class FakeCache:
+            def __init__(self, path):
+                self._path = path
+
+            def save(self, path, prompts=None, responses=None):
+                pass
+
+        return FakeCache(cfg.get("cache_path")), prompts, responses
+
+    monkeypatch.setattr(pipe_mod, "stage1_build_cache", fake_build)
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "n_prompts: 8\n"
+        "cache_mode: topk\n"
+        "cache:\n  top_k: 256\n  storage: disk\n"
+        "stage0:\n  n_rl_steps: 2\n"
+        "stage2:\n  n_steps: 2\n  batch_size: 4\n"
+        f"stage1:\n  cache_path: {tmp_path / 'c.pt'}\n",
+        encoding="utf-8")
+    out = str(tmp_path / "out.pt")
+    rc = cli_mod.main(["cache", "--config", str(cfg), "--out", out, "--device", "cpu"])
+    assert rc == 0
+    assert captured["s1cfg"]["top_k_teacher"] == 256
+    assert captured["s1cfg"]["cache_path"] == out
+    assert captured["storage"] == "disk"
+    assert captured["prompt_format"] == "raw"
+
+
 def test_no_args_requires_subcommand(capsys):
     # 无参调用：add_subparsers(required=True) 由 argparse 直接 SystemExit(2)
     with pytest.raises(SystemExit) as e:
