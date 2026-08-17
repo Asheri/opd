@@ -66,6 +66,7 @@ def _cmd_train(args) -> int:
 
 
 def _cmd_cache(args) -> int:
+    from .cache_store import hash_models_from_cfg
     from .model_factory import build_model
     from .pipeline import FullStackOPDv2, _teacher_format_prompts, stage1_build_cache
 
@@ -96,6 +97,7 @@ def _cmd_cache(args) -> int:
         opd.prompts, opd.responses, teacher_rl, teacher_ref, s1cfg,
         warmup_student=warmup_student,
         storage=storage,
+        hashes=hash_models_from_cfg(cfg),
         pad_id=int((cfg.get("dataset") or {}).get("pad_id", 0)),
         prompt_format=("chat" if bool((cfg.get("dataset") or {}).get(
             "apply_chat_template", False)) else "raw"),

@@ -104,6 +104,7 @@ def test_cli_cache_injects_topk_storage_prompt_format(tmp_path, monkeypatch):
         captured["s1cfg"] = dict(cfg)
         captured["storage"] = kw.get("storage")
         captured["prompt_format"] = kw.get("prompt_format")
+        captured["hashes"] = kw.get("hashes")
 
         class FakeCache:
             def __init__(self, path):
@@ -131,6 +132,7 @@ def test_cli_cache_injects_topk_storage_prompt_format(tmp_path, monkeypatch):
     assert captured["s1cfg"]["cache_path"] == out
     assert captured["storage"] == "disk"
     assert captured["prompt_format"] == "raw"
+    assert captured["hashes"] and captured["hashes"].get("tokenizer_hash")
 
 
 def test_no_args_requires_subcommand(capsys):
