@@ -146,18 +146,24 @@ class VLLMRolloutEngine:
         return full.tolist()
 
     def response_dists_topk(self, prompts: torch.Tensor,
-                            responses: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                            responses: torch.Tensor,
+                            K: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """(B,P),(B,T) -> (ids, logps)，形状各 (B,T,K)。GPU 路径主接口（稀疏）。
 
         把 vLLM 的 prompt_logprobs 稀疏 dict 直接拍平成 (B,T,K) 的 (ids, logps)，
         不重建 dense (B,T,V)。返回的 ids 恰好对接 cache 的 searchsorted 支撑匹配。
+        K：可选，限制返回 top-K（每槽按 logprob 降序，第 0 位最高概率）；None → full_cap。
+        IMP-2/P0：vLLM logprobs dict 迭代顺序不保证按 logprob 排序，这里显式降序排序，
+        保证按 K 截断 = 精确 top-K（否则 searchsorted 匹配/支撑语义错乱）。
         """
         prompts = prompts.detach()
         responses = responses.detach()
         B, P = prompts.shape
         T = responses.size(1)
         V = self.vocab_size
-        k = V if V <= self.full_cap else self.full_cap
+        _cap = V if V <= self.full_cap else self.full_cap
+        k = min(int(K), _cap) if K is not None else _cap
+        k = max(1, k)
         sampling = SamplingParams(temperature=0.0, prompt_logprobs=k, logprobs=0)
         seqs = self._prompt_seq(prompts, responses)
         outs = self.llm.generate(prompt_token_ids=seqs, sampling_params=sampling)
@@ -175,6 +181,8 @@ class VLLMRolloutEngine:
                 if not d:
                     continue
                 items = list(d.items())
+                # 按 logprob 降序（vLLM dict 迭代顺序不保证有序）
+                items.sort(key=lambda kv: kv[1].logprob, reverse=True)
                 ids[b, t, :len(items)] = torch.tensor([int(tid) for tid, _ in items],
                                                       dtype=torch.long)
                 lps[b, t, :len(items)] = torch.tensor([v.logprob for _, v in items],

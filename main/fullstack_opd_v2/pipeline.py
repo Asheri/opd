@@ -627,6 +627,7 @@ class FullStackOPDv2:
             else:
                 # L3 vLLM rollout：单进程下在此构建引擎并注入 scheduler；"toy" 则不注入。
                 rollout_engine = None
+                dist_engines: dict | None = None   # IMP-2/P0：rollout 相位分布引擎 {s_old,rl,ref,ref_anchor}
                 if s2cfg.get("rollout_engine") == "vllm":
                     from .rollout_vllm import VLLMRolloutEngine
                     # L3/IMP-2：rollout vLLM 引擎放独立卡（rollout_device，默认 cuda:1），
@@ -641,6 +642,32 @@ class FullStackOPDv2:
                         vocab_size=vocab,
                         full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
                         device=rollout_device)
+                    # IMP-2/P0：rollout 相位 4 个分布前向（s_old/rl/ref/ref_anchor）切 vLLM
+                    # （workflow-runner 计划）。可配置 l2.rollout.dist_engines（默认 false）；
+                    # 各引擎低 gpu_memory_utilization 共存于 rollout_device（4×~0.25≤1.0）。
+                    # s_old 引擎每次 rollout 前同步 student 权重（on-policy）；ref_anchor 保持
+                    # 初始 student（不同步）；rl/ref 用 teacher。None → run_refresh_phase 走
+                    # HF per-chunk（零回归）。
+                    _l2roll = (self.cfg.get("l2") or {}).get("rollout") or {}
+                    if _l2roll.get("dist_engines", False):
+                        dist_engines = {}
+                        _de_specs = [
+                            ("s_old", s2cfg.get("rollout_model") or self.cfg.get("student_path")),
+                            ("rl", self.cfg.get("teacher_rl_path")),
+                            ("ref", self.cfg.get("teacher_ref_path")),
+                            ("ref_anchor", self.cfg.get("student_path")),
+                        ]
+                        for _k, _mp in _de_specs:
+                            if _mp:
+                                dist_engines[_k] = VLLMRolloutEngine(
+                                    model=_mp, tp_size=1,
+                                    dtype=s2cfg.get("rollout_dtype", "auto"),
+                                    gpu_memory_utilization=float(
+                                        _l2roll.get("dist_engine_gpu_mem", 0.25)),
+                                    vocab_size=vocab,
+                                    full_logprobs_cap=int(
+                                        s2cfg.get("rollout_logprobs_cap", 4096)),
+                                    device=rollout_device)
                 scheduler = AsyncBatchedScheduler(
                     student, cache, fat_prompts, fat_responses,
                     ref_dists, ref_ids, ref_logp, s2cfg, self.device,
@@ -831,6 +858,12 @@ class FullStackOPDv2:
                                     rollout_engine.update_weights(student.state_dict())
                                 except Exception as e:
                                     logger.warning(f"[L2] vLLM 权重同步失败（继续用引擎现有权重）：{e}")
+                            # IMP-2/P0：s_old 分布引擎用当前 student 权重（on-policy）
+                            if dist_engines and dist_engines.get("s_old") is not None:
+                                try:
+                                    dist_engines["s_old"].update_weights(student.state_dict())
+                                except Exception as e:
+                                    logger.warning(f"[L2] dist s_old 权重同步失败：{e}")
                             rollout_summary = run_refresh_phase(
                                 student, teacher_rl, teacher_ref, student_ref,
                                 selector, rb, disag, fat_prompts, step_done,
@@ -850,7 +883,8 @@ class FullStackOPDv2:
                                 compute_disagreement=bool(
                                     (l2_cfg.get("disagreement") or {}).get("enabled", True)),
                                 cand=indices, budgets=budgets, budget_t=budget_t,
-                                dists_chunk=int(rollcfg.get("response_dists_chunk", 2)))
+                                dists_chunk=int(rollcfg.get("response_dists_chunk", 2)),
+                                dist_engines=dist_engines)
                             # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
                             roll_metrics = None
                             if isinstance(rollout_summary, dict):

@@ -632,6 +632,46 @@ def _rl_ref_delta_k(model_rl, model_ref, prompts, responses, top_k, chunk: int =
     return torch.cat(ids_l, 0), torch.cat(rl_l, 0), torch.cat(delta_l, 0)
 
 
+def _dist_topk_cached(engine, hf_model, prompts, responses, K, chunk):
+    """vLLM 引擎（非 None）→ response_dists_topk(K)；None → HF per-chunk（零回归）。
+
+    IMP-2/P0：rollout 相位分布前向可切 vLLM（连续批处理 + FP8），接口与
+    _response_dists_topk 同构返回 (ids, logps) 各 (B,T,K)，按 logprob 降序。
+    """
+    if engine is not None:
+        return engine.response_dists_topk(prompts, responses, K=K)
+    return _response_dists_topk(hf_model, prompts, responses, K, chunk)
+
+
+def _gather_support(ids, logp, query_ids, tail_logp: float = -30.0) -> torch.Tensor:
+    """ref top-K (ids,logp) 在 rl top-K 支撑 (query_ids) 上的 logp（searchsorted）。
+
+    ids/logp 来自 vLLM response_dists_topk（按 logprob 降序，非按 id 排序），这里按 id
+    升序预排序后二分匹配；未命中填 tail_logp（≈log 0）。与 HF 路径 delta_k 的
+    ref_dist.gather(rl_ids) 语义一致。
+    """
+    so = torch.argsort(ids, dim=-1)
+    ids_s = ids.gather(-1, so)
+    logp_s = logp.gather(-1, so)
+    Kr = ids_s.size(-1)
+    pos = torch.searchsorted(ids_s, query_ids.contiguous()).clamp(max=Kr - 1)
+    found = ids_s.gather(-1, pos) == query_ids
+    return logp_s.gather(-1, pos).where(
+        found, torch.full_like(logp_s.gather(-1, pos), tail_logp))
+
+
+def _dist_rl_ref_delta(rl_engine, ref_engine, rl_hf, ref_hf,
+                       prompts, responses, top_k, chunk):
+    """rl/ref 分布 → (ids_k, rl_k, delta_k)。两引擎都给 → vLLM（rl top-K 支撑 + ref gather）；
+    任一缺失 → HF per-chunk 联合（_rl_ref_delta_k，数值对齐）。"""
+    if rl_engine is not None and ref_engine is not None:
+        rl_ids, rl_logp = rl_engine.response_dists_topk(prompts, responses, K=top_k)
+        ref_ids, ref_logp = ref_engine.response_dists_topk(prompts, responses, K=top_k)
+        ref_at_rl = _gather_support(ref_ids, ref_logp, rl_ids)
+        return rl_ids, rl_logp, rl_logp - ref_at_rl
+    return _rl_ref_delta_k(rl_hf, ref_hf, prompts, responses, top_k, chunk)
+
+
 def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       selector, ring_buffer, disag, prompts, step, version,
                       m_selected, max_resp_len, top_k, device,
@@ -651,7 +691,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       exploration_fraction=0.20,
                       cand=None,                   # Stage 3：预选 prompt 索引 (M,)；None→内部 select
                       compute_disagreement=True,  # P1.4：disagreement.enabled 硬 gate
-                      dists_chunk: int = 2):       # IMP-1：rollout response_dists 分批大小（降显存峰值）
+                      dists_chunk: int = 2,       # IMP-1：rollout response_dists 分批大小（降显存峰值）
+                      dist_engines: dict | None = None):   # IMP-2/P0：vLLM 分布引擎 {s_old,rl,ref,ref_anchor}；None→HF
                                                   # False 时跳过 D 计算（省 student/student_ref
                                                   # chosen-logp 前向），append 用 D=0
     """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 短 rollout（带 status）
@@ -803,9 +844,12 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         delta_k = rl_k - ref_dist.gather(-1, tk.indices)
     else:
         with torch.no_grad():
-            s_old_ids, s_old_logp = _response_dists_topk(
+            s_old_ids, s_old_logp = _dist_topk_cached(
+                dist_engines.get("s_old") if dist_engines else None,
                 student, p_b_v, resp_v, Ks, dists_chunk)
-            ids_k, rl_k, delta_k = _rl_ref_delta_k(
+            ids_k, rl_k, delta_k = _dist_rl_ref_delta(
+                dist_engines.get("rl") if dist_engines else None,
+                dist_engines.get("ref") if dist_engines else None,
                 teacher_rl, teacher_ref, p_b_v, resp_v, top_k, dists_chunk)
     # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）。先于 D 计算（compute 用）。
     mask = build_length_mask(resp_v, [lengths[i] for i in valid],
@@ -817,7 +861,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     # per-chunk 不驻留完整 (M,T,V)；student_ref 为初始权重（rollout 阶段不变）。
     with torch.no_grad():
         student_ref.eval()
-        ref_a_ids, ref_a_logp = _response_dists_topk(
+        ref_a_ids, ref_a_logp = _dist_topk_cached(
+            dist_engines.get("ref_anchor") if dist_engines else None,
             student_ref, p_b_v, resp_v, Ks, dists_chunk)
     # P1.4：disagreement.enabled 硬 gate——关闭时跳过 D 计算（省 student/student_ref
     # chosen-logp 前向），append 用 D=0（E1↔E2 差异改为真实计算量差异）。
