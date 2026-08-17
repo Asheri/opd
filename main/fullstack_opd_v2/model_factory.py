@@ -76,6 +76,18 @@ class HFCausalLM:
         # P1.5：真实 pad_token_id（供变长 rollout 右 pad 与尾部去 pad；Qwen3 的 token 0
         # 不是 pad，默认 0 会误判/错误填充）。
         self._pad_token_id = getattr(self.model.config, "pad_token_id", None)
+        # IMP-1 根因修复：Qwen 系 config.pad_token_id=None（HF 模型配置常不带 pad），
+        # 但 tokenizer 有真实 pad（Qwen3=151643）。若保持 None，pipeline 会把 rollout
+        # pad_id 落到 rollcfg.pad_id=0 → HF generate 自动推断 attention_mask 时无法识别
+        # 数据层 right-pad（151643）→ 800+ pad 被当作有效上下文 → 长序列尾部 token 重复
+        # （训练路径 75% loop vs 校准路径 0% loop 的矛盾根因，2026-08-17 GPU 实测定位）。
+        # 回落到 tokenizer.pad_token_id：HF mask 推断正确，尾部去 pad 判据也正确。
+        if self._pad_token_id is None:
+            try:
+                from transformers import AutoTokenizer
+                self._pad_token_id = AutoTokenizer.from_pretrained(path).pad_token_id
+            except Exception:
+                self._pad_token_id = None
 
     @property
     def pad_token_id(self):

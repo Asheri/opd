@@ -516,6 +516,72 @@ def refresh_cold_start_decision(pool_size: int, min_refresh_pool: int) -> tuple[
     return False, ""
 
 
+def _response_dists_batched(model, prompts, responses, chunk: int = 2):
+    """分批 response_dists（(B,P),(B,T)->(B,T,V)），降低 (M,P+T,V) 全词表 log-softmax 显存峰值。
+
+    IMP-1 修复配套：loop 修复后 valid 样本从 ~2 升到 ~8，真实 152k 词表下单批
+    (8,1536,151936) fp32 log-softmax ~9.4GB × 3（student+rl+ref）叠加训练残留显存
+    会 OOM（2026-08-17 GPU 实测）。逐 chunk 前向后 concat，峰值降为 chunk/M。
+    """
+    from .model import response_dists   # 模块级无该名（run_refresh_phase 内 import），helper 内自取
+    outs = []
+    for i in range(0, prompts.size(0), chunk):
+        outs.append(response_dists(model, prompts[i:i + chunk], responses[i:i + chunk]))
+    if len(outs) == 1:
+        return outs[0]
+    return torch.cat(outs, 0)
+
+
+def _token_logprobs_batched(model, prompts, responses, chunk: int = 2):
+    """分批 token_logprobs（内部 response_dists 也按 chunk 降低峰值），保留梯度语义。"""
+    from .model import response_dists   # 同上：token_logprobs 内部也走 response_dists
+    outs = []
+    for i in range(0, prompts.size(0), chunk):
+        d = response_dists(model, prompts[i:i + chunk], responses[i:i + chunk])
+        outs.append(d.gather(2, responses[i:i + chunk].unsqueeze(-1)).squeeze(-1))
+    return torch.cat(outs, 0) if len(outs) > 1 else outs[0]
+
+
+def _response_dists_topk(model, prompts, responses, K, chunk: int = 2):
+    """per-chunk response_dists → topk，返回 (M,T,K) ids + logp；不驻留完整 (M,T,V)。
+
+    IMP-1 显存优化：真实 152k 词表下完整 (M,T,V) fp32 全量驻留 + 训练后碎片化缓存
+    会 OOM（训练峰值 74GB/expandable_segments 碎片，2026-08-17 GPU 实测）。逐 chunk
+    前向+topk，峰值=单 chunk，只保留 top-K 小张量（(M,T,256) bf16 ≈ 数 MB）。
+    """
+    from .model import response_dists
+    ids_l, logp_l = [], []
+    for i in range(0, prompts.size(0), chunk):
+        d = response_dists(model, prompts[i:i + chunk], responses[i:i + chunk])
+        tk = d.topk(min(K, d.size(-1)), dim=-1)
+        ids_l.append(tk.indices)
+        logp_l.append(tk.values)
+        del d
+    return torch.cat(ids_l, 0), torch.cat(logp_l, 0)
+
+
+def _rl_ref_delta_k(model_rl, model_ref, prompts, responses, top_k, chunk: int = 2):
+    """per-chunk 联合算 rl top-k（ids_k, rl_k）与 ref 在该 top-k 支撑的 delta_k。
+
+    rl/ref 同 chunk 计算完即 del，避免两份完整 (M,T,V) fp32 同时驻留。返回
+    (ids_k, rl_k, delta_k)，均 (M,T,K)。top_k 需 < 词表（调用方保证）。
+    """
+    from .model import response_dists
+    ids_l, rl_l, delta_l = [], [], []
+    for i in range(0, prompts.size(0), chunk):
+        p, r = prompts[i:i + chunk], responses[i:i + chunk]
+        rl_d = response_dists(model_rl, p, r)
+        tk = rl_d.topk(top_k, dim=-1)
+        ids_k, rl_k = tk.indices, tk.values
+        ref_d = response_dists(model_ref, p, r)
+        delta = rl_k - ref_d.gather(-1, ids_k)
+        ids_l.append(ids_k)
+        rl_l.append(rl_k)
+        delta_l.append(delta)
+        del rl_d, ref_d
+    return torch.cat(ids_l, 0), torch.cat(rl_l, 0), torch.cat(delta_l, 0)
+
+
 def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       selector, ring_buffer, disag, prompts, step, version,
                       m_selected, max_resp_len, top_k, device,
@@ -534,7 +600,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       budget_set=(256, 512, 1024, 2048),
                       exploration_fraction=0.20,
                       cand=None,                   # Stage 3：预选 prompt 索引 (M,)；None→内部 select
-                      compute_disagreement=True):  # P1.4：disagreement.enabled 硬 gate
+                      compute_disagreement=True,  # P1.4：disagreement.enabled 硬 gate
+                      dists_chunk: int = 2):       # IMP-1：rollout response_dists 分批大小（降显存峰值）
                                                   # False 时跳过 D 计算（省 student/student_ref
                                                   # chosen-logp 前向），append 用 D=0
     """§3.3 + §6.5 rollout 相位：selective 选 prompt -> student 短 rollout（带 status）
@@ -660,18 +727,35 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                 "source": rollout_source}
     p_b_v = p_b[valid]
     resp_v = responses[valid]
+    # IMP-1 修复配套：训练相位结束后 GPU 仍驻留训练激活（实测 ~92GB），rollout 的
+    # response_dists (M,P+T,V) 全词表前向需要额外显存。先 empty_cache 释放 PyTorch
+    # 未用缓存块，再分批前向（dists_chunk），避免 valid 全量时 OOM。
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     # 行为策略：生成完立即取当前 student 完整分布 top-K（s_old，精确行为策略 §2）。
     # 同一相位内 student 权重未变，因此 refresh 训练第一步 ratio≈1（纯 on-policy）。
-    with torch.no_grad():
-        s_full = response_dists(student, p_b_v, resp_v)          # (M,T,V)
+    # IMP-1 显存修复：compute_disagreement=False（默认/E1/E2）走 per-chunk topk/gather
+    # （_response_dists_topk / _rl_ref_delta_k），从不驻留完整 (M,P+T,V) fp32 全量——
+    # 训练后 expandable_segments 碎片缓存（实测 reserved 61GB/峰值 74GB，2026-08-17 GPU）
+    # 下全量驻留会 OOM。D 计算（=True）仍需完整 rl_dist/ref_dist，保留原路径。
     Ks = ring_buffer.student_top_k
-    s_old_ids = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).indices
-    s_old_logp = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).values
-    rl_dist = response_dists(teacher_rl, p_b_v, resp_v)      # (M,T,V)
-    ref_dist = response_dists(teacher_ref, p_b_v, resp_v)
-    tk = rl_dist.topk(top_k, dim=-1)
-    ids_k, rl_k = tk.indices, tk.values
-    delta_k = rl_k - ref_dist.gather(-1, tk.indices)
+    if compute_disagreement:
+        with torch.no_grad():
+            s_full = _response_dists_batched(student, p_b_v, resp_v, dists_chunk)   # (M,T,V)
+        s_old_ids = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).indices
+        s_old_logp = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).values
+        del s_full
+        rl_dist = _response_dists_batched(teacher_rl, p_b_v, resp_v, dists_chunk)   # (M,T,V)
+        tk = rl_dist.topk(top_k, dim=-1)
+        ids_k, rl_k = tk.indices, tk.values
+        ref_dist = _response_dists_batched(teacher_ref, p_b_v, resp_v, dists_chunk)
+        delta_k = rl_k - ref_dist.gather(-1, tk.indices)
+    else:
+        with torch.no_grad():
+            s_old_ids, s_old_logp = _response_dists_topk(
+                student, p_b_v, resp_v, Ks, dists_chunk)
+            ids_k, rl_k, delta_k = _rl_ref_delta_k(
+                teacher_rl, teacher_ref, p_b_v, resp_v, top_k, dists_chunk)
     # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）。先于 D 计算（compute 用）。
     mask = build_length_mask(resp_v, [lengths[i] for i in valid],
                              [eos_pos[i] for i in valid])
@@ -680,10 +764,10 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     if compute_disagreement:
         with torch.no_grad():
             student_ref.eval()
-            ref_logp = token_logprobs(student_ref, p_b_v, resp_v)
+            ref_logp = _token_logprobs_batched(student_ref, p_b_v, resp_v, dists_chunk)
             rl_chosen = disag.gather_chosen_logp(rl_dist, resp_v)
             ref_chosen = disag.gather_chosen_logp(ref_dist, resp_v)
-            student_logp = token_logprobs(student, p_b_v, resp_v)
+            student_logp = _token_logprobs_batched(student, p_b_v, resp_v, dists_chunk)
         D_vals = disag.compute(rl_chosen, ref_chosen, student_logp, ref_logp, mask).get("abs")
         D_vals = [float(v.detach()) for v in D_vals]
     else:

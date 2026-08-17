@@ -752,6 +752,12 @@ class FullStackOPDv2:
                         # 否则本相位纯训练、跳过 refresh 与 α 更新。
                         elapsed = base_done - last_refresh
                         if elapsed >= refresh_min or elapsed >= refresh_max:
+                            # IMP-1 显存修复：训练相位（scheduler.run）后 PyTorch 仍保留
+                            # 大量未用缓存块（实测 alloc 44GB / reserved 78GB，~34GB 可释放）。
+                            # rollout 的生成 + response_dists (M,P+T,V) 前向需要额外显存，
+                            # 先 empty_cache 归还未引用块，否则生成 8×512 即 OOM（2026-08-17）。
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                             # Stage 2：消费 l2.rollout 短预算协议（max_new_tokens / eos / loop）。
                             # fallback：未设 rollout 段 → 回落 cache.max_response_length（toy=4）。
                             rollcfg = l2_cfg.get("rollout", {})
@@ -830,7 +836,8 @@ class FullStackOPDv2:
                                 rollout_source=rollout_source,
                                 compute_disagreement=bool(
                                     (l2_cfg.get("disagreement") or {}).get("enabled", True)),
-                                cand=indices, budgets=budgets, budget_t=budget_t)
+                                cand=indices, budgets=budgets, budget_t=budget_t,
+                                dists_chunk=int(rollcfg.get("response_dists_chunk", 2)))
                             # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
                             roll_metrics = None
                             if isinstance(rollout_summary, dict):

@@ -79,3 +79,52 @@
 - 尾部周期 loop 检测 + Final Answer marker 检查：**已完成，0%**。
 - 人工标注（逐条内容判定）：**待**（无 ground-truth 标签，未计算 FP/FN）。
 - 1024/2048 预算补测 + 实际训练路径（run_refresh_phase）复跑：**待（IMP-3）**。
+
+
+---
+
+## 更新（2026-08-17 深夜）：训练路径 75% loop 根因定位——pad_id=0 是校准 0% vs 训练 75% 的矛盾解答
+
+**结论：早前"75-87% loop 率"不是旧代码异常，而是 rollout 生成路径的 pad_token_id=0 bug；修复后训练路径实测 0% loop。校准路径 0% 与训练路径 75% 的矛盾根源即此。**
+
+### 根因（GPU 实测定位，loop_diag2-6 + 双卡复跑）
+
+1. **数据层**：JsonLinesDataLoader 把 prompt right-pad 到 1024。pilot_200 真实 prompt 仅
+   64~202 token，其余 818~960 是 pad（Qwen3 pad_token=151643）。
+2. **模型层**：Qwen3 model.config.pad_token_id = None（HF 配置不带 pad）。HFCausalLM.
+   pad_token_id 原样回落 None → pipeline _pad_id = int(None or rollcfg.pad_id=0) = 0。
+3. **生成路径**：generate_with_status_kv 传 pad_token_id=0、**不带 attention_mask**，
+   HF 自动推断 mask 时把 **token 0** 当 pad（prompts 里无 token 0 → mask 全 1），
+   **无法识别 151643 为 pad** → 模型把 800+ pad token 当作有效上下文 → 长序列尾部
+   token 重复（198/220/0 交替）→ detect_loop 命中（实测 8/8 或 6/8）。
+4. **校准路径**：calibrate_rollout.py 用 	ok(..., padding=True)（left-pad）+ 显式
+   attention_mask → pad 正确屏蔽 → 0% loop。**两路径的差异 = pad 是否被正确 mask。**
+
+### 复现对照（服务器 GPU，训练后 step_19 模型 + 冷启动 cand + temp=0.7/max_new=512）
+
+| 路径 | pad_token_id | loop 率 |
+|---|---|---|
+| 旧训练路径（复刻 generate_with_status_kv） | **0** | **7/8** |
+| 修复后（pad=151643） | **151643** | **0/8** |
+| 校准路径（mask 正确） | - | 0/8 |
+
+### 修复（已提交，最小侵入、可配置）
+
+- HFCausalLM.pad_token_id 在 config.pad_token_id is None 时**回落到
+  AutoTokenizer.pad_token_id**（Qwen3=151643）→ pipeline 的 rollout pad_id 自动正确。
+- 配套显存修复：rollout 前 	orch.cuda.empty_cache()（训练后 expandable_segments 碎片
+  缓存）＋ rollout 分布计算改 **per-chunk**（_response_dists_topk/_rl_ref_delta_k），
+  不再驻留完整 (M,T,V) fp32 全量（训练峰值 74GB + 8 valid 全量会 OOM，已实测）。
+
+### 修复后训练路径实测（双卡并行 2026-08-17）
+
+| 实验 | max_new | valid_rate | n_loop | n_appended | 备注 |
+|---|---|---|---|---|---|
+| S2_E1_opd512 (cuda:0) | 512 | **1.0** | **0/8** | 8/8 | 修复前 valid_rate=0.25、n_loop=6/8 |
+| S2_E2_opd1024 (cuda:1) | 1024 | **1.0** | **0/8** | 8/8 | 与 E1 双卡并行 |
+
+### 结论
+
+- 原校准"0% loop"成立的前提是 **pad 被正确 mask**；训练路径因 pad_id=0 未 mask 而虚高。
+- **detector 无需放宽**；(2,3,4)/min_len=8 在正确 pad 下不误杀、能抓住真实退化。
+- 修复后 alid_rate=1.0 远超 >= 0.50 目标；下一步核对 refresh 训练 KL 锚点（IMP-3）。
