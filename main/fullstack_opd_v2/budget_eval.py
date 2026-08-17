@@ -230,8 +230,11 @@ class BudgetEvaluator(AimeEvaluator):
             new = new[:new.index(eos)]
         return self.tok.decode(new, skip_special_tokens=True), len(new)
 
-    def evaluate_budget(self, dataset_ref: str, budget: int) -> dict:
+    def evaluate_budget(self, dataset_ref: str, budget: int,
+                        n_limit: int | None = None) -> dict:
         """预算感知评估单数据集单预算。返回聚合字典（含每样本 rows 供落盘/审计）。
+
+        n_limit：可选，只评估数据集前 n_limit 条（快速子集/初步曲线用）；None=全量。
 
         指标：
           - outcome_correct：verifier(extract_final_answer(预算内文本)) 正确 → Accuracy@B
@@ -239,14 +242,27 @@ class BudgetEvaluator(AimeEvaluator):
           - status/eos、budget_stop、reasoning_tokens、answer_completion_tokens、total_tokens
         """
         problems = self.load_problems(dataset_ref)
+        if n_limit is not None:
+            problems = problems[:int(n_limit)]
         prompts = [format_prompt(p, self.prompt_style) for p, _ in problems]
         n = self.n_samples
         rows = []
         n_outcome = n_prefix_denominator = n_prefix_correct = n_eos = 0
         rt_sum = 0
+        # IMP-4 性能修复（2026-08-17 GPU 实测）：n<=1（greedy）批量生成，避免逐条
+        # generate 的巨大固定调用开销——批量 5 条 B256 仅 4.9s（264 tok/s），逐条 50 次
+        # 调用慢一个数量级。generate_budget 内部已按 batch_size 分批，返回顺序与
+        # prompts 一致（n=1 时每条一组）。n>1 多采样保留原逐条归组路径（保守）。
+        if n <= 1:
+            _batch = self.generate_budget(prompts, budget)          # [(text,status,rt)] × N
+            # 兼容 flat（真实实现）与 nested（测试 fake 每样本一组）两种返回
+            _groups = [(_batch[i],) if isinstance(_batch[i], tuple)
+                       else tuple(_batch[i]) for i in range(len(problems))]
+        else:
+            _groups = [self.generate_budget([prompts[i]], budget)
+                       for i in range(len(problems))]
         for i, (problem, gt) in enumerate(problems):
-            group = self.generate_budget([prompts[i]], budget)   # → n 条 (text,status,rt)
-            for (text, status, rt) in group:
+            for (text, status, rt) in _groups[i]:
                 fa = extract_final_answer(text)
                 outcome_ok = self._verify(fa, gt)
                 n_outcome += int(outcome_ok)

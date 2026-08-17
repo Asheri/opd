@@ -728,7 +728,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
             p_bucket = prompts[torch.tensor(idxs, device=prompts.device)].to(device)
             out = _gen(p_bucket, max_new=int(b))
             for k, pc in enumerate(pos_in_cand):
-                rk = out["responses"][k]
+                rk = out["responses"][k].to(device)   # vLLM 引擎可能在 rollout_device，回训练 device
                 resp_all[pc, :rk.size(0)] = rk
                 statuses[pc] = out["statuses"][k]
                 lengths[pc] = out["lengths"][k]
@@ -738,7 +738,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     else:
         p_b = prompts[cand].to(device)
         out = _gen(p_b, max_new=max_resp_len)
-        responses, statuses, lengths = out["responses"], out["statuses"], out["lengths"]
+        responses = out["responses"].to(device)   # vLLM 引擎可能在 rollout_device，回训练 device
+        statuses, lengths = out["statuses"], out["lengths"]
         eos_pos = out["eos_pos"]
         expected = m_selected * max_resp_len
         budgets_used = m_selected * max_resp_len

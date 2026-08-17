@@ -629,13 +629,18 @@ class FullStackOPDv2:
                 rollout_engine = None
                 if s2cfg.get("rollout_engine") == "vllm":
                     from .rollout_vllm import VLLMRolloutEngine
+                    # L3/IMP-2：rollout vLLM 引擎放独立卡（rollout_device，默认 cuda:1），
+                    # 避免与训练卡（cuda:0）的 student/teacher 显存冲突（vLLM 默认
+                    # gpu_memory_utilization=0.9 独占）。tp_size=1 单卡 rollout；权重由
+                    # 每次 rollout 相位前 update_weights 同步（on-policy）。
+                    rollout_device = s2cfg.get("rollout_device", "cuda:1")
                     rollout_engine = VLLMRolloutEngine(
                         model=s2cfg.get("rollout_model", "Qwen/Qwen2.5-7B"),
                         tp_size=int(s2cfg.get("rollout_tp_size", 1)),
                         dtype=s2cfg.get("rollout_dtype", "auto"),
                         vocab_size=vocab,
                         full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
-                        device=self.device)
+                        device=rollout_device)
                 scheduler = AsyncBatchedScheduler(
                     student, cache, fat_prompts, fat_responses,
                     ref_dists, ref_ids, ref_logp, s2cfg, self.device,
@@ -818,6 +823,14 @@ class FullStackOPDv2:
                                         _m_sel, fat_prompts.size(0),
                                         budget_mode="fixed",
                                         fixed_budget=sc.get("fixed_budget", 1024))
+                            # L3/IMP-2：rollout vLLM 引擎独立于 learner——每次 rollout 前把
+                            # 当前 student 权重推入 vLLM（update_weights），保证 on-policy；
+                            # toy（rollout_engine=None）跳过，零回归。
+                            if rollout_engine is not None and hasattr(rollout_engine, "update_weights"):
+                                try:
+                                    rollout_engine.update_weights(student.state_dict())
+                                except Exception as e:
+                                    logger.warning(f"[L2] vLLM 权重同步失败（继续用引擎现有权重）：{e}")
                             rollout_summary = run_refresh_phase(
                                 student, teacher_rl, teacher_ref, student_ref,
                                 selector, rb, disag, fat_prompts, step_done,

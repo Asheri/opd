@@ -151,8 +151,9 @@ def _fake_eval_budget(groups, problems, completion=("\\boxed{42}", 5), **over):
     ev.completion_max_tokens = 64
     ev.seed = 42
     ev.load_problems = lambda d: problems
-    it = iter(groups)
-    ev.generate_budget = lambda prompts, budget: next(it)
+    # IMP-4 批量契约（2026-08-17）：evaluate_budget 一次传所有 prompts 调 generate_budget，
+    # 返回按样本顺序 flat 的 (text,status,rt) 列表。fake 对齐新契约（n=1 每条一组）。
+    ev.generate_budget = lambda prompts, budget: [item for gr in groups for item in gr]
     ev._completion = lambda prefix, x: completion
     for k, v in over.items():
         setattr(ev, k, v)
