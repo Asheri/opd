@@ -29,9 +29,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import sys
 import time
 from pathlib import Path
+
+# 脚本位于 main/scripts/ 下；直接运行（python scripts/calibrate_rollout.py）时 sys.path[0]
+# 是 scripts/ 而非 repo 根，导致 `from fullstack_opd_v2.model import detect_loop` 失败。
+# 显式把 main/（repo 根）加入 sys.path，保证脚本可直接运行（本地与服务器一致）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def parse_args() -> argparse.Namespace:
