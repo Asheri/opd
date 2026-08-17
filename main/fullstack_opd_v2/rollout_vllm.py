@@ -70,6 +70,31 @@ import atexit
 atexit.register(_shutdown_all_engines)
 
 
+def _resolve_visible_device(device: str, current_env: str | None) -> str | None:
+    """把逻辑 cuda:i 映射为 vLLM 子进程可见的 CUDA_VISIBLE_DEVICES。
+
+    vLLM 1.x 的 LLM() 没有 device 参数，EngineCore 是 spawn 子进程，只认
+    CUDA_VISIBLE_DEVICES（默认落在 cuda:0）。2026-08-18 GPU 实测：引擎与训练
+    共卡 → 训练 (8,3072,151936) fp32 logits 41GB + 引擎 11.6GB = 95GB OOM，
+    第二张卡全程空置。此处把 device 映射进子进程环境，引擎独立卡。
+
+    - 无 CUDA_VISIBLE_DEVICES：直接返回设备号（"cuda:1" → "1"）。
+    - 有重排（如 "1,0"）：按列表索引取物理号（cuda:1 → "0"）。
+    - 非 cuda 设备返回 None（不注入，vLLM 自行选择）。
+    """
+    if not str(device).startswith("cuda"):
+        return None
+    idx = str(device).split(":")[-1] if ":" in str(device) else "0"
+    if current_env:
+        vis = [x.strip() for x in current_env.split(",") if x.strip()]
+        if vis:
+            try:
+                return vis[int(idx) % len(vis)]
+            except ValueError:
+                return None
+    return idx
+
+
 class VLLMRolloutEngine:
     """vLLM 包成的 rollout 引擎，接口对齐 model.response_dists。
 
@@ -111,6 +136,11 @@ class VLLMRolloutEngine:
                 import logging
                 logging.getLogger(__name__).warning(
                     f"weight_transfer_config 不可用（旧版 vLLM？）：{e}")
+        # 引擎核心是 spawn 子进程：把 device 映射为 CUDA_VISIBLE_DEVICES 注入，
+        # 否则 vLLM 恒用默认 cuda:0 与训练卡冲突（2026-08-18 GPU 实测双卡 OOM）。
+        _vis = _resolve_visible_device(device, os.environ.get("CUDA_VISIBLE_DEVICES"))
+        if _vis is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _vis
         self.llm = LLM(
             model=model,
             tensor_parallel_size=self.tp_size,
