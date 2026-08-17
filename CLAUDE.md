@@ -162,6 +162,23 @@ vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。L2 �
 - 决策顺序：先判断任务是否可分片 → 可分片则**优先并行**；只有任务本身有顺序依赖 / 显存或
   通信瓶颈使并行无收益 / 用户显式指定单卡时，才回退单卡，且应说明原因。
 
+## 全局网络资源约束（HF / GitHub 超时）
+
+**当 HuggingFace / GitHub 等外网连接超时或不可达时，必须考虑使用学术资源加速**：
+
+```bash
+source /etc/network_turbo   # AutoDL 学术加速（代理 github/huggingface）
+```
+
+- 适用：模型/分词器下载、`huggingface-cli`、`git clone` GitHub 仓库、pip 走 HF/GitHub 源等。
+- 服务器（AutoDL）默认无直连外网；直连报 `Network is unreachable` / 连接 huggingface.co
+  超时时，先 `source /etc/network_turbo` 再重试，不要直接判失败。
+- 优先级：**本地已有模型路径 > 加速代理下载**。本地路径可用时（如
+  `/root/autodl-tmp/models/...`）一律走本地 + `HF_HUB_OFFLINE=1`/`TRANSFORMERS_OFFLINE=1`，
+  不触网；仅当本地缺失必需文件时才走加速代理。
+- 注意：加速开启后访问其他资源（如 pip 常规源）会更慢，用完可在同一 shell 之外另开
+  无代理会话；no_proxy 已含 modelscope/aliyuncs 等国内源。
+
 ## 深入阅读
 
 - `main/README.md` — 三篇论文核心抽取、代码地图、v1→v2 重构对照表、审阅修复记录

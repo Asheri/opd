@@ -73,8 +73,12 @@ class Stage2Cfg(_Strict):
     tp_size: int = 1
     sequence_parallel: bool = True
     rollout_engine: Literal["toy", "vllm"] = "toy"
-    rollout_tp_size: int = 2
-    rollout_model: str = "Qwen/Qwen2.5-7B"
+    # tp 默认 1：引擎按单卡放置（物理卡由 CUDA_VISIBLE_DEVICES 决定）；
+    # 多卡 TP 仍可显式配置 rollout_tp_size=2。
+    rollout_tp_size: int = 1
+    # 空串 = pipeline 回落 student_path（on-policy 同构）。⚠️ 不要给 HF hub
+    # 默认名——真实环境离线时会触发联网下载直接失败。
+    rollout_model: str = ""
     rollout_dtype: Literal["auto", "bf16", "fp8"] = "auto"
     rollout_logprobs_cap: int = 4096
     # vLLM 引擎放置/显存/上下文（IMP-2/P1）：rollout_device 为输出张量回落设备
