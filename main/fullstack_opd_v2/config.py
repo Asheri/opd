@@ -87,6 +87,13 @@ class Stage2Cfg(_Strict):
     rollout_device: str = "cuda:1"
     rollout_gpu_mem: float = 0.9
     rollout_max_model_len: int = 2048
+    # IMP-2/P1：vLLM 引擎最大并发请求数（压低超配 KV）+ 启动显存断言训练预留量
+    rollout_max_num_seqs: int = 256
+    rollout_min_free_gb: float = 25.0
+    # IMP-2/P1：base 池稀疏 PG（默认开，OOM 根治）+ 队列深度 + 停滞 watchdog
+    base_sparse_pg: bool = True
+    staleness_queue_min: int = 16
+    rollout_stall_timeout: float = 900.0
     # ---- 顶层部署键下渗槽位（A5 解法 + T2 死槽位清理）----
     # load_config 在下渗后才校验，这些键须在 stage schema 有合法位置，否则
     # extra="forbid" 会把下渗结果当未知键拒掉。只保留 stage2 真正消费的键
