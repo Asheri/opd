@@ -1,0 +1,40 @@
+model_kind: hf
+dtype: bf16
+cache_mode: topk
+top_k_teacher: 256
+top_k_student: 256
+ref_topk: 256
+offload_to_cpu: false
+student_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+teacher_rl_path: /root/autodl-tmp/models/JustRL-DeepSeek-1.5B
+teacher_ref_path: /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-1.5B
+dataset:
+  type: jsonl
+  path: /root/autodl-tmp/data/gsm8k.jsonl
+  max_prompt_len: 256
+  max_response_len: 384
+  tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+stage1:
+  cache_path: /root/autodl-tmp/cache_17b.pt
+  warmup_M: 0
+  warmup_source: none
+  build_batch_size: 8
+  load_cache: false
+stage2:
+  distributed: false
+  tp_size: 1
+  rollout_engine: toy
+  renormalize_topk_support: true
+  batch_size: 8
+  n_steps: 60
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 0.5
+  clip_eps: 0.2
+  lr: 3.0e-05
+  delta_clip: 2.0
+run:
+  run_dir: /root/autodl-tmp/runs/real_17b_v2
+  checkpoint_every: 20
+eval:
+  model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
