@@ -222,6 +222,17 @@ def test_parse_vllm_outputs_eos():
     assert r["looped"] == [False]
 
 
+def test_parse_vllm_outputs_stop_token_eos():
+    """vLLM>=0.8 stop_token_ids 路径：eos 被消费但不入输出，finish_reason='stop'。
+    语义 = toy（length=eos_pos+1 含 eos），eos 位置=len(new)。"""
+    outs = [_FakeOut([1, 2, 3], "stop")]               # 3 token 后撞 eos
+    r = parse_vllm_outputs(outs, max_new=8, eos_token_id=0)
+    assert r["statuses"] == ["eos"]
+    assert r["lengths"] == [4]                          # len(3)+1 含 eos
+    assert r["eos_pos"] == [3]
+    assert r["looped"] == [False]
+
+
 def test_parse_vllm_outputs_budget_stop():
     outs = [_FakeOut([1, 2, 3], "length")]           # 无 eos，撞 max_new
     r = parse_vllm_outputs(outs, max_new=8, eos_token_id=0)

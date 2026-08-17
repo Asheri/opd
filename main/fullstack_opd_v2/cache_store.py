@@ -223,10 +223,17 @@ def verify_consistency(meta: dict, cfg: dict, hashes_now: dict | None = None) ->
     if cfg_top_k and top_k != int(cfg_top_k):
         raise CacheConsistencyError(
             f"缓存 top_k={top_k} 与配置 cache.top_k={cfg_top_k} 不一致，不准加载")
+    # max_response_len 读取【dataset 块】（data loader 实际用键）而非顶层——此前误读顶层
+    # 导致 cache(T=2048) vs dataset(T=4096) 错配不报错，直到训练中 searchsorted 维度
+    # 崩溃（2026-08-17 实测 [1,2048,256] vs [1,4096,256]）。缓存与数据必须同长。
+    _data_cfg = cfg.get("dataset") or {}
+    _data_len = _data_cfg.get("max_response_len")
     meta_len = meta.get("max_response_len")
-    if meta_len and meta_len != int(cfg.get("max_response_len", meta_len)):
+    if meta_len and _data_len and meta_len != int(_data_len):
         raise CacheConsistencyError(
-            f"缓存 max_response_len={meta_len} 与配置 {cfg.get('max_response_len')} 不一致")
+            f"缓存 max_response_len={meta_len} 与 dataset.max_response_len={_data_len} "
+            "不一致（缓存用旧配置建则需对齐 dataset.max_response_len 或重建缓存，"
+            "否则 teacher top-K 支撑与训练响应维度错配 → searchsorted 崩溃）。")
 
 
 class DiskTeacherCache:

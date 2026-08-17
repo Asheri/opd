@@ -422,10 +422,16 @@ class VLLMRolloutEngine:
         """
         prompts = prompts.detach().cpu()
         B = prompts.size(0)
-        sampling = SamplingParams(
-            temperature=max(temperature, 1e-6), top_p=0.9, max_tokens=max_new,
-            eos_token_id=eos_token_id,
-            repetition_penalty=max(float(repetition_penalty), 1.0))
+        # vLLM>=0.8 移除 SamplingParams.eos_token_id 字段（0.16 msgspec 校验拒绝）。
+        # 改用 stop_token_ids=[eos]：vLLM 在即将生成 eos 时提前停（stop token 不入输出），
+        # parse_vllm_outputs 按 finish_reason="stop" 恢复 toy 语义（eos 位置=len、length=len+1
+        # 并在 generate_with_status 补写 eos token）。Qwen3+短预算实际 eos≈0，多为 budget_stop。
+        _sp_kw = dict(temperature=max(temperature, 1e-6), top_p=0.9,
+                      max_tokens=max_new,
+                      repetition_penalty=max(float(repetition_penalty), 1.0))
+        if eos_token_id is not None:
+            _sp_kw["stop_token_ids"] = [int(eos_token_id)]
+        sampling = SamplingParams(**_sp_kw)
         seqs = [prompts[b].tolist() for b in range(B)]
         outs = self._generate(seqs, sampling)
         parsed = parse_vllm_outputs(outs, max_new, eos_token_id,
@@ -435,7 +441,11 @@ class VLLMRolloutEngine:
         for b, o in enumerate(outs):
             toks = o.outputs[0].token_ids[:max_new]
             n = parsed["lengths"][b]
-            res[b, :n] = torch.tensor(toks[:n], dtype=torch.long)
+            res[b, :len(toks)] = torch.tensor(toks, dtype=torch.long)
+            # stop_token_ids 路径（eos 不入输出）：在 eos 位置补写 eos token，还原
+            # toy 语义（length=eos_pos+1 含 eos）。
+            if parsed["statuses"][b] == "eos" and parsed["eos_pos"][b] == len(toks):
+                res[b, len(toks)] = int(eos_token_id if eos_token_id is not None else pad_id)
         parsed["responses"] = res.to(self.device)
         return parsed
 
@@ -460,9 +470,14 @@ def parse_vllm_outputs(outs, max_new: int, eos_token_id=None,
     looped: list[bool] = []
     for o in outs:
         new = o.outputs[0].token_ids          # 生成部分（不含 prompt）
+        fr = o.outputs[0].finish_reason
         if eos_token_id is not None and eos_token_id in new:
             ep = new.index(eos_token_id)
             status, length = "eos", ep + 1          # 含 eos
+        elif (eos_token_id is not None and fr == "stop"):
+            # vLLM>=0.8 stop_token_ids 路径：eos 被消费但【不入输出】；finish_reason=stop
+            # 且我们只传了 eos 一个 stop token → 判 eos 停，位置=len(new)、length=len+1。
+            ep, status, length = len(new), "eos", len(new) + 1
         else:
             ep, status, length = None, "budget_stop", len(new)
         loop = loop_detection and detect_loop(
