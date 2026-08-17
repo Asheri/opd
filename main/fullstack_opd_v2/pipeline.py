@@ -630,6 +630,12 @@ class FullStackOPDv2:
                 dist_engines: dict | None = None   # IMP-2/P0：rollout 相位分布引擎 {s_old,rl,ref,ref_anchor}
                 if s2cfg.get("rollout_engine") == "vllm":
                     from .rollout_vllm import VLLMRolloutEngine
+                    # IMP-2/P1 实测修复：vLLM 引擎词表必须用【学生真实词表】
+                    # （HF 路径 student.vocab = model.config.vocab_size=151936）。
+                    # cfg["vocab_size"] 是 toy 默认 64，泄漏到引擎会让
+                    # response_dists 稠密重建 out=(B*T*V) 越界 IndexError
+                    # （2026-08-17 双卡实测：index 1049554 > size 1048576）。
+                    _engine_vocab = int(getattr(student, "vocab", None) or vocab)
                     # L3/IMP-2：rollout vLLM 引擎放独立卡（rollout_device，默认 cuda:1），
                     # 避免与训练卡（cuda:0）的 student/teacher 显存冲突（vLLM 默认
                     # gpu_memory_utilization=0.9 独占）。tp_size=1 单卡 rollout；权重由
@@ -647,7 +653,7 @@ class FullStackOPDv2:
                         # 训练+vLLM 共卡时调低 rollout_gpu_mem（如 0.5）防 OOM。
                         gpu_memory_utilization=float(s2cfg.get("rollout_gpu_mem", 0.9)),
                         max_model_len=int(s2cfg.get("rollout_max_model_len", 2048)),
-                        vocab_size=vocab,
+                        vocab_size=_engine_vocab,
                         full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
                         device=rollout_device)
                     # IMP-2/P0：rollout 相位 4 个分布前向（s_old/rl/ref/ref_anchor）切 vLLM
@@ -672,7 +678,7 @@ class FullStackOPDv2:
                                     dtype=s2cfg.get("rollout_dtype", "auto"),
                                     gpu_memory_utilization=float(
                                         _l2roll.get("dist_engine_gpu_mem", 0.25)),
-                                    vocab_size=vocab,
+                                    vocab_size=_engine_vocab,
                                     full_logprobs_cap=int(
                                         s2cfg.get("rollout_logprobs_cap", 4096)),
                                     device=rollout_device)

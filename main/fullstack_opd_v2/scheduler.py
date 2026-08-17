@@ -142,6 +142,10 @@ class AsyncBatchedScheduler:
         self.staleness_drop_base = bool(cfg.get("staleness_drop_base", True))
         self.weight_store = WeightStore(offload_to_cpu=self.offload_to_cpu)
         self.stop = threading.Event()
+        # IMP-2/P1 稳健性：worker 线程异常 → 记录并停线程，主循环快速失败
+        # （此前 collector 线程死亡 → _train_dispatcher 空等 queue → GPU 0% 空挂）。
+        self._thread_error: Exception | None = None
+        self._err_lock = threading.Lock()
         self.metrics: list = []
         # P2-1：只观测计数器（不改控制流）
         self._n_rollout = 0          # rollout 实际前向次数
@@ -170,27 +174,28 @@ class AsyncBatchedScheduler:
             self.staleness_q._cur_version = initial_version
             self.weight_store._version = initial_version
 
-        # L3 · vLLM rollout 引擎（可选）：包成 response_dists 的 drop-in 替换。
-        # 提供时，rollout 阶段用 vLLM TP=2 推理取代 self.worker 的朴素前向；
-        # self.worker（ToyModel 副本）仅作权重对照，无需常驻显存。
+        # L3 · vLLM rollout 引擎（可选）：供 pipeline 的 L2 刷新相位生成与稀疏分布前向
+        # （generate_with_status / response_dists_topk，见 pipeline 接线）。
+        # ⚠️ IMP-2/P1 实测修复（2026-08-17）：base 池 s_old【恒用 HF/toy worker 前向】，
+        # 不走 vLLM 的稠密 response_dists 重建——真实词表（V=151936）下 vLLM 逐 token
+        # prompt_logprobs 重建 (B,T,V) 慢 ~50s/样本且占显存，且 vocab 错误时会 IndexError
+        # 挂死 collector 线程→主循环空等（GPU 占用 0%）。vLLM 的职责是【生成】与【稀疏
+        # top-K 分布】，base 池稠密 s_old 由 HF worker 一次前向完成（与 toy 路径一致）。
         self.rollout_engine = rollout_engine
         if self.rollout_engine is not None and not vllm_available():
             raise RuntimeError("cfg 指定 vLLM rollout 但 vllm 未安装（统一 GPU 环境应含）。")
-        if self.rollout_engine is None:
-            # 旧快照前向模型：toy → CausalToyLM 副本；hf → 同 student 路径再加载一份
-            # HFCausalLM（权重随后经 weight_store 快照覆盖）。⚠️ hf 骨架：需 GPU 验证。
-            # P1-B：model_kind 由 pipeline 从顶层注入 s2cfg；student_path 同理（hf 时
-            # build_model 按 role=student 读它）。n_layers 用 getattr 防御（非 toy student
-            # 可能无该属性，避免 CausalToyLM 分支构造崩溃）。
-            if cfg.get("model_kind") == "hf":
-                from .model_factory import build_model as _build_model
-                self.worker = _build_model(cfg, device, role="student")
-            else:
-                self.worker = CausalToyLM(vocab=student.vocab, d_model=student.d_model,
-                                          n_layers=getattr(student, "n_layers",
-                                                           cfg.get("n_layers", 2))).to(device)
+        # 旧快照前向模型（base 池 s_old）：toy → CausalToyLM 副本；hf → 同 student
+        # 路径再加载一份 HFCausalLM（权重随后经 weight_store 快照覆盖）。
+        # P1-B：model_kind 由 pipeline 从顶层注入 s2cfg；student_path 同理（hf 时
+        # build_model 按 role=student 读它）。n_layers 用 getattr 防御（非 toy student
+        # 可能无该属性，避免 CausalToyLM 分支构造崩溃）。
+        if cfg.get("model_kind") == "hf":
+            from .model_factory import build_model as _build_model
+            self.worker = _build_model(cfg, device, role="student")
         else:
-            self.worker = None
+            self.worker = CausalToyLM(vocab=student.vocab, d_model=student.d_model,
+                                      n_layers=getattr(student, "n_layers",
+                                                       cfg.get("n_layers", 2))).to(device)
         self._loaded_ver = -1
 
     # --------------------------- 优化器 ---------------------------
@@ -242,32 +247,23 @@ class AsyncBatchedScheduler:
                 # colocated CPU offload（L6）：快照可能在 CPU，加载前搬回设备
                 if self.offload_to_cpu:
                     snap = {k: v.to(self.device) for k, v in snap.items()}
-                if self.rollout_engine is not None:
-                    # L3 · vLLM 路径：把新权重推入 vLLM 引擎（取代 load_state_dict）
-                    self.rollout_engine.update_weights(snap)
-                else:
-                    self.worker.load_state_dict(snap)
+                # IMP-2/P1：base 池 s_old 恒用 HF/toy worker（vLLM 只负责 L2 生成）。
+                self.worker.load_state_dict(snap)
                 self._loaded_ver = ver
             self._n_rollout += 1
             idxs_dev = idxs.to(self.device)
-            if self.rollout_engine is not None:
-                # L3 · vLLM TP=2 推理：response_dists 接口对齐，返回 (B,T,V) 落设备
-                with torch.no_grad():
-                    s_old = self.rollout_engine.response_dists(
-                        self.prompts[idxs_dev], self.responses[idxs_dev])
-            else:
-                self.worker.eval()
-                with torch.no_grad():
-                    # P-显存修复：worker 前向产物 s_old 是 (B,T,V) 大张量，HF lm_head 输出
-                    # 在 autocast 下仍 fp32（2.5GB/份@batch2）。队列 queue_size=2 + 训练
-                    # backward 同时驻留 → 与 train_step 叠加 OOM（部署实测 84GB）。autocast
-                    # 省前向激活 + 显式 .to 让队列里的 s_old 全程 bf16（砍半）。
-                    with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
-                                            enabled=self.amp):
-                        s_old = response_dists(self.worker, self.prompts[idxs_dev],
-                                               self.responses[idxs_dev])  # (B,T,V)
-                    if self.dtype is not None and s_old.dtype != self.dtype:
-                        s_old = s_old.to(self.dtype)
+            self.worker.eval()
+            with torch.no_grad():
+                # P-显存修复：worker 前向产物 s_old 是 (B,T,V) 大张量，HF lm_head 输出
+                # 在 autocast 下仍 fp32（2.5GB/份@batch2）。队列 queue_size=2 + 训练
+                # backward 同时驻留 → 与 train_step 叠加 OOM（部署实测 84GB）。autocast
+                # 省前向激活 + 显式 .to 让队列里的 s_old 全程 bf16（砍半）。
+                with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
+                                        enabled=self.amp):
+                    s_old = response_dists(self.worker, self.prompts[idxs_dev],
+                                           self.responses[idxs_dev])  # (B,T,V)
+                if self.dtype is not None and s_old.dtype != self.dtype:
+                    s_old = s_old.to(self.dtype)
             try:
                 self._rq.put((idxs, s_old, self._loaded_ver), timeout=_PUT_TIMEOUT)
             except queue.Full:
@@ -568,6 +564,13 @@ class AsyncBatchedScheduler:
     def _train_dispatcher(self, n_steps: int, on_step=None, start_step: int = 0):
         done = start_step
         while done < start_step + n_steps:
+            # 快速失败：任一 worker 线程死亡（异常）立即抛出，不空等（避免 GPU 0%）。
+            with self._err_lock:
+                if self._thread_error is not None:
+                    raise RuntimeError(
+                        "worker 线程异常（训练中止，避免空等）："
+                        f"{type(self._thread_error).__name__}: {self._thread_error}") \
+                        from self._thread_error
             try:
                 (idxs, s_old, delta), ver, _ = self.staleness_q.get(timeout=_DISPATCH_GET_TIMEOUT)
             except queue.Empty:
@@ -590,10 +593,22 @@ class AsyncBatchedScheduler:
         self._pq: "queue.Queue" = queue.Queue(maxsize=self.cfg.get("queue_size", 8))
         self._rq: "queue.Queue" = queue.Queue(maxsize=self.cfg.get("queue_size", 8))
 
+        def _guard(fn):
+            """把线程目标包一层：异常 → 记录 + 停其他线程（让主循环快速失败）。"""
+            def _wrapped(*a, **k):
+                try:
+                    fn(*a, **k)
+                except Exception as e:          # noqa: BLE001 —— 必须捕获全部线程异常
+                    with self._err_lock:
+                        if self._thread_error is None:
+                            self._thread_error = e
+                    self.stop.set()
+            return _wrapped
+
         threads = [
-            threading.Thread(target=self._rollout_collector, name="RolloutCollector"),
-            threading.Thread(target=self._teacher_scorer, name="TeacherScorer"),
-            threading.Thread(target=self._prompt_feeder, name="PromptFeeder"),
+            threading.Thread(target=_guard(self._rollout_collector), name="RolloutCollector"),
+            threading.Thread(target=_guard(self._teacher_scorer), name="TeacherScorer"),
+            threading.Thread(target=_guard(self._prompt_feeder), name="PromptFeeder"),
         ]
         for t in threads:
             t.start()
