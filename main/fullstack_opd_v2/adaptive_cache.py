@@ -210,6 +210,15 @@ class RefreshRingBuffer:
         self.s_old_logp: torch.Tensor | None = None       # (cap, T, Ks) 行为策略学生 top-K logp
         self.s_old_ids_sorted: torch.Tensor | None = None # 每槽按 id 升序
         self.s_old_logp_sorted: torch.Tensor | None = None
+        # IMP-3（Refresh KL Anchor Correctness）：初始 student 在 rollout 响应上的
+        # top-K 分布（KL 锚点）。base 路径锚点=初始 student 在静态响应上（正确）；
+        # refresh 路径锚点必须是【同一 rollout 响应】上的初始 student 分布，否则
+        # token 重合率 ~2%、支撑外 ~27% → tail_logp 巨惩罚 → kl_loss 爆炸（GPU 实测）。
+        # 旧断点/旧调用无此字段 → 保持 None → scheduler 回落旧静态锚点（向后兼容）。
+        self.ref_anchor_ids: torch.Tensor | None = None        # (cap, T, Kr)
+        self.ref_anchor_logp: torch.Tensor | None = None       # (cap, T, Kr)
+        self.ref_anchor_ids_sorted: torch.Tensor | None = None
+        self.ref_anchor_logp_sorted: torch.Tensor | None = None
         self._gen_steps: list[int] = []             # 每槽 generation_step
         self._resp_lens: list[int] = []
         self._token_masks: list[torch.Tensor] = []
@@ -237,6 +246,12 @@ class RefreshRingBuffer:
                                           dtype=dtype, device=device)
             self.s_old_ids_sorted = self.s_old_ids.clone()
             self.s_old_logp_sorted = self.s_old_logp.clone()
+            # IMP-3：ref 锚点 top-K（Kr = student_top_k，与 s_cur 支撑对齐）
+            Kr = self.student_top_k
+            self.ref_anchor_ids = torch.zeros(self.capacity, T, Kr, dtype=torch.long, device=device)
+            self.ref_anchor_logp = torch.zeros(self.capacity, T, Kr, dtype=dtype, device=device)
+            self.ref_anchor_ids_sorted = self.ref_anchor_ids.clone()
+            self.ref_anchor_logp_sorted = self.ref_anchor_logp.clone()
 
     def _sort_slot(self, pos: int):
         """按 token id 升序重排教师 top-K 与行为策略学生 top-K（供 searchsorted）。"""
@@ -246,6 +261,10 @@ class RefreshRingBuffer:
         so = torch.argsort(self.s_old_ids[pos], dim=-1)
         self.s_old_ids_sorted[pos] = self.s_old_ids[pos].gather(-1, so)
         self.s_old_logp_sorted[pos] = self.s_old_logp[pos].gather(-1, so)
+        if self.ref_anchor_ids is not None:
+            ro = torch.argsort(self.ref_anchor_ids[pos], dim=-1)
+            self.ref_anchor_ids_sorted[pos] = self.ref_anchor_ids[pos].gather(-1, ro)
+            self.ref_anchor_logp_sorted[pos] = self.ref_anchor_logp[pos].gather(-1, ro)
 
     def append(self, ids: torch.Tensor, delta_k: torch.Tensor,
                generation_step: int, response_length: int,
@@ -253,7 +272,9 @@ class RefreshRingBuffer:
                prompt_idx: int, response: torch.Tensor,
                s_old_ids: torch.Tensor, s_old_logp: torch.Tensor,
                status: str = "budget_stop",
-               source: str = "student") -> int:
+               source: str = "student",
+               ref_anchor_ids: torch.Tensor | None = None,
+               ref_anchor_logp: torch.Tensor | None = None) -> int:
         """append 一条样本（ids/delta_k/s_old_ids/s_old_logp: (T,K)）。满则 FIFO 淘汰。
 
         status：Stage 2 rollout 状态（eos/budget_stop），默认 budget_stop 兼容旧调用。
@@ -274,6 +295,10 @@ class RefreshRingBuffer:
         self.delta_k[pos] = delta_k
         self.s_old_ids[pos] = s_old_ids
         self.s_old_logp[pos] = s_old_logp
+        # IMP-3：ref 锚点（初始 student 在 rollout 响应上的 top-K）；None → 该槽沿用 0 填充
+        if ref_anchor_ids is not None and ref_anchor_logp is not None:
+            self.ref_anchor_ids[pos] = ref_anchor_ids
+            self.ref_anchor_logp[pos] = ref_anchor_logp
         self._sort_slot(pos)
         # 列表按 pos 索引（ring buffer 槽位复用）
         if pos < len(self._gen_steps):
@@ -393,6 +418,24 @@ class RefreshRingBuffer:
         return logp_s.gather(-1, pos).where(
             found, torch.full_like(logp_s.gather(-1, pos), tail_logp))
 
+    def ref_anchor_at_student_topk(self, idxs: torch.Tensor,
+                                    student_topk_ids: torch.Tensor,
+                                    device, tail_logp: float = -1e2) -> torch.Tensor:
+        """IMP-3：把【初始 student 在 rollout 响应上的 top-K】展开到 s_cur 当前 top-K 支撑。
+
+        与 _ref_logp_at_student_topk（静态 fat_responses 锚点）同构，但锚点来自 rollout
+        响应（r_b）——refresh 训练 KL 的正确锚点。返回 (B,T,Ks)：锚点 top-K 命中处取
+        logp，未命中填 tail_logp（支撑外强惩罚）。旧断点（无 ref_anchor_*）时由
+        scheduler 回落静态锚点。
+        """
+        ids_s = self.ref_anchor_ids_sorted[idxs]           # (B,T,Kr) 已升序
+        logp_s = self.ref_anchor_logp_sorted[idxs]
+        Kr = ids_s.size(-1)
+        pos = torch.searchsorted(ids_s, student_topk_ids.contiguous()).clamp(max=Kr - 1)
+        found = ids_s.gather(-1, pos) == student_topk_ids
+        return logp_s.gather(-1, pos).where(
+            found, torch.full_like(logp_s.gather(-1, pos), tail_logp))
+
     def reward_estimate(self, pos: int, device=None) -> float:
         """E_{π_cur}[Δ_T] 估计（行为策略 top-K 支撑，monitor 用，非训练信号）。
 
@@ -423,6 +466,8 @@ class RefreshRingBuffer:
             "delta_k": (self.delta_k[:self.size].detach().cpu() if self.delta_k is not None else None),
             "s_old_ids": (self.s_old_ids[:self.size].detach().cpu() if self.s_old_ids is not None else None),
             "s_old_logp": (self.s_old_logp[:self.size].detach().cpu() if self.s_old_logp is not None else None),
+            "ref_anchor_ids": (self.ref_anchor_ids[:self.size].detach().cpu() if self.ref_anchor_ids is not None else None),
+            "ref_anchor_logp": (self.ref_anchor_logp[:self.size].detach().cpu() if self.ref_anchor_logp is not None else None),
             "gen_steps": self._gen_steps[:self.size],
             "resp_lens": self._resp_lens[:self.size],
             "token_masks": [m.detach().cpu() for m in self._token_masks[:self.size]],
@@ -444,6 +489,11 @@ class RefreshRingBuffer:
             self.delta_k[:self.size] = sd["delta_k"]
             self.s_old_ids[:self.size] = sd["s_old_ids"]
             self.s_old_logp[:self.size] = sd["s_old_logp"]
+            # IMP-3：旧断点无 ref_anchor_* → 保持 None（scheduler 回落静态锚点）
+            if sd.get("ref_anchor_ids") is not None:
+                self._ensure_alloc(sd["ids"].size(1), sd["ids"].device, sd["delta_k"].dtype)
+                self.ref_anchor_ids[:self.size] = sd["ref_anchor_ids"]
+                self.ref_anchor_logp[:self.size] = sd["ref_anchor_logp"]
             for i in range(self.size):
                 self._sort_slot(i)
         self._gen_steps = list(sd["gen_steps"][:self.size])
@@ -759,6 +809,15 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）。先于 D 计算（compute 用）。
     mask = build_length_mask(resp_v, [lengths[i] for i in valid],
                              [eos_pos[i] for i in valid])
+    # IMP-3（Refresh KL Anchor Correctness）：refresh KL 锚点 = 初始 student 在【同一
+    # rollout 响应 r_b】上的 top-K。base 路径锚点是静态 fat_responses 上的初始 student
+    # 分布（同响应 → 正确）；refresh 若复用静态锚点则 token 重合 ~2%、支撑外 ~27% →
+    # tail_logp 巨惩罚 → kl_loss 爆炸（GPU 实测 2026-08-17，见 IMP-3 报告）。
+    # per-chunk 不驻留完整 (M,T,V)；student_ref 为初始权重（rollout 阶段不变）。
+    with torch.no_grad():
+        student_ref.eval()
+        ref_a_ids, ref_a_logp = _response_dists_topk(
+            student_ref, p_b_v, resp_v, Ks, dists_chunk)
     # P1.4：disagreement.enabled 硬 gate——关闭时跳过 D 计算（省 student/student_ref
     # chosen-logp 前向），append 用 D=0（E1↔E2 差异改为真实计算量差异）。
     if compute_disagreement:
@@ -778,7 +837,8 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
             disagreement_abs=D_vals[j],
             prompt_idx=int(cand[i]), response=resp_v[j],
             s_old_ids=s_old_ids[j], s_old_logp=s_old_logp[j],
-            status=statuses[i], source=rollout_source)
+            status=statuses[i], source=rollout_source,
+            ref_anchor_ids=ref_a_ids[j], ref_anchor_logp=ref_a_logp[j])
         # G2：写回 PromptState（rollout 结果 -> prompt 历史 -> 下次 selection 闭环）。
         if prompt_state is not None:
             rew = ring_buffer.reward_estimate(pos)

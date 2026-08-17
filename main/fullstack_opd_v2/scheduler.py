@@ -484,8 +484,15 @@ class AsyncBatchedScheduler:
             s_old_at = rb.s_old_at_student_topk(
                 rb_idxs, s_topk.indices, self.device,
                 tail_logp=self.ref_tail_logp)                  # (B,T,Ks)
-            # KL 锚点：dense 模式从 ref_dists 取，稀疏模式从 ref_top-K 取（同 base 路径）
-            if self.kl_mode == "dense":
+            # IMP-3（Refresh KL Anchor Correctness）：refresh KL 锚点优先用 ring buffer 存的
+            # 【初始 student 在 rollout 响应上的 top-K】（rollout 相位 per-chunk 算好）。
+            # 旧断点/旧调用无 ref_anchor_* 时回落静态 fat_responses 锚点（向后兼容；
+            # 注意该回落路径存在锚点错位——token 重合 ~2%、支撑外 ~27% → kl_loss 爆炸，
+            # 见 IMP-3 报告，仅对旧 checkpoint/旧数据生效）。
+            if rb.ref_anchor_ids is not None:
+                ref_at = rb.ref_anchor_at_student_topk(
+                    rb_idxs, s_topk.indices, self.device, tail_logp=self.ref_tail_logp)
+            elif self.kl_mode == "dense":
                 _T = min(self.ref_dists[batch["prompt_idx"]].size(1), s_topk.indices.size(1))
                 ref_at = self.ref_dists[batch["prompt_idx"]][:, :_T].gather(
                     -1, s_topk.indices[:, :_T])                # (B,T,Ks)
