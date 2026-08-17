@@ -9,7 +9,8 @@ def test_build_nccl_update_info():
         "model.layers.0.self_attn.q_proj.weight": torch.ones(4, 8, dtype=torch.float32),
     }
     info = _build_nccl_update_info(sd)
-    assert info["backend"] == "nccl"
+    # backend 由引擎启动时的 WeightTransferConfig 决定，update_info 不带 backend 键
+    assert "backend" not in info
     assert info["names"] == list(sd.keys())
     assert info["dtype_names"] == ["bfloat16", "float32"]
     assert info["shapes"] == [[16, 8], [4, 8]]

@@ -100,6 +100,17 @@ class VLLMRolloutEngine:
         # vLLM 引擎默认 max_logprobs=20，超过会被 SamplingParams 校验拒绝 → 必须抬高上限，
         # 否则小词表精确重建路径在运行期才报错。
         engine_kwargs.setdefault("max_logprobs", max(self.full_cap, 20))
+        # vLLM>=0.16 NCCL 权重同步：引擎【启动时】就必须带 weight_transfer_config，
+        # 否则 worker 的 init_weight_transfer_engine 直接拒绝（"Weight transfer not
+        # configured"）→ trainer 的 TCPStore 等不到 rank1 → 死锁（2026-08-17 实测）。
+        if str(weight_sync_mode).lower() != "off":
+            try:
+                from vllm.config.weight_transfer import WeightTransferConfig
+                engine_kwargs["weight_transfer_config"] = WeightTransferConfig(backend="nccl")
+            except Exception as e:   # pragma: no cover —— 旧版 vLLM 无此配置
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"weight_transfer_config 不可用（旧版 vLLM？）：{e}")
         self.llm = LLM(
             model=model,
             tensor_parallel_size=self.tp_size,
@@ -269,10 +280,31 @@ class VLLMRolloutEngine:
             "rank_offset": 1,                     # trainer=0，worker 从 1 起
             "world_size": 1 + int(self.tp_size),
         }
-        # trainer 侧 NCCL 组（rank 0，用当前 CUDA 设备）
+        # NCCL 组建立是【阻塞集合操作】：trainer（rank0）与 worker（rank1）必须【并发】
+        # 调 init，否则一方等另一方加入 → 死锁（2026-08-17 实测：base 训练 20 步完成后
+        # 卡死在 update_weights 初始化）。故 worker 侧 init 放后台线程，主线程 trainer_init
+        # 阻塞握手；两者在同一 master_port/store 上完成 NCCL 组建立。
+        _init_err: list[Exception] = []
+
+        def _worker_init():
+            try:
+                self.llm.init_weight_transfer_engine({"init_info": self._wt_init_info})
+            except Exception as e:  # noqa: BLE001
+                _init_err.append(e)
+
+        import threading
+        t = threading.Thread(target=_worker_init, daemon=True)
+        t.start()
+        # NCCL 通信组禁止两个 rank 同卡（"Duplicate GPU detected"，2026-08-17 实测）。
+        # trainer（rank0）必须在【训练卡】建组，vLLM worker（rank1）在 rollout 卡——
+        # 布局必须是交叉分卡（CUDA_VISIBLE_DEVICES 重排）。显式把当前设备切到训练卡。
+        if str(self.device).startswith("cuda"):
+            torch.cuda.set_device(self.device)
+        # trainer 侧 NCCL 组（rank 0，用当前 CUDA 设备 = 训练卡）
         self._wt_group = NCCLWeightTransferEngine.trainer_init(self._wt_init_info)
-        # worker 侧加入（EngineCore 上建 group）——在 trainer 组就绪后调用，避免握手错位
-        self.llm.init_weight_transfer_engine({"init_info": self._wt_init_info})
+        t.join(timeout=120)
+        if _init_err:
+            raise RuntimeError(f"vLLM NCCL 权重同步初始化失败（worker 侧）：{_init_err[0]}")
 
     def _weight_transfer_update_16(self, state_dict: dict) -> bool:
         """0.16 NCCL 广播：update_info + 后台线程发权重。
@@ -286,6 +318,11 @@ class VLLMRolloutEngine:
         import threading
         self._weight_transfer_init_16()
         update_info = _build_nccl_update_info(state_dict)
+        # 防御：广播要求 tensor 在 NCCL 组设备（训练卡）上——调用方传 CPU 态会
+        # AssertionError 且被吞 → collective_rpc 永久挂（2026-08-17 实测）。
+        sd_dev = {k: (v.to(self.device) if v.device != torch.device(self.device)
+                      else v) for k, v in state_dict.items()}
+        update_info = _build_nccl_update_info(sd_dev)
         from vllm.distributed.weight_transfer.nccl_engine import (
             NCCLWeightTransferEngine)
         err: list[Exception] = []
@@ -293,7 +330,7 @@ class VLLMRolloutEngine:
         def _send():
             try:
                 NCCLWeightTransferEngine.trainer_send_weights(
-                    iter(state_dict.items()), self._wt_group,
+                    iter(sd_dev.items()), self._wt_group,
                     stream=torch.cuda.current_stream())
             except Exception as e:  # noqa: BLE001 —— 广播失败记入并让主线程抛
                 err.append(e)
@@ -301,9 +338,12 @@ class VLLMRolloutEngine:
         t = threading.Thread(target=_send, daemon=True)
         t.start()
         try:
-            self.llm.update_weights({"update_info": update_info})
+            # 用 engine 层 collective_rpc + 显式超时：广播失败时不无限挂，超时即抛。
+            self.llm.llm_engine.collective_rpc(
+                "update_weights", timeout=float(getattr(self, "_wt_timeout", 120.0)),
+                kwargs={"update_info": update_info})
         finally:
-            t.join(timeout=900)
+            t.join(timeout=float(getattr(self, "_wt_timeout", 120.0)) + 30)
         if err:
             raise RuntimeError(f"vLLM NCCL 权重广播失败：{err[0]}")
         return True
@@ -531,9 +571,11 @@ def _build_nccl_update_info(state_dict: dict) -> dict:
 
     names/dtype_names/shapes 与 trainer_send_weights 的迭代顺序一致（state_dict.items()）。
     is_checkpoint_format=True → worker 用 model.load_weights（HF→vLLM 合并层映射自动）。
+    注意：不带 "backend" 键——worker 的 NCCLWeightTransferUpdateInfo 只接受
+    names/dtype_names/shapes/packed/is_checkpoint_format；backend 由引擎启动时的
+    WeightTransferConfig 决定（2026-08-17 实测：带 backend 会 "unexpected keyword"）。
     """
     return {
-        "backend": "nccl",
         "names": list(state_dict.keys()),
         "dtype_names": [str(t.dtype).split(".")[-1] for t in state_dict.values()],
         "shapes": [list(t.shape) for t in state_dict.values()],
