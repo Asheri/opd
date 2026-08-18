@@ -106,6 +106,15 @@ class HFCausalLM:
         return self.model(**kw).logits
 
     @torch.no_grad()
+    @property
+    def config(self):
+        """代理到内部 HF 模型（scheduler 的 gradient_checkpointing/use_cache 读取）。"""
+        return self.model.config
+
+    def gradient_checkpointing_enable(self):
+        """代理到内部 HF 模型（2026-08-18：backward OOM 根治的激活重计算开关）。"""
+        return self.model.gradient_checkpointing_enable()
+
     def generate_batch(self, prompts: torch.Tensor, max_new: int = 8192,
                        temperature: float = 1.0) -> torch.Tensor:
         """自回归生成（§2.3 骨架：委托 HF generate，真实规模应走 vLLM）。

@@ -53,6 +53,7 @@ BASE_LOG_RATIO_CLIP = 5.0
 
 # 队列操作超时（秒）：put 满 / get 空时的轮询间隔，平衡吞吐与线程响应
 _PUT_TIMEOUT = 0.5        # 入队侧（prompt→rollout、rollout→scorer、scorer→staleness_q）
+_REFRESH_CHUNK = 4  # refresh 训练 chunk 大小（2026-08-18 双卡并行 OOM 实测：整批 (M,T,V) 前向+backward 峰值撞顶，chunk 化 + 梯度累积减半）
 _GET_TIMEOUT = 1.0        # 消费侧空转轮询（rollout/scorer 无批次时）
 _DISPATCH_GET_TIMEOUT = 10.0  # 训练调度器等待批次（远超 GET_TIMEOUT，容忍长队列空窗）
 
@@ -531,79 +532,92 @@ class AsyncBatchedScheduler:
                 "loss": 0.0, "pg_loss": 0.0, "kl_loss": 0.0,
                 "adv_mean": 0.0, "reward": 0.0,
             }
-        batch = rb.get(rb_idxs)
-        p_b = self.prompts[batch["prompt_idx"]].to(self.device)
-        r_b = batch["responses"].to(self.device)
-        mask = batch["token_masks"].to(self.device)
+        # 显存（2026-08-18 双卡并行实测）：refresh 训练整批 (8,2048,V) 前向+backward，
+        # 在 ~67GB 驻留（模型+锚点+对侧 vLLM 引擎 12GB 同卡）上再触发 9.77GB 分配 → OOM。
+        # 拆 chunk（_REFRESH_CHUNK=4，batch=8 → 2 块）【独立小批更新】：每 chunk 完整
+        # forward/backward/step（4 条/次），峰值增量减半（~5GB），图完全独立无共享。
+        # refresh 训练的小批粒度是超参选择（更接近标准 SGD），不影响 rollout/验收口径。
+        chunks = list(rb_idxs.split(max(1, min(_REFRESH_CHUNK, rb_idxs.size(0)))))
         self.student.train()
-        with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
-                                enabled=self.amp):
-            s_cur = self.student.response_dists(p_b, r_b, dtype=self.dtype)  # (B,T,V) 带梯度（P5）
-            # P-显存修复（同 _train_step）：HF lm_head 输出 autocast 下仍 fp32，真实
-            # V=152k 大张量堆 fp32 OOM；转回 autocast dtype（bf16）。refresh 只用 topk
-            # 小张量，bf16 精度足够。
-            if self.dtype is not None and s_cur.dtype != self.dtype:
-                s_cur = s_cur.to(self.dtype)
-            s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
-            # Δ_T 展开到 s_cur top-K（教师 top-K 命中处取 delta_k，未命中=0）
-            delta_at = rb.delta_at_student_topk(
-                rb_idxs, s_topk.indices, self.device)          # (B,T,Ks)
-            # 行为策略 s_old 展开到 s_cur top-K（未命中填 ref_tail_logp≈log 0）
-            s_old_at = rb.s_old_at_student_topk(
-                rb_idxs, s_topk.indices, self.device,
-                tail_logp=self.ref_tail_logp)                  # (B,T,Ks)
-            # IMP-3（Refresh KL Anchor Correctness）：refresh KL 锚点优先用 ring buffer 存的
-            # 【初始 student 在 rollout 响应上的 top-K】（rollout 相位 per-chunk 算好）。
-            # 旧断点/旧调用无 ref_anchor_* 时回落静态 fat_responses 锚点（向后兼容；
-            # 注意该回落路径存在锚点错位——token 重合 ~2%、支撑外 ~27% → kl_loss 爆炸，
-            # 见 IMP-3 报告，仅对旧 checkpoint/旧数据生效）。
-            if rb.ref_anchor_ids is not None:
-                ref_at = rb.ref_anchor_at_student_topk(
-                    rb_idxs, s_topk.indices, self.device, tail_logp=self.ref_tail_logp)
-            elif self.kl_mode == "dense":
-                _T = min(self.ref_dists[batch["prompt_idx"]].size(1), s_topk.indices.size(1))
-                ref_at = self.ref_dists[batch["prompt_idx"]][:, :_T].gather(
-                    -1, s_topk.indices[:, :_T])                # (B,T,Ks)
-            else:
-                ref_at = self._ref_logp_at_student_topk(
-                    batch["prompt_idx"], s_topk.indices)       # (B,T,Ks)
-            # 支撑 = 完整 s_cur top-K（ones），与 KL 同源重归一（对齐原始 Direct-OPD）
-            sup = torch.ones_like(s_topk.values, dtype=torch.bool)
-            loss_pg = pg_loss(s_topk.values, s_old_at, delta_at, mask, self.clip_eps,
-                              p_old=s_old_at.exp(), log_ratio_max=REFRESH_LOG_RATIO_MAX,
-                              log_ratio_clip=REFRESH_LOG_RATIO_MAX,
-                              renormalize_support=True, support=sup,
-                              delta_clip=self.delta_clip)
-            loss_kl = low_var_kl_support(s_topk.values, ref_at, mask,
-                                         renormalize_support=True)
-            loss = loss_pg + self.kl_coef * loss_kl
-
-        self.opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.student.parameters(), self.grad_clip)
-        self.opt.step()
-        version = self._publish()
-        with torch.no_grad():
-            p_cur = s_topk.values.exp()
-            reward = (p_cur * delta_at).sum(-1) * mask
-            adv = (s_old_at.exp() * delta_at).sum(-1) * mask
-            reward = reward.sum() / mask.sum()
-            adv = adv.sum() / mask.sum()
-        scalars = [loss, loss_pg, loss_kl, adv, reward]
-        scalars = [s.float() if s.dtype != torch.float32 else s for s in scalars]
-        loss_v, pg_v, kl_v, adv_v, rew_v = torch.stack(scalars).detach().cpu().tolist()
-        # 标量从标量张量转 float（reward/adv 已是标量）
+        acc = {"loss": [], "pg": [], "kl": [], "rew": [], "adv": []}
+        version = self.staleness_q.current_version
+        for chunk in chunks:
+            batch = rb.get(chunk)
+            # 拷贝成独立张量（ring buffer 全局 storage 共享，防止任何视图别名问题）
+            p_b = self.prompts[batch["prompt_idx"]].to(self.device)
+            r_b = batch["responses"].to(self.device)
+            mask = batch["token_masks"].to(self.device).clone()
+            with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
+                                    enabled=self.amp):
+                s_cur = self.student.response_dists(p_b, r_b, dtype=self.dtype)  # (B,T,V) 带梯度（P5）
+                # P-显存修复（同 _train_step）：HF lm_head 输出 autocast 下仍 fp32，真实
+                # V=152k 大张量堆 fp32 OOM；转回 autocast dtype（bf16）。refresh 只用 topk
+                # 小张量，bf16 精度足够。
+                if self.dtype is not None and s_cur.dtype != self.dtype:
+                    s_cur = s_cur.to(self.dtype)
+                s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
+                # Δ_T 展开到 s_cur top-K（教师 top-K 命中处取 delta_k，未命中=0）
+                delta_at = rb.delta_at_student_topk(
+                    chunk, s_topk.indices, self.device)                # (B,T,Ks)
+                # 行为策略 s_old 展开到 s_cur top-K（未命中填 ref_tail_logp≈log 0）
+                s_old_at = rb.s_old_at_student_topk(
+                    chunk, s_topk.indices, self.device,
+                    tail_logp=self.ref_tail_logp)                      # (B,T,Ks)
+                # IMP-3（Refresh KL Anchor Correctness）：refresh KL 锚点优先用 ring buffer 存的
+                # 【初始 student 在 rollout 响应上的 top-K】（rollout 相位 per-chunk 算好）。
+                # 旧断点/旧调用无 ref_anchor_* 时回落静态 fat_responses 锚点（向后兼容；
+                # 注意该回落路径存在锚点错位——token 重合 ~2%、支撑外 ~27% → kl_loss 爆炸，
+                # 见 IMP-3 报告，仅对旧 checkpoint/旧数据生效）。
+                if rb.ref_anchor_ids is not None:
+                    ref_at = rb.ref_anchor_at_student_topk(
+                        chunk, s_topk.indices, self.device, tail_logp=self.ref_tail_logp)
+                elif self.kl_mode == "dense":
+                    _T = min(self.ref_dists[batch["prompt_idx"]].size(1),
+                             s_topk.indices.size(1))
+                    ref_at = self.ref_dists[batch["prompt_idx"]][:, :_T].gather(
+                        -1, s_topk.indices[:, :_T])                    # (B,T,Ks)
+                else:
+                    ref_at = self._ref_logp_at_student_topk(
+                        batch["prompt_idx"], s_topk.indices)           # (B,T,Ks)
+                # 支撑 = 完整 s_cur top-K（ones），与 KL 同源重归一（对齐原始 Direct-OPD）
+                sup = torch.ones_like(s_topk.values, dtype=torch.bool)
+                loss_pg = pg_loss(s_topk.values, s_old_at, delta_at, mask, self.clip_eps,
+                                  p_old=s_old_at.exp(), log_ratio_max=REFRESH_LOG_RATIO_MAX,
+                                  log_ratio_clip=REFRESH_LOG_RATIO_MAX,
+                                  renormalize_support=True, support=sup,
+                                  delta_clip=self.delta_clip)
+                loss_kl = low_var_kl_support(s_topk.values, ref_at, mask,
+                                             renormalize_support=True)
+                loss = loss_pg + self.kl_coef * loss_kl
+                with torch.no_grad():
+                    p_cur = s_topk.values.exp()
+                    reward = (p_cur * delta_at).sum(-1) * mask
+                    adv = (s_old_at.exp() * delta_at).sum(-1) * mask
+                    acc["loss"].append(loss.detach().float())
+                    acc["pg"].append(loss_pg.detach().float())
+                    acc["kl"].append(loss_kl.detach().float())
+                    acc["rew"].append((reward.sum() / max(mask.sum(), 1)).float())
+                    acc["adv"].append((adv.sum() / max(mask.sum(), 1)).float())
+            self.opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.student.parameters(), self.grad_clip)
+            self.opt.step()
+            version = self._publish()
+        # 展示用聚合：各 chunk 标量均值
+        loss_v, pg_v, kl_v, adv_v, rew_v = [
+            float(torch.stack(acc[k]).mean()) if acc[k] else 0.0 for k in
+            ("loss", "pg", "kl", "adv", "rew")]
         return {
             "step": done,
             "version": version,
             "age": 0,
             "pool": "refresh",
-            "batch": int(r_b.size(0)),
+            "batch": int(rb_idxs.size(0)),
             "loss": loss_v,
             "pg_loss": pg_v,
             "kl_loss": kl_v,
-            "adv_mean": float(adv_v),
-            "reward": float(rew_v),
+            "adv_mean": adv_v,
+            "reward": rew_v,
         }
 
     def train_refresh_phase(self, rb, alpha: float, n_refresh_steps: int,
