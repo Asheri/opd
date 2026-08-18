@@ -136,6 +136,28 @@ def test_train_step_dense_fetches_delta_when_none():
         assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"
 
 
+def test_train_step_passes_dtype_to_response_dists(monkeypatch):
+    """P5 回归（2026-08-18 GPU 实测）：_train_step 的 s_cur 前向必须带 dtype=self.dtype，
+    使 fp32 (B,T,V) logits+log_softmax 不离开 response_dists（真实词表 7.5GB/份@batch4，
+    双份驻留推高训练峰值 ~15GB）。"""
+    student, cache, prompts, responses, ref_dists = _setup()
+    orig = student.response_dists
+    seen = {}
+
+    def spy(p, r, dtype=None):
+        seen["dtype"] = dtype
+        return orig(p, r, dtype=dtype)
+
+    monkeypatch.setattr(student, "response_dists", spy)
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, _cfg(), "cpu")
+    idxs = torch.arange(4)
+    s_old = response_dists(student, prompts[idxs], responses[idxs])
+    m = sched._train_step(0, idxs, s_old, None, 0)
+    assert m is not None                     # 训练步正常完成
+    assert seen.get("dtype") == torch.float32   # self.dtype（fp32）被透传
+
+
 def test_scheduler_worker_hf_branch_uses_factory(monkeypatch):
     """P1-B（二次审查）：model_kind='hf' 注入 s2cfg 后，worker 走 build_model 而非
     CausalToyLM（旧版恒走 toy 分支、对无 n_layers 的 HFCausalLM 取 n_layers → AttributeError）。"""

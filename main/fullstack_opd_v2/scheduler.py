@@ -350,7 +350,11 @@ class AsyncBatchedScheduler:
         # bf16 自动混合精度（L1）：包住前向 + 损失 + 反向（bf16 有范围，无需 GradScaler）。
         with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
                                 enabled=self.amp):
-            s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
+            # P5 dtype 透传（2026-08-18 GPU 实测）：HF lm_head 输出在 autocast 下仍为
+            # fp32，(B,T,V) fp32 双份（logits+log_softmax）驻留推高训练峰值——改在函数内
+            # 立即转 bf16，fp32 不离开 response_dists（峰值减半）。下游 373 行防御转换
+            # 保留（幂等）。真实词表 V=151936 下每份 (4,3072,V) fp32≈7.5GB。
+            s_cur = self.student.response_dists(p_b, r_b, dtype=self.dtype)  # (B,T,V) 带梯度
             # P-显存修复：HF lm_head 输出在 autocast 下仍为 fp32（transformers 行为），
             # 真实词表 V=152k 下 (B,T,V) fp32=2.5GB/张，而 pg_loss 内部 ~11 个中间张量
             # 全堆 fp32 → 25GB+，叠加 worker/队列/激活 OOM（部署实测 87GB）。转回 autocast
@@ -498,7 +502,7 @@ class AsyncBatchedScheduler:
         self.student.train()
         with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
                                 enabled=self.amp):
-            s_cur = self.student.response_dists(p_b, r_b)      # (B,T,V) 带梯度
+            s_cur = self.student.response_dists(p_b, r_b, dtype=self.dtype)  # (B,T,V) 带梯度（P5）
             # P-显存修复（同 _train_step）：HF lm_head 输出 autocast 下仍 fp32，真实
             # V=152k 大张量堆 fp32 OOM；转回 autocast dtype（bf16）。refresh 只用 topk
             # 小张量，bf16 精度足够。
