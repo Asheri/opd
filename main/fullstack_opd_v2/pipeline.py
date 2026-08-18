@@ -21,6 +21,14 @@ import time
 
 import torch
 
+
+def _mem_point(tag: str) -> None:
+    """显存打点（调试用，OPD_MEM_TRACE=1）。"""
+    import os as _os
+    if _os.environ.get("OPD_MEM_TRACE") == "1" and torch.cuda.is_available():
+        print(f"[MEM:{tag}] allocated={torch.cuda.memory_allocated()/2**30:.1f}GiB "
+              f"reserved={torch.cuda.memory_reserved()/2**30:.1f}GiB", flush=True)
+
 from .cache import TensorTeacherCache
 from .cache_store import (DiskTeacherCache, hash_models_from_cfg,
                           load_cache_metadata, verify_consistency,
@@ -610,6 +618,7 @@ class FullStackOPDv2:
             anchor_model = student
             if resume is not None:                 # 旧断点无 ref：重建初始 student 算锚点
                 anchor_model = build_model(self.cfg, self.device, role="student")
+                _mem_point("stage2:anchor_model_ready")
                 logger.info("resume: 断点无 ref 锚点，重建初始 student 重算 KL 锚点（旧断点兼容）")
             anchor_model.eval()
             # Stage 1 统一 K：ref_topk 显式给出时优先；cache_mode=topk 且未显式给 ref_topk 时

@@ -76,9 +76,15 @@ def response_dists(model: CausalToyLM, prompts: torch.Tensor,
     P = prompts.size(1)
     T = responses.size(1)
     full = torch.cat([prompts, responses], dim=1)          # (B, P+T)
-    logp = F.log_softmax(model(full), dim=-1)              # (B, P+T, V)
-    if dtype is not None and logp.dtype != dtype:
-        logp = logp.to(dtype)
+    logits = model(full)                                   # (B, P+T, V)
+    # P5 修正（2026-08-18 GPU 实测 +59GB/步）：HF lm_head 输出在 autocast 下仍 fp32。
+    # 旧实现先 fp32 log_softmax 再 .to(bf16) → fp32 logits + fp32 logp + bf16 副本
+    # 三份共存（batch8 ≈ 37GB），train_step 峰值 93GB OOM。改为【先转 bf16 再
+    # log_softmax】：fp32 只在 lm_head 输出瞬态（.to 后即释放），峰值 ~22GB；
+    # bf16 域 log_softmax 精度与 PG 中间量一致（Δ_T 本就在 bf16 域）。
+    if dtype is not None and logits.dtype != dtype:
+        logits = logits.to(dtype)
+    logp = F.log_softmax(logits, dim=-1)                   # (B, P+T, V)
     return logp[:, P - 1:P - 1 + T]                        # (B, T, V)
 
 

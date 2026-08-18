@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import os
+
 import queue
 import threading
 import time
@@ -83,6 +85,17 @@ except Exception:                                   # pragma: no cover
 
 _DTYPE_MAP = {"fp32": torch.float32, "bf16": torch.bfloat16,
               "float32": torch.float32, "bfloat16": torch.bfloat16}
+
+
+_OPD_MEM_TRACE = os.environ.get("OPD_MEM_TRACE") == "1"
+
+
+def _mem(tag: str) -> None:
+    """显存打点（调试用）：OPD_MEM_TRACE=1 时打印 memory_allocated/reserved。"""
+    if not _OPD_MEM_TRACE or not torch.cuda.is_available():
+        return
+    print(f"[MEM:{tag}] allocated={torch.cuda.memory_allocated()/2**30:.1f}GiB "
+          f"reserved={torch.cuda.memory_reserved()/2**30:.1f}GiB", flush=True)
 
 
 class AsyncBatchedScheduler:
@@ -167,6 +180,7 @@ class AsyncBatchedScheduler:
         self.grad_clip = cfg.get("grad_clip", 1.0)
         self.use_topk = (self.top_k_student > 0) and (cache.mode == "topk")
         self.opt = self._build_optimizer(student, cfg)
+        _mem("scheduler.__init__:opt_ready")
 
         # 初始化权重快照（首版 = student 当前权重），供 rollout worker 加载版本 0。
         # 注意：不调用 self._publish() —— 分布式版的 _publish 已被 NCCL 广播覆盖，
@@ -272,6 +286,13 @@ class AsyncBatchedScheduler:
                 if self.dtype is not None and s_old.dtype != self.dtype:
                     s_old = s_old.to(self.dtype)
             try:
+                # L6 offload（与权重快照同开关 offload_to_cpu）：在途 s_old (B,T,V) 大
+                # 张量入队前搬 CPU。GPU 实测：queue_size 默认 8 槽 × 7.46GB/份 ≈ 60GB
+                # 驻留，叠加训练前向 OOM 95GB；offload 后队列全 CPU，_train_step 已有
+                # s_old.to(device, dtype) 拷回——数值完全一致（同张量换设备），分布式
+                # 路径 894 行 s_old.cpu() 同款先例。开关关（默认）保持原 GPU 行为。
+                if self.offload_to_cpu:
+                    s_old = s_old.cpu()
                 self._rq.put((idxs, s_old, self._loaded_ver), timeout=_PUT_TIMEOUT)
                 self._qfull_streak = 0
             except queue.Full:
@@ -345,6 +366,7 @@ class AsyncBatchedScheduler:
         idxs_dev = idxs.to(self.device)
         p_b = self.prompts[idxs_dev]
         r_b = self.responses[idxs_dev]
+        _mem("train_step:start")
 
         # learner 时刻用【当前】student 重算分布（recompute 代理）。
         # bf16 自动混合精度（L1）：包住前向 + 损失 + 反向（bf16 有范围，无需 GradScaler）。
