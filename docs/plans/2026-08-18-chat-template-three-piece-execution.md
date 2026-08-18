@@ -99,6 +99,48 @@ cd /root/opd/main
 - 顺带把 loop 检测器在模板 rollout 上重新抽样校准（calibrate_rollout.py，
   periods/min_len 可能可收紧）——旧校准已标注 stale。
 
+## 6.5 权重同步失败根因分析（vLLM 0.16.0 NCCL WeightTransferEngine，2026-08-19 静态定位）
+
+### 现象
+- 每次 rollout 前 `rollout_engine.update_weights(student.state_dict())` 失败，
+  日志 `[L2] vLLM 权重同步失败（继续用引擎现有权重）：NCCL error: invalid usage`；
+  失败点固定：**worker 侧**（EngineCore 子进程）`gpu_worker.init_weight_transfer_engine`
+  → `NCCLWeightTransferEngine.init_transfer_engine` → `StatelessProcessGroup.create`
+  → `PyNcclCommunicator.ncclCommInitRank`（vllm/distributed/device_communicators/pynccl.py:139）。
+- **单实例（verify3 n_steps=1）与双卡并行均复现** → 与 --parallel/端口竞争无关。
+- 代码走降级路径（引擎期初始权重），训练不受影响（E1/E2 各 20 步完成）。
+
+### 调用链（与 vLLM 0.16.0 源码逐行核对）
+- trainer（rank0）：`_weight_transfer_init_16`（rollout_vllm.py）——随机端口开 TCPStore、
+  `world_size=1+tp_size=2`、`torch.cuda.set_device(训练卡)`；后台线程 worker_init 并发
+  `llm.init_weight_transfer_engine({"init_info": ...})`；主线程 `trainer_init` 建组。
+- worker：`rank = dp_rank*TP + rank_within_dp + rank_offset = 0*1+0+1 = 1`（<2 合法）；
+  `device = torch.cuda.current_device()`（CUDA_VISIBLE_DEVICES 重排后逻辑 0）；
+  unique_id 经 TCPStore `broadcast_obj(src=0)` 从 trainer 取。
+- **参数链正确**：rank=1/world_size=2/device 可为每侧独立卡；WeightTransferConfig(backend="nccl")
+  已生效（worker 走到 init 而非 "Weight transfer not configured" 拒绝路径）。
+
+### 剩余候选根因（按概率，待 NCCL_DEBUG 实证）
+1. **[高] spawn 子进程 + NCCL unique_id 的 TCPStore pickle 广播完整性**：worker 侧
+   `ncclUniqueId()` 空对象经 pickle 往返填充；若 trainer set 与 worker get 之间 store
+   键计数错位（多组/重试）或 id 损坏 → `ncclCommInitRank` 用无效 id → NCCL invalid usage（经典触发）。
+2. **[中] worker `torch.cuda.current_device()` 与 CUDA_VISIBLE_DEVICES 重排组合**：
+   EngineCore 进程内 current_device 非预期（如仍为物理索引/未设）→ comm init device 非法。
+3. **[低] NCCL 2.27.5 + CUDA 版本组合 bug**（`vLLM is using nccl==2.27.5` 已确认 trainer 侧）。
+
+### 验证协议（SSH 恢复后执行，一次性拿全证据）
+- `NCCL_DEBUG=INFO` 重跑 n_steps=1：NCCL 内部会打印 rank/world_size/comm 建立过程，
+  invalid usage 前的 NCCL WARN 行即根因出口。
+- rollout_vllm.py `_weight_transfer_init_16` 加 `OPD_WT_DEBUG=1` 门控打点：
+  打印 trainer/worker 两侧 rank/world_size/device/unique_id[:16] hex —— 判定候选 1/2。
+
+### 缓解与正式方案
+- **pilot 阶段（本序列验收）**：`--set stage2.rollout_weight_sync=off` 走代码既有逃生舱
+  （明示 off，不再失败刷屏；rollout 用引擎初始权重）。decode/valid_rate 验收由模板质量主导，
+  影响可控；报告标注 on-policy 违约范围。
+- **正式方案（阶段 3 合并评估）**：TP=1 快路径 `merge_map + param.copy_` 直接拷贝
+  （绕开 NCCL weight transfer）——若 200 步耗时不可接受则实现；仍要 NCCL 时按验证协议修复 worker 端。
+
 ## 7. 已知边界（不影响本序列执行）
 
 - warmup_M=0 部署下教师模板 fat 行对齐无需处理；warmup>0 + 模板会按 1+warmup_M 倍
