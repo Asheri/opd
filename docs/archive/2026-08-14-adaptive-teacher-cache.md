@@ -1,5 +1,7 @@
 # Adaptive Staleness-Aware Teacher Cache 实现计划
 
+> **状态：已完成（2026-08-18 归档）。** L2 四能力全部落地（cache.py / adaptive_cache.py），实现见 docs/reports/2026-08-14-adaptive-teacher-cache-implementation.md。
+
 
 > **状态（2026-08-16 同步）：** L2 四能力（RefreshRingBuffer/Disagreement/CacheHealthMonitor/DynamicRatio/RefreshSelector+PromptState）+ 双池 feeder + 交替相位 + E0-E6 已实现；服务器 pytest 344 全绿；真实规模 E0-E6 已实测（见实现报告 §10，循环率高是主要限制）；G5/G7/成本核算/disagreement gate/真实 pad 已在 P1 落地。HF/FSDP/分布式骨架仍为 GPU 待验证。
 > 本计划的实现进度已按服务器实测/测试结果回填；`- [x]` 表示已实现并通过
@@ -13,7 +15,7 @@
 
 **技术栈：** pytorch / pydantic（extra="forbid"）/ pytest / transformers（HF 骨架）/ FSDP（双卡）
 
-**规格：** `docs/superpowers/specs/2026-08-14-adaptive-teacher-cache-design.md`（13 节，四能力权威定义）
+**规格：** `docs/specs/2026-08-14-adaptive-teacher-cache-design.md`（13 节，四能力权威定义）
 
 **关键约束（贯穿全计划）：**
 - `_train_step`（scheduler.py:282）内核一行不动，teacher-free 保持

@@ -17,7 +17,7 @@
 | main/fullstack_opd_v2/adaptive_cache.py | rollout 前 mpty_cache()；rollout 分布计算 per-chunk（_response_dists_topk/_rl_ref_delta_k），不再驻留完整 (M,T,V) |
 | main/fullstack_opd_v2/pipeline.py | rollout 相位开头 mpty_cache()（释放训练后缓存）；向 
 un_refresh_phase 传 dists_chunk |
-| docs/superpowers/reports/2026-08-16-rollout-loop-calibration.md | 追加 pad_id 根因章节（校准 0% vs 训练 75% 矛盾解答） |
+| docs/reports/2026-08-16-rollout-loop-calibration.md | 追加 pad_id 根因章节（校准 0% vs 训练 75% 矛盾解答） |
 
 ## 2. 修改目的
 

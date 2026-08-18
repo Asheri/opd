@@ -2,8 +2,8 @@
 
 > 面向用户：完整记录 L2 四能力（Teacher-Student Disagreement / Cache Health Monitor /
 > Dynamic Refresh Ratio / Selective Rollout）的工程实现全貌——含**第一轮 worklfow 的装配
-> 成果**与**本轮闭环修复（G1-G9）**。规格见 `docs/superpowers/specs/2026-08-14-adaptive-teacher-cache-design.md`，
-> 分阶段计划见 `docs/superpowers/plans/2026-08-14-adaptive-teacher-cache.md`。
+> 成果**与**本轮闭环修复（G1-G9）**。规格见 `docs/specs/2026-08-14-adaptive-teacher-cache-design.md`，
+> 分阶段计划见 `docs/plans/2026-08-14-adaptive-teacher-cache.md`。
 
 ---
 

@@ -1015,7 +1015,7 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 
 ### 8.4 Skywork 训练数据落地【待办，未完成】
 
-**状态：规格已设计（`docs/superpowers/specs/2026-08-13-align-directopd-experiment-design.md` §四），
+**状态：规格已设计（`docs/specs/2026-08-13-align-directopd-experiment-design.md` §四），
 但数据下载与转换从未执行**——训练实际未用 Skywork。用户 2026-08-14 指出该疏漏。
 
 **计划管道**（服务器恢复后执行，数据接口已就绪零代码改动）：

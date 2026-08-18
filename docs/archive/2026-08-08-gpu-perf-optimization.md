@@ -1,5 +1,7 @@
 # GPU 部署路径性能优化 实现计划
 
+> **状态：已完成并落地（2026-08-18 归档）。** 原计划全部实现；当前硬件为 2×RTX PRO 6000，见 docs/specs/GPU_MEMORY_AND_PARALLEL_PLAN.md。
+
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
 
 **目标：** 提升 `main/fullstack_opd_v2/` 的 GPU 部署路径吞吐与显存，六项改动各一项一 commit，守住算法内核的数值等价。
@@ -804,7 +806,7 @@ git commit -m "perf(scheduler): 缓存 p_old + 全1 mask 快路径 + WeightStore
 
 ## 执行交接
 
-计划已完成并保存到 `docs/superpowers/plans/2026-08-08-gpu-perf-optimization.md`。两种执行方式：
+计划已完成并保存到 `docs/plans/2026-08-08-gpu-perf-optimization.md`。两种执行方式：
 
 **1. 子代理驱动（推荐）** - 每个任务调度一个新的子代理，任务间进行审查，快速迭代
 

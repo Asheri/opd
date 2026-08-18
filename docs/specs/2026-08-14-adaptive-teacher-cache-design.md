@@ -652,7 +652,7 @@ sample_id, prompt_id, generation_step, generation_version, response_length, toke
 - **详细描述**：Stage 2 预算评估（`eval-budget` CLI，`--datasets AIME24`，B4096）实测结果：
   E0=1/30=3.3%、E1=2/30=6.7%（四档最佳）、E2=1/30=3.3%、E3=0/30=0%。全部 budget_stop、avgRT=4096
   （B4096 对 1.7B 是预算下限，无 EOS）。需标注为 smoke 训练 + 噪声，不过分解读。需把这些数值并入
-  `docs/superpowers/reports/2026-08-15-stage2-rollout.md` 的 Q1-Q4 解读，以及
+  `docs/reports/2026-08-15-stage2-rollout.md` 的 Q1-Q4 解读，以及
   `main/fullstack_opd_v2/TECHNICAL_REPORT.md` §5（benchmark 分数）/§8（数据构成）。
 - **依赖**：无（数据已就绪）
 - **验证**：报告含 B4096 四实验数值与"smoke 训练 + 噪声"标注

@@ -1,5 +1,7 @@
 # 全栈 OPD 流水线 · 8×RTX4090 GPU 部署优化方案
 
+> **状态：已过时（2026-08-18 归档）。** 8×4090 方案参考资料；当前部署为 2×RTX PRO 6000（见 OPTIMIZATION_PLAN_2xRTXPRO6000.md）。
+
 > 配套仓库：`main/fullstack_opd_v2/`（已批量化重构的 demo 内核）
 > 环境：单节点 8×RTX4090，统一环境 `requirements-unified.txt`（torch 2.9.1 + CUDA 12.8 + vLLM 0.16.0）
 > 注：本方案针对 **RTX 4090**，与 `OPTIMIZATION_PLAN.md`（8×A100 版）并行策略不同——**4090 无 NVLink、仅 PCIe 4.0 互联、24GB/卡、无 fp8**，这是所有决策的根。
