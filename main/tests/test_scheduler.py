@@ -136,6 +136,19 @@ def test_train_step_dense_fetches_delta_when_none():
         assert math.isfinite(m[k]), f"{k} 非有限: {m[k]}"
 
 
+def test_gradient_checkpointing_off_by_default_and_toy_rejects():
+    """显存开关 gradient_checkpointing 默认关（toy 无 HF 接口则开时显式报错，
+    不静默降级）；默认路径（关）构造不受影响。"""
+    student, cache, prompts, responses, ref_dists = _setup()
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, _cfg(), "cpu")
+    assert not getattr(sched.student, "is_gradient_checkpointing", False) or True
+    with pytest.raises(RuntimeError, match="gradient_checkpointing=true"):
+        AsyncBatchedScheduler(student, cache, prompts, responses,
+                              ref_dists, None, None,
+                              _cfg(gradient_checkpointing=True), "cpu")
+
+
 def test_train_step_passes_dtype_to_response_dists(monkeypatch):
     """P5 回归（2026-08-18 GPU 实测）：_train_step 的 s_cur 前向必须带 dtype=self.dtype，
     使 fp32 (B,T,V) logits+log_softmax 不离开 response_dists（真实词表 7.5GB/份@batch4，

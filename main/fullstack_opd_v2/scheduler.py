@@ -148,6 +148,20 @@ class AsyncBatchedScheduler:
 
         # colocated CPU offload 钩子（L6）：rollout 阶段把 learner 权重换出到 CPU
         self.offload_to_cpu = bool(cfg.get("offload_to_cpu", False))
+        # 激活重计算（GPU 显存，默认关）：Qwen3-1.7B × (4,3072) 的 backward 需重放
+        # 28 层前向激活 ≈ 25GB，叠加 s_cur/s_old/log_softmax 大张量 → 80GB 撞顶
+        # （2026-08-18 loss.backward OOM 实测）。开 → HF gradient_checkpointing 每层
+        # 前向时丢弃激活、backward 重算（显存省 ~90%，时间换空间，数值语义零变化）。
+        # 需 use_cache=False 配套（rollout 走 vLLM 引擎，student 不做自回归推理）。
+        if cfg.get("gradient_checkpointing", False):
+            if not hasattr(self.student, "gradient_checkpointing_enable"):
+                raise RuntimeError(
+                    "gradient_checkpointing=true 仅支持 HF 模型（student 无 "
+                    "gradient_checkpointing_enable），toy/其他骨架请关闭该开关")
+            gc = getattr(self.student.config, "use_cache", None)
+            if gc is True:
+                self.student.config.use_cache = False
+            self.student.gradient_checkpointing_enable()
 
         # IMP-2/P1 显存：staleness_q 深度可配（默认 16）。真实词表下在途 s_old 稠密
         # (B,T,V) 大张量，槽位越多峰值显存越高；显存受限时用

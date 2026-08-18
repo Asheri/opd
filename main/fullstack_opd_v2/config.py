@@ -105,6 +105,9 @@ class Stage2Cfg(_Strict):
     dtype: Literal["fp32", "bf16", "float32", "bfloat16"] = "fp32"
     top_k_student: int = 0
     offload_to_cpu: bool = False
+    # 激活重计算（默认关）：见 scheduler（2026-08-18 loss.backward OOM 实测——
+    # Qwen3-1.7B × (4,3072) backward 重放 28 层激活 ≈ 25GB，开则 ~2.5GB）。
+    gradient_checkpointing: bool = False
     # 稀疏支撑重归一化（对齐原始 Direct-OPD）：pg_loss 把 π_old 在 Δ≠0 支撑上重归一、
     # low_var_kl_support 把 π_cur 在 top-K 上重归一（条件期望）。默认关=原「非归一截断」
     # 有界近似；GPU 稀疏预设（gpu_skeleton/CLOUD_CONFIG）开。PG 与 KL 必须同步开关。
