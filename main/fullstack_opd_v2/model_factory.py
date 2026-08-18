@@ -105,10 +105,14 @@ class HFCausalLM:
             kw["attention_mask"] = attention_mask
         return self.model(**kw).logits
 
-    @torch.no_grad()
     @property
     def config(self):
-        """代理到内部 HF 模型（scheduler 的 gradient_checkpointing/use_cache 读取）。"""
+        """代理到内部 HF 模型（scheduler 的 gradient_checkpointing/use_cache 读取）。
+
+        2026-08-18 修复：装饰顺序曾写成 @torch.no_grad() 在外、@property 在内——
+        student.config 变成 bound method 而非 property，scheduler 读 use_cache 恒 None、
+        显式置 False 的意图落空（此前靠 transformers 内部兜底）。纯读属性无需 no_grad。
+        """
         return self.model.config
 
     def gradient_checkpointing_enable(self):
