@@ -343,6 +343,19 @@ def _l2_rollout_mem_enough(free_gb: float, eng_gb: float, min_free: float) -> bo
     96GB 卡 0.9 引擎 + 25GB 训练预留 = 111GB > 卡容量，恒失败）。"""
     return free_gb >= eng_gb + min_free
 
+def _raise_if_weight_sync_poisoned(engine, *, mr, metric_key: str, label: str) -> None:
+    """poisoned engine 必须 fail-closed（不受 require_weight_sync=false 影响）。
+
+    NCCL init/update 一旦超时或失败，engine 被标记 weight_sync_poisoned，其 NCCL
+    communicator / EngineCore 状态不可信。这里立即记录指标并中止：禁止继续复用该
+    engine 或进入 refresh phase（正确恢复：进程退出 / 重建 engine）。
+    """
+    if getattr(engine, "weight_sync_poisoned", False):
+        mr.record({metric_key: 1})
+        raise RuntimeError(
+            f"[L2] {label} weight-transfer engine poisoned; "
+            "拒绝继续复用可能状态不一致的 engine。")
+
 
 class FullStackOPDv2:
     def __init__(self, cfg: dict | None = None, device: str = "cpu"):
@@ -985,6 +998,12 @@ class FullStackOPDv2:
                                 # WeightTransferEngine）不再静默——记录指标；
                                 # 配置 l2.rollout.require_weight_sync=true 时直接中止
                                 # （避免正式训练静默违约 on-policy）。
+                                # poisoned 必须 fail-closed：不受 require_weight_sync=false
+                                # 影响——NCCL 超时后 communicator 状态不可信，不允许继续复用。
+                                _raise_if_weight_sync_poisoned(
+                                    rollout_engine, mr=mr,
+                                    metric_key="rollout/weight_sync_poisoned",
+                                    label="vLLM")
                                 if _ok is False:
                                     mr.record({"rollout/weight_sync_failed": 1})
                                     if (l2_cfg.get("rollout") or {}).get("require_weight_sync", False):
@@ -997,6 +1016,11 @@ class FullStackOPDv2:
                                     dist_engines["s_old"].update_weights(student.state_dict())
                                 except Exception as e:
                                     logger.warning(f"[L2] dist s_old 权重同步失败：{e}")
+                                # poisoned 必须 fail-closed：不允许继续 refresh phase。
+                                _raise_if_weight_sync_poisoned(
+                                    dist_engines["s_old"], mr=mr,
+                                    metric_key="rollout/dist_s_old_weight_sync_poisoned",
+                                    label="dist s_old")
                             rollout_summary = run_refresh_phase(
                                 student, teacher_rl, teacher_ref, student_ref,
                                 selector, rb, disag, fat_prompts, step_done,

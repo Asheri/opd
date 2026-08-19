@@ -515,3 +515,208 @@ def test_shutdown_idempotent():
     eng.shutdown()                  # 第二次调用应直接返回
     assert eng.llm.called == 1
     assert eng not in _ACTIVE_ENGINES
+
+# --------------------------- WT poisoned 语义（2026-08-19） ---------------------------
+# 覆盖：init/update 超时或失败后 engine 标记 poisoned、poisoned 禁止复用（fail-closed）、
+# shutdown 不清除 poisoned、pipeline fail-closed helper。纯 CPU 可测。
+import sys
+import types
+
+
+class _FakeNCCLWeightTransferEngine:
+    """fake NCCLWeightTransferEngine：trainer_init / trainer_send_weights 按测试替换。"""
+    trainer_init = None
+    trainer_send_weights = None
+
+
+class _FakeGroup:
+    def __init__(self, device="cpu"):
+        self.device = device
+
+
+class _NoopCM:
+    def __init__(self, *a, **k):
+        pass
+    def __enter__(self):
+        return None
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeWTLLM:
+    """fake vLLM LLM：init_weight_transfer_engine 成功；collective_rpc 可选阻塞。"""
+    def __init__(self, blocking=False):
+        self.llm_engine = self
+        self.rpc_calls = 0
+        self.blocking = blocking
+        self.shutdown_called = 0
+
+    def init_weight_transfer_engine(self, info):
+        return None
+
+    def collective_rpc(self, *a, **k):
+        self.rpc_calls += 1
+        if self.blocking:
+            time.sleep(3600)
+        return None
+
+    def shutdown(self):
+        self.shutdown_called += 1
+
+
+def _install_fake_nccl_module(monkeypatch):
+    """把 vllm.distributed.weight_transfer.nccl_engine 注册为 fake 模块（方法级 import 用）。"""
+    pkg = types.ModuleType("vllm"); pkg.__path__ = []
+    dist = types.ModuleType("vllm.distributed"); dist.__path__ = []
+    wt = types.ModuleType("vllm.distributed.weight_transfer"); wt.__path__ = []
+    nccl = types.ModuleType("vllm.distributed.weight_transfer.nccl_engine")
+    nccl.NCCLWeightTransferEngine = _FakeNCCLWeightTransferEngine
+    monkeypatch.setitem(sys.modules, "vllm", pkg)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", dist)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.weight_transfer", wt)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.weight_transfer.nccl_engine", nccl)
+
+
+def _fast_run_with_timeout(monkeypatch):
+    """把模块级 _run_with_timeout 包一层：统一用 0.1s 超时（真实机制 + 快速，避免 150s 等待）。"""
+    import fullstack_opd_v2.rollout_vllm as rv
+    _real = rv._run_with_timeout
+    def _fast(fn, timeout, label):
+        return _real(fn, 0.1, label)
+    monkeypatch.setattr(rv, "_run_with_timeout", _fast)
+
+
+def _patch_cuda_stream(monkeypatch):
+    """CPU-only 环境：把 torch.cuda.device / current_stream 打成 no-op（send 线程用）。"""
+    monkeypatch.setattr(torch.cuda, "device", _NoopCM)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+
+
+def _mk_wt_engine(**attrs):
+    """绕过 __init__（需真实 vLLM）构造 engine，预置 WT 相关属性。"""
+    from fullstack_opd_v2.rollout_vllm import VLLMRolloutEngine
+    eng = object.__new__(VLLMRolloutEngine)
+    eng._wt_poisoned = False
+    eng._wt_failure_reason = None
+    eng._wt_sync_mode = "auto"
+    eng._wt_warned = False
+    eng._wt_group = None
+    eng._wt_init_info = None
+    eng._wt_timeout = 120.0
+    eng._wt_double_send = True
+    eng.tp_size = 1
+    eng.device = "cpu"
+    eng._learner_device = None
+    eng.llm = None
+    for k, v in attrs.items():
+        setattr(eng, k, v)
+    return eng
+
+
+def test_init_timeout_poisons_engine(monkeypatch):
+    _install_fake_nccl_module(monkeypatch)
+    _fast_run_with_timeout(monkeypatch)
+    eng = _mk_wt_engine()
+    eng.llm = _FakeWTLLM()
+    _FakeNCCLWeightTransferEngine.trainer_init = lambda info: time.sleep(3600)
+    with pytest.raises(RuntimeError):
+        eng._weight_transfer_init_16()
+    assert eng.weight_sync_poisoned is True
+    assert "init:" in (eng.weight_sync_poison_reason or "")
+    # 再次调用 update_weights 立即失败（不等待 3600s）
+    with pytest.raises(RuntimeError, match="poisoned"):
+        eng.update_weights({"w": torch.zeros(2)})
+
+
+def test_update_first_round_timeout_poisons_engine(monkeypatch):
+    _install_fake_nccl_module(monkeypatch)
+    _fast_run_with_timeout(monkeypatch)
+    _patch_cuda_stream(monkeypatch)
+    eng = _mk_wt_engine(_wt_double_send=True)
+    llm = _FakeWTLLM(blocking=True)
+    eng.llm = llm
+    _FakeNCCLWeightTransferEngine.trainer_init = lambda info: _FakeGroup("cpu")
+    _FakeNCCLWeightTransferEngine.trainer_send_weights = lambda *a, **k: None
+    with pytest.raises(RuntimeError):
+        eng._weight_transfer_update_16({"w": torch.zeros(2, dtype=torch.float32)})
+    assert eng.weight_sync_poisoned is True
+    assert llm.rpc_calls == 1          # 第一发超时 → 第二发不执行
+    with pytest.raises(RuntimeError, match="poisoned"):
+        eng.update_weights({"w": torch.zeros(2)})
+
+
+def test_sender_exception_poisons_engine(monkeypatch):
+    _install_fake_nccl_module(monkeypatch)
+    _fast_run_with_timeout(monkeypatch)
+    _patch_cuda_stream(monkeypatch)
+    eng = _mk_wt_engine()
+    eng.llm = _FakeWTLLM()
+    _FakeNCCLWeightTransferEngine.trainer_init = lambda info: _FakeGroup("cpu")
+    def _bad_send(*a, **k):
+        raise RuntimeError("fake nccl send failure")
+    _FakeNCCLWeightTransferEngine.trainer_send_weights = _bad_send
+    with pytest.raises(RuntimeError, match="fake nccl send failure"):
+        eng._weight_transfer_update_16({"w": torch.zeros(2, dtype=torch.float32)})
+    assert eng.weight_sync_poisoned is True
+    with pytest.raises(RuntimeError, match="poisoned"):
+        eng.update_weights({"w": torch.zeros(2)})
+
+
+@pytest.mark.parametrize("bad_sd", [
+    {},                                                      # 空 dict
+    {"w": 42},                                               # 非 tensor
+    {"w": torch.zeros(2, dtype=torch.complex64)},            # 非支持 dtype
+    {"w": torch.zeros(0, 4)},                                # 空 shape
+])
+def test_payload_preflight_failure_poisons_engine(monkeypatch, bad_sd):
+    _install_fake_nccl_module(monkeypatch)
+    _fast_run_with_timeout(monkeypatch)
+    eng = _mk_wt_engine()
+    eng.llm = _FakeWTLLM()
+    _FakeNCCLWeightTransferEngine.trainer_init = lambda info: _FakeGroup("cpu")
+    _FakeNCCLWeightTransferEngine.trainer_send_weights = lambda *a, **k: None
+    with pytest.raises((ValueError, TypeError)):
+        eng._weight_transfer_update_16(bad_sd)
+    assert eng.weight_sync_poisoned is True
+    with pytest.raises(RuntimeError, match="poisoned"):
+        eng.update_weights({"w": torch.zeros(2)})
+
+
+def test_shutdown_does_not_clear_poisoned(monkeypatch):
+    _install_fake_nccl_module(monkeypatch)
+    eng = _mk_wt_engine()
+    llm = _FakeWTLLM()
+    eng.llm = llm
+    eng._mark_weight_transfer_poisoned("test reason")
+    assert eng.weight_sync_poisoned is True
+    eng.shutdown()
+    assert eng.weight_sync_poisoned is True        # shutdown 不清除 poisoned
+    assert eng.weight_sync_poison_reason == "test reason"
+    with pytest.raises(RuntimeError, match="poisoned"):
+        eng.update_weights({"w": torch.zeros(2)})
+
+
+# --------------------------- pipeline fail-closed（2026-08-19） ---------------------------
+def test_pipeline_raise_if_weight_sync_poisoned():
+    from fullstack_opd_v2.pipeline import _raise_if_weight_sync_poisoned
+    class _Mr:
+        def __init__(self):
+            self.records = []
+        def record(self, m):
+            self.records.append(dict(m))
+    class _Poisoned:
+        weight_sync_poisoned = True
+    mr = _Mr()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        _raise_if_weight_sync_poisoned(_Poisoned(), mr=mr,
+                                       metric_key="rollout/weight_sync_poisoned",
+                                       label="vLLM")
+    assert mr.records == [{"rollout/weight_sync_poisoned": 1}]
+    # 未 poisoned → 不抛、不记录
+    class _OK:
+        weight_sync_poisoned = False
+    mr2 = _Mr()
+    _raise_if_weight_sync_poisoned(_OK(), mr=mr2,
+                                   metric_key="rollout/weight_sync_poisoned",
+                                   label="vLLM")
+    assert mr2.records == []
