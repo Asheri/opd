@@ -114,12 +114,14 @@ class VLLMRolloutEngine:
                  gpu_memory_utilization: float = 0.9, max_model_len: int = 2048,
                  vocab_size: int | None = None, full_logprobs_cap: int = 4096,
                  device: str = "cuda:0", weight_sync_mode: str = "auto",
+                 learner_device: str | None = None,
                  **engine_kwargs):
         if not _VLLM_AVAILABLE:
             raise RuntimeError(
                 "vLLM 未安装（统一 GPU 环境应含 vllm）。L3 rollout 需要 vLLM 引擎。")
         self.tp_size = int(tp_size)
         self._wt_sync_mode = weight_sync_mode  # auto=0.16 NCCL 同步；off=逃生舱
+        self._learner_device = learner_device   # trainer 侧 NCCL 组所在卡（训练卡）
         self.dtype = dtype
         self.device = device
         self.full_cap = int(full_logprobs_cap)
@@ -330,8 +332,14 @@ class VLLMRolloutEngine:
         # NCCL 通信组禁止两个 rank 同卡（"Duplicate GPU detected"，2026-08-17 实测）。
         # trainer（rank0）必须在【训练卡】建组，vLLM worker（rank1）在 rollout 卡——
         # 布局必须是交叉分卡（CUDA_VISIBLE_DEVICES 重排）。显式把当前设备切到训练卡。
-        if str(self.device).startswith("cuda"):
-            torch.cuda.set_device(self.device)
+        # 2026-08-19 修复：此前误用 self.device（rollout 卡）建 trainer 侧 NCCL 组
+        # → rank0/rank1 同卡 → NCCL_INVALID_USAGE(5)（NCCL_DEBUG 实锤 init.cc:737
+        # "Duplicate GPU detected"）。NCCL 组禁止两个 rank 同卡，trainer 必须在该
+        # 实验的【训练卡】建组（worker 在 rollout 卡）；未显式给定 learner_device 时
+        # 回落 rollout 卡（旧调用兼容：单卡部署时两者同卡合法）。
+        _trainer_dev = self._learner_device or self.device
+        if str(_trainer_dev).startswith("cuda"):
+            torch.cuda.set_device(_trainer_dev)
         # trainer 侧 NCCL 组（rank 0，用当前 CUDA 设备 = 训练卡）
         self._wt_group = NCCLWeightTransferEngine.trainer_init(self._wt_init_info)
         t.join(timeout=120)

@@ -760,7 +760,8 @@ class FullStackOPDv2:
                         vocab_size=_engine_vocab,
                         full_logprobs_cap=int(s2cfg.get("rollout_logprobs_cap", 4096)),
                         weight_sync_mode=s2cfg.get("rollout_weight_sync", "auto"),
-                        device=rollout_device)
+                        device=rollout_device,
+                        learner_device=self.device)
                     # IMP-2/P0：rollout 相位 4 个分布前向（s_old/rl/ref/ref_anchor）切 vLLM
                     # （workflow-runner 计划）。可配置 l2.rollout.dist_engines（默认 false）；
                     # 各引擎低 gpu_memory_utilization 共存于 rollout_device（4×~0.25≤1.0）。
@@ -787,7 +788,8 @@ class FullStackOPDv2:
                                     full_logprobs_cap=int(
                                         s2cfg.get("rollout_logprobs_cap", 4096)),
                                     weight_sync_mode=s2cfg.get("rollout_weight_sync", "auto"),
-                                    device=rollout_device)
+                                    device=rollout_device,
+                                    learner_device=self.device)
                 scheduler = AsyncBatchedScheduler(
                     student, cache, fat_prompts, fat_responses,
                     ref_dists, ref_ids, ref_logp, s2cfg, self.device,
