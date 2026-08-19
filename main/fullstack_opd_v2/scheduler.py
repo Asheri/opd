@@ -146,6 +146,9 @@ class AsyncBatchedScheduler:
         # bf16 自动混合精度（L1）；仅在 cuda + 配置时启用
         self.dtype = _DTYPE_MAP.get(str(cfg.get("dtype", "fp32")).lower(), torch.float32)
         self.amp = (str(device).startswith("cuda") and self.dtype == torch.bfloat16)
+        # P3（2026-08-19）：refresh 训练 chunk 大小可配（原模块级 _REFRESH_CHUNK=4 硬编码，
+        # v5 OOM 实测双卡并行 + vLLM 共卡时 chunk=4 的 (4,T,V) 前向仍撞顶，降到 2 可减半）。
+        self.refresh_chunk = max(1, int(cfg.get("refresh_chunk", 4)))
 
         # colocated CPU offload 钩子（L6）：rollout 阶段把 learner 权重换出到 CPU
         self.offload_to_cpu = bool(cfg.get("offload_to_cpu", False))
@@ -537,7 +540,7 @@ class AsyncBatchedScheduler:
         # 拆 chunk（_REFRESH_CHUNK=4，batch=8 → 2 块）【独立小批更新】：每 chunk 完整
         # forward/backward/step（4 条/次），峰值增量减半（~5GB），图完全独立无共享。
         # refresh 训练的小批粒度是超参选择（更接近标准 SGD），不影响 rollout/验收口径。
-        chunks = list(rb_idxs.split(max(1, min(_REFRESH_CHUNK, rb_idxs.size(0)))))
+        chunks = list(rb_idxs.split(max(1, min(self.refresh_chunk, rb_idxs.size(0)))))
         self.student.train()
         acc = {"loss": [], "pg": [], "kl": [], "rew": [], "adv": []}
         version = self.staleness_q.current_version

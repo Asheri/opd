@@ -117,6 +117,14 @@ class Stage2Cfg(_Strict):
     delta_clip: float | None = None
     # 优化器：adam（默认 fp32）/ adamw_8bit（bnb，4B/7B 单卡必需——fp32-Adam 超 96GB）。
     optimizer: Literal["adam", "adamw_8bit"] = "adam"
+    # P3（2026-08-19）：teacher_rl/teacher_ref 只在 refresh 相位算 Δ_T 时使用，base 训练
+    # 完全不用（Δ_T 从缓存读，KL 锚点是 student_ref）。开 → base 训练时把两个教师 offload
+    # 到 CPU（省 ~6.8GB 基线），refresh 相位前搬回、完成后搬出。默认 False 保持原行为。
+    # ⚠️ student_ref（KL 锚点）每步都用，绝不能 offload。
+    teacher_offload: bool = False
+    # refresh 训练 chunk 大小（v5 OOM 实测 chunk=4 仍不够时降到 2）：_train_step_refresh
+    # 把 ring buffer 样本拆成独立小批 + 梯度累积，控制 (chunk,T,V) 前向/反向峰值。
+    refresh_chunk: int = 4
 
 
 # --------------------------- L2 Adaptive Teacher Cache（§2-§7）-----------------

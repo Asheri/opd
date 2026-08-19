@@ -343,6 +343,43 @@ def _l2_rollout_mem_enough(free_gb: float, eng_gb: float, min_free: float) -> bo
     96GB 卡 0.9 引擎 + 25GB 训练预留 = 111GB > 卡容量，恒失败）。"""
     return free_gb >= eng_gb + min_free
 
+def _check_rollout_max_model_len(cfg: dict, s2cfg: dict, l2_cfg: dict) -> int:
+    """vLLM max_model_len 安全守卫（纯函数，CPU 可单测）。
+
+    rollout_max_model_len 必须 >= max_prompt_len + max_new_tokens，否则 prompt+response
+    恰好等于上限时 vLLM 内部 special token / 余量会导致截断或 init 失败
+    （v3 实测 max_model_len=6144 的 KV cache 太大也 init 失败）。返回所需下限。
+    """
+    _mml = int(s2cfg.get("rollout_max_model_len", 2048))
+    _needed = int((cfg.get("dataset") or {}).get("max_prompt_len", 1024)) \
+        + int((l2_cfg.get("rollout") or {}).get("max_new_tokens", 512))
+    if _mml < _needed:
+        raise RuntimeError(
+            f"[L2] rollout_max_model_len={_mml} < max_prompt_len + max_new_tokens"
+            f"={_needed}；vLLM 会截断或 init 失败。请调大 rollout_max_model_len 或减小"
+            "max_prompt_len。")
+    return _needed
+
+
+def _p3_teacher_move(teacher_rl, teacher_ref, target, *, enabled: bool,
+                    device: str, logger, message: str) -> None:
+    """P3：把 teacher_rl/teacher_ref 搬到 target（"cpu" offload 或训练卡 reload）。
+
+    - enabled=False 或非 cuda 设备时 no-op（默认零回归）；
+    - 搬移后 empty_cache 释放 GPU 缓存（target 为 "cpu" 时把保留的教师显存归还）；
+    - ⚠️ student_ref 不在此列：它是 KL 锚点（ref_dists[idxs]）每步都用，必须常驻。
+    """
+    if not enabled or not str(device).startswith("cuda"):
+        return
+    if teacher_rl is not None:
+        teacher_rl.to(target)
+    if teacher_ref is not None:
+        teacher_ref.to(target)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info(message)
+
+
 def _raise_if_weight_sync_poisoned(engine, *, mr, metric_key: str, label: str) -> None:
     """poisoned engine 必须 fail-closed（不受 require_weight_sync=false 影响）。
 
@@ -757,6 +794,11 @@ class FullStackOPDv2:
                                 f"{_eng_gb:.1f}GB + 预留 {_min_free}GB（同卡训练余量/异卡 "
                                 "仅引擎）；请调低 stage2.rollout_gpu_mem 或减少同卡并发"
                                 "（避免训练中 OOM）。")
+                    # vLLM max_model_len 安全守卫（2026-08-19）：必须 >= max_prompt_len +
+                    # max_new_tokens，否则 prompt(1024)+response(512)=1536 恰好等于上限时，
+                    # vLLM 内部 special token / 余量会导致截断或 init 失败（v3 实测
+                    # max_model_len=6144 的 KV cache 太大也 init 失败）。
+                    _check_rollout_max_model_len(self.cfg, s2cfg, l2_cfg)
                     rollout_engine = VLLMRolloutEngine(
                         # rollout 模型默认回落 student_path（on-policy 同构）；
                         # rollout_model 显式覆盖仅作诊断用。
@@ -890,6 +932,15 @@ class FullStackOPDv2:
                     # warmup_M=0 时未建，则新建一份初始 student 副本。
                     student_ref = warmup_student if warmup_student is not None else \
                         build_model(self.cfg, self.device, role="student")
+                    # P3（2026-08-19）：cache 预建（load_cache）时 teacher_rl/teacher_ref 在
+                    # base 训练完全不用（Δ_T 从缓存读，KL 锚点是 student_ref），offload 到
+                    # CPU 省 ~6.8GB 基线（train_step 起点 ~29GB → ~22GB）。student_ref 必须
+                    # 常驻（每步 ref_dists[idxs]）。刷新相位前 reload、完成后 finally 搬回。
+                    _teacher_offload = bool(s2cfg.get("teacher_offload", False))
+                    _p3_teacher_move(
+                        teacher_rl, teacher_ref, "cpu",
+                        enabled=_teacher_offload, device=self.device, logger=logger,
+                        message="[P3] teacher offload: base 训练阶段（省 ~6.8GB）")
 
                     metrics = []
                     n_total = int(s2cfg.get("n_steps", 30))
@@ -1021,107 +1072,130 @@ class FullStackOPDv2:
                                     dist_engines["s_old"], mr=mr,
                                     metric_key="rollout/dist_s_old_weight_sync_poisoned",
                                     label="dist s_old")
-                            rollout_summary = run_refresh_phase(
-                                student, teacher_rl, teacher_ref, student_ref,
-                                selector, rb, disag, fat_prompts, step_done,
-                                scheduler.staleness_q.current_version,
-                                int(l2_cfg.get("m_refresh", 1000)),
-                                max_new,
-                                cache.top_k, self.device, prompt_state=ps,
-                                rollout_generator=_rollout_gen,
-                                eos_token_id=eos_id,
-                                loop_detection=rollcfg.get("loop_detection", True),
-                                loop_periods=rollcfg.get("loop_periods", (2, 3, 4)),
-                                pad_id=_pad_id,
-                                temperature=temperature,
-                                repetition_penalty=repetition_penalty,
-                                loop_min_len=loop_min_len,
-                                rollout_source=rollout_source,
-                                compute_disagreement=bool(
-                                    (l2_cfg.get("disagreement") or {}).get("enabled", True)),
-                                cand=indices, budgets=budgets, budget_t=budget_t,
-                                dists_chunk=int(rollcfg.get("response_dists_chunk", 2)),
-                                dist_engines=dist_engines)
-                            # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
-                            roll_metrics = None
-                            if isinstance(rollout_summary, dict):
-                                mr.record({f"rollout/{k}": v
-                                           for k, v in rollout_summary.items()})
-                                # Stage 3：token 效率指标（键已带 rollout/ 前缀）落盘 mr。
-                                # 无条件调用（budgets=None 单预算也产出），供 S3 同口径对比。
-                                roll_metrics = compute_rollout_metrics(
-                                    rollout_summary, budgets, budget_t)
-                                mr.record(roll_metrics)
-                                # 并入返回 metrics 列表（供 run_experiment / aggregate_stage3
-                                # 读 rollout/ 指标做 S3 同口径对比）。phase=rollout 供 n_steps
-                                # 过滤；不写 version，避免末步断点误取 rollout 行（_last_train）。
-                                metrics.append({
-                                    "step": step_done,
-                                    "phase": "rollout",
-                                    # 原始 status 计数（rollout/n_total/n_appended/...，供
-                                    # run_s2_real / test_l2_integration 消费）
-                                    **{f"rollout/{k}": v
-                                       for k, v in rollout_summary.items()},
-                                    # 派生效率指标（compute_rollout_metrics，供 S3 同口径对比）
-                                    **roll_metrics})
-                            logger.info(f"[L2] rollout temperature={temperature:.3f} "
-                                        f"(m_refresh={int(l2_cfg.get('m_refresh', 1000))})")
-                            last_refresh = base_done
-                            # Health Monitor 观测（Observe-only，不改训练）。
-                            # hm.record 只按 4 个已知键做分类，其余 kwargs 原样透传，
-                            # 把 rollout/ 键并入 hm.record 顶层安全、不破坏既有分类逻辑。
-                            hm_metrics = hm.record(
-                                step_done, hit_rate=1.0,
-                                refresh_age_p95=0, reuse_p95=0, max_length_ratio=0,
-                                **(roll_metrics or {}))
-                            mr.record(hm_metrics)
-                            # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）。
-                            # 任务 6：传 rollout_efficiency（expected/actual tokens，§五）。
-                            # >1 省 token → 放宽 α；<1 超用 → 收紧（方向修正，此前写反）。
-                            _eff = (rollout_summary.get("expected_rollout_tokens") / max(
-                                1, rollout_summary.get("rollout_tokens", 1))
-                                if isinstance(rollout_summary, dict) else None)
-                            alpha = drc.update(
-                                base_age=hm_metrics.get("age/mean", 0),
-                                policy_drift=0,
-                                refresh_quality=rb.mean_disagreement(),
-                                rollout_efficiency=_eff)
-                            # G3：α 真实应用——refresh 训练步数 = α/(1-α)·n_base（双池 feeder）。
-                            # cold start：refresh 池不足时 α_actual 收缩（§5.5）。
-                            alpha_act = drc.cold_start_adjust(
-                                alpha, rb.size, max(1, n_phase * scheduler.batch))
-                            n_refresh = int(round(alpha_act / max(1e-6, 1 - alpha_act) * n_phase))
-                            n_refresh = max(0, min(n_refresh, n_phase))  # 不超 base 步数
-                            if n_refresh > 0:
-                                # IMP-1d：refresh pool 冷启动保护——池 < min_refresh_pool 时跳过
-                                # refresh 训练（不调 _train_step_refresh）；rollout metrics 照常、
-                                # ring buffer 样本不丢，记录 skip reason 与 pool size。
-                                min_refresh_pool = int(l2c.get("min_refresh_pool", 8))
-                                skip_train, skip_reason = refresh_cold_start_decision(
-                                    rb.size, min_refresh_pool)
-                                guard = {"refresh_train/skipped": skip_train,
-                                         "refresh_train/skip_reason": skip_reason,
-                                         "refresh_pool/size": rb.size}
-                                mr.record(guard)
-                                # 并入本轮 rollout 行（不新增 phase 行，避免 n_steps 统计与
-                                # rollout 行 n_appended 断言被稀释）
-                                for _m in reversed(metrics):
-                                    if isinstance(_m, dict) and _m.get("phase") == "rollout":
-                                        _m.update(guard)
-                                        break
-                                if skip_train:
-                                    logger.info(
-                                        f"[L2] refresh 训练跳过（冷启动：池 {rb.size} < "
-                                        f"min_refresh_pool={min_refresh_pool}）")
-                                else:
-                                    scheduler.metrics = []
-                                    done = scheduler.train_refresh_phase(
-                                        rb, alpha_act, n_refresh, step_done, _on_step)
-                                    metrics.extend(scheduler.metrics)
-                                    step_done += done
-                                    logger.info(
-                                        f"[L2] α={alpha:.3f}→实际{alpha_act:.3f}，"
-                                        f"refresh 训练 {done} 步（池 {rb.size}）")
+                            # P3：refresh 相位需要教师前向算 Δ_T → 搬回 GPU（base 训练已 offload）。
+                            # 用 try/finally 保证：无论 rollout/refresh 训练成功或异常，教师都在
+                            # 下一个 base 步开始前搬回 CPU 并 empty_cache（省 ~6.8GB）。
+                            _p3_teacher_move(
+                                teacher_rl, teacher_ref, self.device,
+                                enabled=_teacher_offload, device=self.device, logger=logger,
+                                message="[P3] teacher reload: refresh 相位（搬回 GPU）")
+                            try:
+                                rollout_summary = run_refresh_phase(
+                                    student, teacher_rl, teacher_ref, student_ref,
+                                    selector, rb, disag, fat_prompts, step_done,
+                                    scheduler.staleness_q.current_version,
+                                    int(l2_cfg.get("m_refresh", 1000)),
+                                    max_new,
+                                    cache.top_k, self.device, prompt_state=ps,
+                                    rollout_generator=_rollout_gen,
+                                    eos_token_id=eos_id,
+                                    loop_detection=rollcfg.get("loop_detection", True),
+                                    loop_periods=rollcfg.get("loop_periods", (2, 3, 4)),
+                                    pad_id=_pad_id,
+                                    temperature=temperature,
+                                    repetition_penalty=repetition_penalty,
+                                    loop_min_len=loop_min_len,
+                                    rollout_source=rollout_source,
+                                    compute_disagreement=bool(
+                                        (l2_cfg.get("disagreement") or {}).get("enabled", True)),
+                                    cand=indices, budgets=budgets, budget_t=budget_t,
+                                    dists_chunk=int(rollcfg.get("response_dists_chunk", 2)),
+                                    dist_engines=dist_engines)
+                                # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
+                                roll_metrics = None
+                                if isinstance(rollout_summary, dict):
+                                    mr.record({f"rollout/{k}": v
+                                               for k, v in rollout_summary.items()})
+                                    # Stage 3：token 效率指标（键已带 rollout/ 前缀）落盘 mr。
+                                    # 无条件调用（budgets=None 单预算也产出），供 S3 同口径对比。
+                                    roll_metrics = compute_rollout_metrics(
+                                        rollout_summary, budgets, budget_t)
+                                    mr.record(roll_metrics)
+                                    # 并入返回 metrics 列表（供 run_experiment / aggregate_stage3
+                                    # 读 rollout/ 指标做 S3 同口径对比）。phase=rollout 供 n_steps
+                                    # 过滤；不写 version，避免末步断点误取 rollout 行（_last_train）。
+                                    metrics.append({
+                                        "step": step_done,
+                                        "phase": "rollout",
+                                        # 原始 status 计数（rollout/n_total/n_appended/...，供
+                                        # run_s2_real / test_l2_integration 消费）
+                                        **{f"rollout/{k}": v
+                                           for k, v in rollout_summary.items()},
+                                        # 派生效率指标（compute_rollout_metrics，供 S3 同口径对比）
+                                        **roll_metrics})
+                                logger.info(f"[L2] rollout temperature={temperature:.3f} "
+                                            f"(m_refresh={int(l2_cfg.get('m_refresh', 1000))})")
+                                last_refresh = base_done
+                                # Health Monitor 观测（Observe-only，不改训练）。
+                                # hm.record 只按 4 个已知键做分类，其余 kwargs 原样透传，
+                                # 把 rollout/ 键并入 hm.record 顶层安全、不破坏既有分类逻辑。
+                                hm_metrics = hm.record(
+                                    step_done, hit_rate=1.0,
+                                    refresh_age_p95=0, reuse_p95=0, max_length_ratio=0,
+                                    **(roll_metrics or {}))
+                                mr.record(hm_metrics)
+                                # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）。
+                                # 任务 6：传 rollout_efficiency（expected/actual tokens，§五）。
+                                # >1 省 token → 放宽 α；<1 超用 → 收紧（方向修正，此前写反）。
+                                _eff = (rollout_summary.get("expected_rollout_tokens") / max(
+                                    1, rollout_summary.get("rollout_tokens", 1))
+                                    if isinstance(rollout_summary, dict) else None)
+                                alpha = drc.update(
+                                    base_age=hm_metrics.get("age/mean", 0),
+                                    policy_drift=0,
+                                    refresh_quality=rb.mean_disagreement(),
+                                    rollout_efficiency=_eff)
+                                # G3：α 真实应用——refresh 训练步数 = α/(1-α)·n_base（双池 feeder）。
+                                # cold start：refresh 池不足时 α_actual 收缩（§5.5）。
+                                alpha_act = drc.cold_start_adjust(
+                                    alpha, rb.size, max(1, n_phase * scheduler.batch))
+                                n_refresh = int(round(alpha_act / max(1e-6, 1 - alpha_act) * n_phase))
+                                n_refresh = max(0, min(n_refresh, n_phase))  # 不超 base 步数
+                                if n_refresh > 0:
+                                    # IMP-1d：refresh pool 冷启动保护——池 < min_refresh_pool 时跳过
+                                    # refresh 训练（不调 _train_step_refresh）；rollout metrics 照常、
+                                    # ring buffer 样本不丢，记录 skip reason 与 pool size。
+                                    min_refresh_pool = int(l2c.get("min_refresh_pool", 8))
+                                    skip_train, skip_reason = refresh_cold_start_decision(
+                                        rb.size, min_refresh_pool)
+                                    guard = {"refresh_train/skipped": skip_train,
+                                             "refresh_train/skip_reason": skip_reason,
+                                             "refresh_pool/size": rb.size}
+                                    mr.record(guard)
+                                    # 并入本轮 rollout 行（不新增 phase 行，避免 n_steps 统计与
+                                    # rollout 行 n_appended 断言被稀释）
+                                    for _m in reversed(metrics):
+                                        if isinstance(_m, dict) and _m.get("phase") == "rollout":
+                                            _m.update(guard)
+                                            break
+                                    if skip_train:
+                                        logger.info(
+                                            f"[L2] refresh 训练跳过（冷启动：池 {rb.size} < "
+                                            f"min_refresh_pool={min_refresh_pool}）")
+                                    else:
+                                        # 2026-08-19 OOM 修复：rollout 相位（生成 + 教师前向
+                                        # response_dists (M,P+T,V)）后 PyTorch 缓存分配器仍保留大量
+                                        # 未用块（实测 alloc 44GB / reserved 78GB，~34GB 可释放）。
+                                        # refresh 训练（_train_step_refresh 的 s_cur 前向）需要额外
+                                        # 显存——先 empty_cache 归还未引用块再训练，否则 chunk=4 的
+                                        # (4,T,V) response_dists 即 OOM（2026-08-19 双卡并行实测）。
+                                        if torch.cuda.is_available():
+                                            torch.cuda.empty_cache()
+                                        scheduler.metrics = []
+                                        done = scheduler.train_refresh_phase(
+                                            rb, alpha_act, n_refresh, step_done, _on_step)
+                                        metrics.extend(scheduler.metrics)
+                                        step_done += done
+                                        logger.info(
+                                            f"[L2] α={alpha:.3f}→实际{alpha_act:.3f}，"
+                                            f"refresh 训练 {done} 步（池 {rb.size}）")
+                            finally:
+                                # P3：refresh 完成后教师回 CPU + 释放缓存（异常路径也执行）。
+                                _p3_teacher_move(
+                                    teacher_rl, teacher_ref, "cpu",
+                                    enabled=_teacher_offload, device=self.device,
+                                    logger=logger,
+                                    message="[P3] teacher offload: refresh 完成（回 CPU + empty_cache）")
                 else:
                     metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         finally:

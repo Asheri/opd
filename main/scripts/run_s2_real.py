@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 # 脚本位于 main/scripts/ 下；直接运行（python scripts/xxx.py）时 sys.path[0] 是 scripts/
 # 而非 repo 根，导致 `from fullstack_opd_v2 ...` 失败。显式把 main/ 加入 sys.path。
@@ -78,6 +79,10 @@ def parse_args() -> argparse.Namespace:
                    help="并行实验数：N>1 时每个实验 spawn 一个子进程，按 N 张卡交叉分卡"
                         "（第 i 个实验训练 cuda:{i%N}、vLLM rollout_device cuda:{(i+1)%N}），"
                         "全部子进程强制 --load-cache 只读复用预建缓存；默认 1=串行（不改原行为）")
+    p.add_argument("--stagger", type=float, default=0.0, metavar="SEC",
+                   help="--parallel N>1 时，子进程间启动间隔秒数（默认 0=同时启动）。"
+                        "vLLM init 与对方训练峰值竞态时设 30-60 可确定性消除"
+                        "（v6 实测：E1 的 vLLM 在 GPU1 init 时 E2 已占 71GB -> profiling 失败）")
     # 内部标记：仅由父进程 --parallel 路径追加到子进程 argv，用户无需使用
     p.add_argument("--parallel-child", action="store_true", help=argparse.SUPPRESS,
                    dest="parallel_child")
@@ -190,7 +195,7 @@ def _run_experiment(args, name, load_cache, prefix=None):
 
 
 # ---------------------------------------------------------------- 并行工具（纯函数，供单测）---
-_STRIP_OPTIONS = ("--names", "--device", "--parallel")
+_STRIP_OPTIONS = ("--names", "--device", "--parallel", "--stagger")
 
 
 def build_parallel_argv(base_argv, name, i, n_cards):
@@ -387,6 +392,13 @@ def _run_parallel(args, names):
     ctx = multiprocessing.get_context("spawn")   # vLLM/NCCL 强制 spawn（fork 不兼容）
     procs = []
     for i, name in enumerate(names_to_spawn):
+        # vLLM init 错峰（--stagger）：第 2+ 个子进程延迟启动，避免其 vLLM 引擎在
+        # 对方训练峰值时 profiling 失败（v6 实测：E1 的 vLLM 在 GPU1 init 时 E2 已占
+        # 71GB -> "No available memory for cache blocks"）。
+        if i > 0 and args.stagger > 0:
+            print(f"[S2] stagger: 等待 {args.stagger:.0f}s 后启动第 {i + 1} 个子进程"
+                  f"（{name}，vLLM init 错峰）...", flush=True)
+            time.sleep(args.stagger)
         child_argv = build_parallel_argv(sys.argv, name, i, args.parallel)
         child_argv += ["--parallel-child"]
         p = ctx.Process(target=_spawn_entry, args=(child_argv,), name=f"S2-{name}")

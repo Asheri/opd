@@ -315,3 +315,62 @@ def test_run_serial_normal_rethrows_uncaught(rs2, monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="配置错误"):
         rs2._run_serial(args, ["S2_E0_static"])
     assert not (tmp_path / "l2_experiment_summary.json").exists()   # 传播前不写汇总
+
+
+# ---------------------------------------------------------------- --stagger（2026-08-19） ---
+def test_stagger_default_zero(rs2, monkeypatch):
+    """--stagger 不传时默认 0（parse_args）。"""
+    monkeypatch.setattr(sys, "argv", ["run_s2_real.py", "--config", "c.yaml",
+                                      "--run-dir", "r", "--names", "S2_E1_opd512"])
+    args = rs2.parse_args()
+    assert args.stagger == 0.0
+
+
+def test_stagger_strips_from_child_argv(rs2, base_argv):
+    """--stagger 45 不透传到子进程 argv（只有父进程用）。"""
+    argv = list(base_argv) + ["--stagger", "45"]
+    child = rs2.build_parallel_argv(argv, "S2_E1_opd512", 0, 2)
+    assert "--stagger" not in child
+    assert "45" not in child
+
+
+def test_stagger_sleeps_between_children(rs2, monkeypatch):
+    """--parallel 2 --stagger 30：第 1 个子进程立即启动，sleep(30) 后再启动第 2 个。"""
+    import time
+    import multiprocessing
+    sleeps = []
+    real_sleep = time.sleep
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    # 用一个假的 ctx 记录 p.start() 调用顺序
+    started = []
+    class _FakeProc:
+        def __init__(self, *a, **k):
+            self.name = k.get("name", "?")
+            self.exitcode = 0
+        def start(self):
+            started.append(self.name)
+        def join(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(multiprocessing, "get_context", lambda *a, **k: type("C", (), {"Process": _FakeProc})())
+    # 直接调 _run_parallel 的循环逻辑（通过模块函数）
+    from types import SimpleNamespace
+    args = SimpleNamespace(stagger=30.0, parallel=2, config="c.yaml", run_dir="r",
+                           load_cache=True, cache_path=None, eos_id=None,
+                           materialized=0, m_refresh=8, refresh_min=10,
+                           refresh_size=None, batch_size=None, extra_sets=[],
+                           names=None, device="cuda:0", n_steps=20,
+                           parallel_child=False, refresh_cold=0)
+    # 需要 names 合法 + cache 存在（否则走 build 路径）——这里只验证 sleep 行为，
+    # 通过 monkeypatch _resolve_cache_path/_cache_exists/_run_experiment 短路。
+    rs2._resolve_cache_path = lambda a, n: "x.pt"
+    rs2._cache_exists = lambda p: True
+    rs2._spawn_entry = lambda argv: None
+    rs2._finish_parallel = lambda a, n_failed=0: None
+    rs2._cleanup_stray_engines = lambda: None
+    names = ["S2_E1_opd512", "S2_E2_opd1024"]
+    rs2._run_parallel(args, names)
+    # 第 1 个立即启动，第 2 个在 sleep 后 → 只 sleep 一次（30s）
+    assert started == ["S2-S2_E1_opd512", "S2-S2_E2_opd1024"]
+    assert len(sleeps) == 1
+    assert sleeps[0] == 30.0
