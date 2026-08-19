@@ -326,9 +326,12 @@ class VLLMRolloutEngine:
             except Exception as e:  # noqa: BLE001
                 _init_err.append(e)
 
-        import threading
+        import threading, logging
+        _wlog = logging.getLogger(__name__)
         t = threading.Thread(target=_worker_init, daemon=True)
         t.start()
+        _wlog.info("[WT] worker_init 线程已启动（端口 %s, world_size=%s）",
+                   port, 1 + int(self.tp_size))
         # NCCL 通信组禁止两个 rank 同卡（"Duplicate GPU detected"，2026-08-17 实测）。
         # trainer（rank0）必须在【训练卡】建组，vLLM worker（rank1）在 rollout 卡——
         # 布局必须是交叉分卡（CUDA_VISIBLE_DEVICES 重排）。显式把当前设备切到训练卡。
@@ -341,8 +344,11 @@ class VLLMRolloutEngine:
         if str(_trainer_dev).startswith("cuda"):
             torch.cuda.set_device(_trainer_dev)
         # trainer 侧 NCCL 组（rank 0，用当前 CUDA 设备 = 训练卡）
+        _wlog.info("[WT] trainer_init 开始（trainer_dev=%s, 端口 %s）", _trainer_dev, port)
         self._wt_group = NCCLWeightTransferEngine.trainer_init(self._wt_init_info)
+        _wlog.info("[WT] trainer_init 完成")
         t.join(timeout=120)
+        _wlog.info("[WT] worker_init join 返回（init_err=%d）", len(_init_err))
         if _init_err:
             raise RuntimeError(f"vLLM NCCL 权重同步初始化失败（worker 侧）：{_init_err[0]}")
 

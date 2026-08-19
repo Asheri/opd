@@ -308,7 +308,14 @@ def _spawn_entry(child_argv):
     再由 multiprocessing 反序列化调用本入口。
     """
     sys.argv = list(child_argv)
-    main()
+    try:
+        main()
+    finally:
+        # 双引擎并发时 vLLM 引擎 shutdown/解释器退出清理会挂起（非 daemon 线程
+        # join），child 永不退出 → 父 join 永久阻塞、EngineCore 变孤儿占显存
+        # （2026-08-19 双卡实测）。summary.json 在并行子路径也已写完，此处强制
+        # 退出跳过解释器清理；残留 EngineCore 由父进程 join 后统一清理。
+        os._exit(0)
 
 
 def _run_serial(args, names):
@@ -392,8 +399,24 @@ def _run_parallel(args, names):
         if p.exitcode not in (0, None):
             n_failed += 1
             print(f"  [S2][警告] 子进程 {name} 非零退出（exitcode={p.exitcode}），计入失败", flush=True)
+    _cleanup_stray_engines()
     _finish_parallel(args, n_failed=n_failed)
 
+
+
+def _cleanup_stray_engines() -> None:
+    """join 后清理子进程留下的孤儿 vLLM EngineCore（child os._exit 跳过清理）。
+
+    双卡并行：child 完成即 os._exit(0)（防 vLLM shutdown 挂起），引擎进程残留为
+    init 孤儿（ppid=1）继续占显存；此处按 cmdline 精确匹配 kill。专用云 GPU 机器，
+    pkill 'VLLM::EngineCore' 不匹配父/其他链路。
+    """
+    import subprocess
+    try:
+        subprocess.run(["pkill", "-9", "-f", "VLLM::EngineCore"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:   # pragma: no cover —— 清理失败只告警，不影响汇总
+        print(f"  [S2][警告] 残留引擎清理失败: {e}", flush=True)
 
 def main() -> None:
     args = parse_args()
