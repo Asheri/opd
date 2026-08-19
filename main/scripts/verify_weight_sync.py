@@ -79,7 +79,8 @@ def main() -> int:
     eng = VLLMRolloutEngine(model=args.model, tp_size=1, dtype="auto",
                             gpu_memory_utilization=0.12, max_model_len=6144,
                             vocab_size=151936, full_logprobs_cap=4096,
-                            device=args.vllm_device, weight_sync_mode="auto")
+                            device=args.vllm_device, weight_sync_mode="auto",
+                            learner_device="cuda:0")  # NCCL rank0 建组在物理1（与 worker 物理0 交叉）
     eng._weight_transfer_init_16()
     print("[C1] vLLM engine built", flush=True)
 

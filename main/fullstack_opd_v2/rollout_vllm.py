@@ -368,8 +368,10 @@ class VLLMRolloutEngine:
         部分旧权重（off-policy）。解决：同权重双发（第二发强制收敛），~200ms/步
         （1.7B bf16 全量 NCCL），可接受。重度优化：TP=1 时改 param.copy_ 直拷可省。
         """
-        import threading
+        import threading, logging
+        _ulog = logging.getLogger(__name__)
         self._weight_transfer_init_16()
+        _ulog.info("[WT-update] 开始（keys=%d）", len(state_dict))
         update_info = _build_nccl_update_info(state_dict)
         # 防御：广播要求 tensor 在 NCCL 组设备（训练卡）上——调用方传 CPU 态会
         # AssertionError 且被吞 → collective_rpc 永久挂（2026-08-17 实测）。
@@ -397,6 +399,7 @@ class VLLMRolloutEngine:
                 kwargs={"update_info": update_info})
         finally:
             t.join(timeout=float(getattr(self, "_wt_timeout", 120.0)) + 30)
+        _ulog.info("[WT-update] 第一发返回（send_err=%d）", len(err))
         if err:
             raise RuntimeError(f"vLLM NCCL 权重广播失败：{err[0]}")
         if getattr(self, "_wt_double_send", True):
@@ -422,8 +425,10 @@ class VLLMRolloutEngine:
                     kwargs={"update_info": update_info2})
             finally:
                 t2.join(timeout=float(getattr(self, "_wt_timeout", 120.0)) + 30)
+            _ulog.info("[WT-update] 第二发返回（send2_err=%d）", len(err2))
             if err2:
                 raise RuntimeError(f"vLLM NCCL 权重广播失败（第 2 发）：{err2[0]}")
+        _ulog.info("[WT-update] 完成")
         return True
 
     def update_weights_from_flat(self, tensors: list) -> bool:
