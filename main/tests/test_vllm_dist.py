@@ -720,3 +720,31 @@ def test_pipeline_raise_if_weight_sync_poisoned():
                                    metric_key="rollout/weight_sync_poisoned",
                                    label="vLLM")
     assert mr2.records == []
+
+# --------------------------- prompt 右填充去填充（2026-08-19） ---------------------------
+def test_strip_prompt_padding_basic():
+    # 输入是 (B, P) 定长矩阵（数据层右 pad 到 max_prompt_len），各 P 同长
+    from fullstack_opd_v2.rollout_vllm import _strip_prompt_padding
+    prompts = torch.tensor([
+        [1, 2, 3, 9, 9, 9],      # 去尾部 pad
+        [4, 5, 9, 9, 9, 9],      # 更多 pad
+        [7, 8, 9, 9, 9, 9],      # 少 pad
+        [9, 9, 9, 9, 9, 9],      # 全 pad
+    ])
+    out = _strip_prompt_padding(prompts, 9)
+    assert out == [[1, 2, 3], [4, 5], [7, 8], [9]]
+
+
+def test_strip_prompt_padding_preserves_inner_pad():
+    # 中间的 pad token 不去（只去右侧连续尾部）
+    from fullstack_opd_v2.rollout_vllm import _strip_prompt_padding
+    prompts = torch.tensor([[1, 9, 2, 9, 9]])
+    assert _strip_prompt_padding(prompts, 9) == [[1, 9, 2]]
+
+
+def test_strip_prompt_padding_empty_row_fallback():
+    # 空行兜底为 [pad_id]（避免 vLLM 收到空 prompt）
+    from fullstack_opd_v2.rollout_vllm import _strip_prompt_padding
+    prompts = torch.tensor([[9, 9], [1, 9]], dtype=torch.long)
+    out = _strip_prompt_padding(prompts, 9)
+    assert out == [[9], [1]]

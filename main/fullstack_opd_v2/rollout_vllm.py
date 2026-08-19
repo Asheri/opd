@@ -759,7 +759,11 @@ class VLLMRolloutEngine:
         if eos_token_id is not None:
             _sp_kw["stop_token_ids"] = [int(eos_token_id)]
         sampling = SamplingParams(**_sp_kw)
-        seqs = [prompts[b].tolist() for b in range(B)]
+        # 2026-08-19 修复：数据层（JsonLinesDataLoader）把 prompt 右 pad 到
+        # max_prompt_len（Qwen3 pad=151643）。HF generate 靠 attention_mask 自动排除
+        # pad；vLLM 不会——尾部 pad token 作为真实上下文进入模型，导致生成退化/loop
+        # （GPU 实测：HF 0 loop vs 旧 vLLM 路径 5/8 loop）。此处按 pad_id 去填充。
+        seqs = _strip_prompt_padding(prompts, pad_id)
         outs = self._generate(seqs, sampling)
         parsed = parse_vllm_outputs(outs, max_new, eos_token_id,
                                     loop_detection, loop_periods, loop_min_len)
@@ -883,6 +887,24 @@ def _prepare_weight_transfer_payload(state_dict: dict, wt_device) -> dict:
         out[name] = v
     return out
 
+
+
+def _strip_prompt_padding(prompts: torch.Tensor, pad_id: int) -> list[list[int]]:
+    """去掉每个 prompt 行右侧的 pad token（vLLM 生成前，纯函数，CPU 可单测）。
+
+    数据层（JsonLinesDataLoader）把 prompt 右 pad 到 max_prompt_len（Qwen3 pad=151643）。
+    HF generate 靠 attention_mask 自动排除 pad；vLLM 不会——尾部 pad 作为真实上下文
+    进入模型，导致生成退化/loop。返回去 pad 后的变长 token 序列；空行兜底为 [pad_id]。
+    """
+    seqs: list[list[int]] = []
+    for b in range(int(prompts.size(0))):
+        row = [int(x) for x in prompts[b].tolist()]
+        while row and row[-1] == int(pad_id):
+            row.pop()
+        if not row:
+            row = [int(pad_id)]
+        seqs.append(row)
+    return seqs
 
 
 def _build_nccl_update_info(state_dict: dict) -> dict:
