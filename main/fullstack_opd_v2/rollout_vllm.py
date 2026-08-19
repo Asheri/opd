@@ -373,10 +373,16 @@ class VLLMRolloutEngine:
         self._weight_transfer_init_16()
         _ulog.info("[WT-update] 开始（keys=%d）", len(state_dict))
         update_info = _build_nccl_update_info(state_dict)
-        # 防御：广播要求 tensor 在 NCCL 组设备（训练卡）上——调用方传 CPU 态会
-        # AssertionError 且被吞 → collective_rpc 永久挂（2026-08-17 实测）。
-        sd_dev = {k: (v.to(self.device) if v.device != torch.device(self.device)
-                      else v) for k, v in state_dict.items()}
+        # 广播要求 tensor 在【NCCL 组设备】（训练卡 = self._wt_group.device）上：
+        # - 传 CPU 态 → PyNcclCommunicator 的 broadcast 无 device assert，NCCL 用
+        #   comm device 操作错误指针 → illegal memory access（异步）→ 后续挂起
+        #   （2026-08-17 实测）；
+        # - 传 rollout 卡张量 → 同样不匹配（2026-08-19 verify_weight_sync 实测：
+        #   [WT-update] 开始后永久卡）。旧实现 to(self.device)（rollout 卡）是错的，
+        #   run_s2_real 恰好因 current_device=训练卡 + 流巧合未暴露。
+        _wt_dev = self._wt_group.device
+        sd_dev = {k: (v.to(_wt_dev) if v.device != _wt_dev else v)
+                  for k, v in state_dict.items()}
         update_info = _build_nccl_update_info(sd_dev)
         from vllm.distributed.weight_transfer.nccl_engine import (
             NCCLWeightTransferEngine)
@@ -384,9 +390,12 @@ class VLLMRolloutEngine:
 
         def _send():
             try:
+                # stream 必须是对应 NCCL comm 设备（训练卡）的流；当前设备可能已被
+                # 其他 CUDA 操作改到 rollout 卡/参考模型卡 → 显式切回 comm 设备取流。
+                with torch.cuda.device(_wt_dev):
+                    _stream = torch.cuda.current_stream()
                 NCCLWeightTransferEngine.trainer_send_weights(
-                    iter(sd_dev.items()), self._wt_group,
-                    stream=torch.cuda.current_stream())
+                    iter(sd_dev.items()), self._wt_group, stream=_stream)
             except Exception as e:  # noqa: BLE001 —— 广播失败记入并让主线程抛
                 err.append(e)
 
@@ -411,9 +420,10 @@ class VLLMRolloutEngine:
 
             def _send2():
                 try:
+                    with torch.cuda.device(_wt_dev):
+                        _stream2 = torch.cuda.current_stream()
                     NCCLWeightTransferEngine.trainer_send_weights(
-                        iter(sd_dev.items()), self._wt_group,
-                        stream=torch.cuda.current_stream())
+                        iter(sd_dev.items()), self._wt_group, stream=_stream2)
                 except Exception as e:  # noqa: BLE001
                     err2.append(e)
 
