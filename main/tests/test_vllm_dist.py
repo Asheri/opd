@@ -332,3 +332,186 @@ def test_resolve_visible_device():
     # 非 cuda：不注入
     assert _resolve_visible_device("cpu", None) is None
     assert _resolve_visible_device("mps", "1,0") is None
+
+# --------------------------- NCCL 权重广播稳定性修复（2026-08-19） ---------------------------
+# 覆盖：_prepare_weight_transfer_payload（payload 预检）、_run_with_timeout（主进程侧超时
+# fail-fast）、shutdown（NCCL 组清理 + 注册表移除，不再早退）。纯 CPU 可测。
+import time
+
+
+def test_prepare_weight_transfer_payload_ok():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    sd = {
+        "w1": torch.ones(4, 8, dtype=torch.bfloat16),
+        "w2": torch.zeros(2, 3, dtype=torch.float32),
+    }
+    out = _prepare_weight_transfer_payload(sd, torch.device("cpu"))
+    assert set(out) == {"w1", "w2"}
+    for k, v in out.items():
+        assert isinstance(v, torch.Tensor)
+        assert v.is_contiguous()
+        assert v.device == torch.device("cpu")
+
+
+def test_prepare_weight_transfer_payload_string_device():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    out = _prepare_weight_transfer_payload({"w": torch.zeros(2)}, "cpu")
+    assert out["w"].device == torch.device("cpu")
+
+
+def test_prepare_weight_transfer_payload_non_contiguous_made_contiguous():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    t = torch.zeros(4, 8).t()          # (8,4)，非连续
+    assert not t.is_contiguous()
+    out = _prepare_weight_transfer_payload({"w": t}, torch.device("cpu"))
+    assert out["w"].is_contiguous()
+    assert out["w"].shape == (8, 4)
+
+
+def test_prepare_weight_transfer_payload_empty_dict():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    with pytest.raises(ValueError):
+        _prepare_weight_transfer_payload({}, torch.device("cpu"))
+
+
+def test_prepare_weight_transfer_payload_non_dict():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    with pytest.raises(ValueError):
+        _prepare_weight_transfer_payload(None, torch.device("cpu"))
+
+
+def test_prepare_weight_transfer_payload_non_tensor():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    with pytest.raises(TypeError):
+        _prepare_weight_transfer_payload({"w": 42}, torch.device("cpu"))
+
+
+def test_prepare_weight_transfer_payload_bad_dtype():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    with pytest.raises(TypeError):
+        _prepare_weight_transfer_payload(
+            {"w": torch.zeros(2, dtype=torch.complex64)}, torch.device("cpu"))
+    with pytest.raises(TypeError):
+        _prepare_weight_transfer_payload(
+            {"w": torch.zeros(2, dtype=torch.bool)}, torch.device("cpu"))
+
+
+def test_prepare_weight_transfer_payload_empty_shape():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    with pytest.raises(ValueError):
+        _prepare_weight_transfer_payload({"w": torch.zeros(0, 4)}, torch.device("cpu"))
+    with pytest.raises(ValueError):
+        _prepare_weight_transfer_payload({"w": torch.zeros(2, 0)}, torch.device("cpu"))
+
+
+def test_prepare_weight_transfer_payload_bad_device():
+    from fullstack_opd_v2.rollout_vllm import _prepare_weight_transfer_payload
+    with pytest.raises(RuntimeError):
+        _prepare_weight_transfer_payload({"w": torch.zeros(2)}, None)
+    with pytest.raises(RuntimeError):
+        _prepare_weight_transfer_payload({"w": torch.zeros(2)}, "not-a-device")
+
+
+def test_run_with_timeout_returns_result():
+    from fullstack_opd_v2.rollout_vllm import _run_with_timeout
+    assert _run_with_timeout(lambda: 42, 5.0, "t") == 42
+
+
+def test_run_with_timeout_propagates_error():
+    from fullstack_opd_v2.rollout_vllm import _run_with_timeout
+    def _boom():
+        raise ValueError("boom")
+    with pytest.raises(ValueError):
+        _run_with_timeout(_boom, 5.0, "t")
+
+
+def test_run_with_timeout_preserves_systemexit_type():
+    from fullstack_opd_v2.rollout_vllm import _run_with_timeout
+    def _exit():
+        raise SystemExit(7)
+    with pytest.raises(SystemExit):
+        _run_with_timeout(_exit, 5.0, "t")
+
+
+def test_run_with_timeout_times_out():
+    from fullstack_opd_v2.rollout_vllm import _run_with_timeout
+    with pytest.raises(RuntimeError, match="主进程侧超时"):
+        _run_with_timeout(lambda: time.sleep(5), 0.2, "slow")
+
+
+def test_build_nccl_update_info_length_consistency():
+    from fullstack_opd_v2.rollout_vllm import _build_nccl_update_info
+    info = _build_nccl_update_info({"a": torch.zeros(2), "b": torch.ones(3)})
+    assert len(info["names"]) == len(info["dtype_names"]) == len(info["shapes"]) == 2
+
+
+# --------------------------- shutdown 生命周期清理 ---------------------------
+def test_shutdown_cleans_nccl_group_and_registry():
+    from fullstack_opd_v2.rollout_vllm import VLLMRolloutEngine, _ACTIVE_ENGINES
+    eng = object.__new__(VLLMRolloutEngine)
+    eng._shutdown_done = False
+
+    class _LLM:
+        def __init__(self):
+            self.called = 0
+        def shutdown(self):
+            self.called += 1
+
+    class _Group:
+        destroyed = 0
+        def destroy(self):
+            _Group.destroyed += 1
+
+    eng.llm = _LLM()
+    eng.llm.llm_engine = None       # llm.shutdown 成功路径不应触碰 engine
+    eng._wt_group = _Group()
+    _ACTIVE_ENGINES.append(eng)
+    eng.shutdown()
+    assert eng.llm.called == 1
+    assert _Group.destroyed == 1
+    assert eng._wt_group is None
+    assert eng not in _ACTIVE_ENGINES
+
+
+def test_shutdown_falls_back_to_engine_and_still_cleans():
+    from fullstack_opd_v2.rollout_vllm import VLLMRolloutEngine
+    eng = object.__new__(VLLMRolloutEngine)
+    eng._shutdown_done = False
+
+    class _LLM:
+        def shutdown(self):
+            raise RuntimeError("llm.shutdown 失败")
+
+    class _Eng:
+        def __init__(self):
+            self.called = 0
+        def shutdown(self):
+            self.called += 1
+
+    eng.llm = _LLM()
+    eng.llm.llm_engine = _Eng()
+    eng._wt_group = object()        # 无 destroy/close 的裸对象
+    eng.shutdown()
+    assert eng.llm.llm_engine.called == 1
+    assert eng._wt_group is None
+
+
+def test_shutdown_idempotent():
+    from fullstack_opd_v2.rollout_vllm import VLLMRolloutEngine, _ACTIVE_ENGINES
+    eng = object.__new__(VLLMRolloutEngine)
+    eng._shutdown_done = False
+
+    class _LLM:
+        def __init__(self):
+            self.called = 0
+        def shutdown(self):
+            self.called += 1
+
+    eng.llm = _LLM()
+    eng.llm.llm_engine = None
+    eng._wt_group = None
+    _ACTIVE_ENGINES.append(eng)
+    eng.shutdown()
+    eng.shutdown()                  # 第二次调用应直接返回
+    assert eng.llm.called == 1
+    assert eng not in _ACTIVE_ENGINES
