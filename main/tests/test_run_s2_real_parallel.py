@@ -374,3 +374,114 @@ def test_stagger_sleeps_between_children(rs2, monkeypatch):
     assert started == ["S2-S2_E1_opd512", "S2-S2_E2_opd1024"]
     assert len(sleeps) == 1
     assert sleeps[0] == 30.0
+
+# ---------------------------------------------------------------- 孤儿引擎清理（2026-08-22） ---
+def test_cleanup_orphan_engines_only_kills_ppid1(rs2, monkeypatch):
+    """_cleanup_orphan_engines：只杀 ppid=1 的 EngineCore（子进程已退出），不误杀运行中的。"""
+    import subprocess
+    fake_ps = (
+        "1234 1 VLLM::EngineCore\n"    # 孤儿（ppid=1）→ 杀
+        "5678 999 VLLM::EngineCore\n"  # 有父进程（运行中）→ 不杀
+        "9999 1 python run_s2_real\n"  # 非 EngineCore → 不杀
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [1234]
+
+# ---------------------------------------------------------------- 孤儿引擎清理 args= 修复（2026-08-22）---
+def test_cleanup_orphan_engines_parses_args_and_kills_ppid1(rs2, monkeypatch):
+    """_cleanup_orphan_engines：args= 格式（cmdline 完整路径）解析 + 只杀 ppid=1 的 EngineCore。
+
+    模拟 ps -eo pid=,ppid=,args= 输出：ppid=1 的 EngineCore（应杀）、ppid=其它（不杀）、
+    非 EngineCore 的 ppid=1 进程（不杀）。
+    """
+    import subprocess
+    fake_ps = (
+        "1234 1 /opt/vllm/VLLM::EngineCore --weight-transfer\n"
+        "5678 999 /opt/vllm/VLLM::EngineCore --weight-transfer\n"
+        "9999 1 /usr/bin/python run_s2_real.py\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [1234]
+
+
+def test_cleanup_orphan_engines_matches_truncated_comm_false_positive_guard(rs2, monkeypatch):
+    """回归守卫：comm= 截断 'VLLM::EngineCore'(16)→'VLLM::EngineCor'(15) 的 bug 已修。
+
+    构造含【截断名】与【完整名】混合的 ps 输出：只有完整名（args= cmdline）能匹配
+    'VLLM::EngineCore' 子串并进入 kill；截断名 'VLLM::EngineCor'（comm= 会显示）
+    无法匹配完整子串 → 不被误处理。验证 args= 路径匹配完整名。
+    """
+    import subprocess
+    fake_ps = (
+        "1001 1 VLLM::EngineCor\n"
+        "2002 1 /proc/.../VLLM::EngineCore --worker\n"
+        "3003 999 VLLM::EngineCore\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [2002]
+
+
+def test_count_orphan_engines_counts_only_ppid1(rs2, monkeypatch):
+    """_count_orphan_engines：只统计 ppid=1 的 EngineCore 数量，不执行 kill。"""
+    import subprocess
+    fake_ps = (
+        "1234 1 /path/VLLM::EngineCore a\n"
+        "5678 999 /path/VLLM::EngineCore b\n"
+        "9999 1 /usr/bin/python run_s2_real.py\n"
+        "4321 1 /path/VLLM::EngineCore c\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    assert rs2._count_orphan_engines() == 2
+    assert killed == []          # count 不杀
+
+def test_cleanup_orphan_engines_matches_truncated_comm_false_positive_guard(rs2, monkeypatch):
+    """回归守卫：comm= 截断 'VLLM::EngineCore'(16)→'VLLM::EngineCor'(15) 的 bug 已修。
+
+    构造含【截断名】与【完整名】混合的 ps 输出：只有完整名（args= cmdline）能匹配
+    'VLLM::EngineCore' 子串并进入 kill；截断名 'VLLM::EngineCor'（comm= 会显示）
+    无法匹配完整子串 → 不被误处理。验证 args= 路径匹配完整名。
+    """
+    import subprocess
+    fake_ps = (
+        "1001 1 VLLM::EngineCor\n"                       # 截断名（comm= 旧 bug 源）→ 不匹配完整名
+        "2002 1 /proc/.../VLLM::EngineCore --worker\n"   # 完整名（args=）→ 匹配并杀
+        "3003 999 VLLM::EngineCore\n"                    # 完整名但 ppid=999 → 不杀
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [2002]
+
+
+def test_count_orphan_engines_counts_only_ppid1(rs2, monkeypatch):
+    """_count_orphan_engines：只统计 ppid=1 的 EngineCore 数量，不执行 kill。"""
+    import subprocess
+    fake_ps = (
+        "1234 1 /path/VLLM::EngineCore a\n"
+        "5678 999 /path/VLLM::EngineCore b\n"
+        "9999 1 /usr/bin/python run_s2_real.py\n"
+        "4321 1 /path/VLLM::EngineCore c\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    assert rs2._count_orphan_engines() == 2
+    assert killed == []          # count 不杀

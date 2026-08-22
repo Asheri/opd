@@ -748,3 +748,38 @@ def test_strip_prompt_padding_empty_row_fallback():
     prompts = torch.tensor([[9, 9], [1, 9]], dtype=torch.long)
     out = _strip_prompt_padding(prompts, 9)
     assert out == [[9], [1]]
+
+# --------------------------- NCCL trainer_init 线程内 set_device（2026-08-22） ---------------------------
+def test_nccl_trainer_init_sets_device_in_thread(monkeypatch):
+    """_weight_transfer_init_16：trainer_init 在 _run_with_timeout 新线程执行，torch.cuda.
+    set_device 必须在线程内生效（线程局部）。E2 交叉布局（train@GPU1+vLLM@GPU0）实测
+    rank0 落在默认 cuda:0 与 worker 冲突 → Duplicate GPU；修复后线程内显式 set_device。
+    """
+    import torch as _t
+    import fullstack_opd_v2.rollout_vllm as rv
+    _install_fake_nccl_module(monkeypatch)
+    # 记录 set_device 的调用参数（CPU-only 无法真设，no-op 记录即可）
+    set_calls = []
+    _orig_set = _t.cuda.set_device
+    monkeypatch.setattr(_t.cuda, "set_device", lambda d: set_calls.append(str(d)))
+    # trainer_init 记录被调用（fake 返回带 device 的 group）
+    inited = {}
+
+    class _FakeGroup:
+        device = "cuda:1"
+
+    _FakeNCCLWeightTransferEngine.trainer_init = lambda info: inited.setdefault("n", 0) or _FakeGroup()
+    _FakeNCCLWeightTransferEngine.trainer_send_weights = lambda *a, **k: None
+
+    eng = _mk_wt_engine(_learner_device="cuda:1")
+    class _LLM:
+        def __init__(self):
+            self.llm_engine = self
+        def init_weight_transfer_engine(self, info):
+            return None
+    eng.llm = _LLM()
+    eng._weight_transfer_init_16()
+    # set_device 必须被调用（至少线程内一次，device 应为 cuda:1 —— 训练卡）
+    assert "cuda:1" in set_calls, f"set_device 未用训练卡：{set_calls}"
+    assert inited.get("n") is not None
+    _t.cuda.set_device = _orig_set

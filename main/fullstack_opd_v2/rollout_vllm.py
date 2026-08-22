@@ -406,9 +406,19 @@ class VLLMRolloutEngine:
                 torch.cuda.set_device(_trainer_dev)
             _timeout = float(getattr(self, "_wt_timeout", 120.0))
             _wlog.info("[WT] trainer_init 开始（trainer_dev=%s, 端口 %s）", _trainer_dev, port)
+            # ⚠️ 2026-08-22 GPU 实测（E2 交叉布局 train@GPU1+vLLM@GPU0）：NCCL trainer_init
+            # 在 _run_with_timeout 的【新线程】里执行，而 torch.cuda.set_device 是【线程局部】
+            # ——主线程设的 cuda:1 在新线程不生效，新线程用默认 cuda:0，导致 rank0(trainer) 与
+            # rank1(worker) 都在 GPU0 → "Duplicate GPU detected / NCCL_INVALID_USAGE"。
+            # E1（train@GPU0）恰好默认卡=训练卡所以从未暴露。修复：把 set_device 放线程内。
+            def _trainer_init_on_device():
+                if str(_trainer_dev).startswith("cuda"):
+                    torch.cuda.set_device(_trainer_dev)
+                return NCCLWeightTransferEngine.trainer_init(self._wt_init_info)
+
             # trainer_init 可能因 worker 未加入而永久阻塞 → 主进程侧限时 fail-fast
             self._wt_group = _run_with_timeout(
-                lambda: NCCLWeightTransferEngine.trainer_init(self._wt_init_info),
+                _trainer_init_on_device,
                 _timeout + 30.0, "trainer_init")
             _wlog.info("[WT] trainer_init 完成")
             t.join(timeout=_timeout + 30.0)

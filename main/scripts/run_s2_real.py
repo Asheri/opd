@@ -408,12 +408,67 @@ def _run_parallel(args, names):
     n_failed = 0
     for name, p in procs:
         p.join()
+        # 2026-08-22：子进程 os._exit 跳过清理 → 其 EngineCore 变孤儿占显存。立即清理
+        # 孤儿（ppid=1），否则先完成的实验引擎一直占着目标卡，拖累仍在跑的另一实验
+        # （v13 实测 E1 残留 12.76GB 致 E2 refresh OOM）。
+        _cleanup_orphan_engines()
+        # P1（2026-08-22）：清理后检查是否仍有 EngineCore 孤儿（ppid=1）残留——
+        # 若有，说明清理静默失效（如 ps 格式变化），打警告提示人工核查，不自动
+        # pkill 全部（会误杀仍在跑实验的引擎）。
+        _left = _count_orphan_engines()
+        if _left > 0:
+            print(f"  [S2][警告] 孤儿引擎清理后仍检测到 {_left} 个 ppid=1 的 "
+                  "EngineCore，请检查 ps args= 输出格式", flush=True)
         if p.exitcode not in (0, None):
             n_failed += 1
             print(f"  [S2][警告] 子进程 {name} 非零退出（exitcode={p.exitcode}），计入失败", flush=True)
     _cleanup_stray_engines()
     _finish_parallel(args, n_failed=n_failed)
 
+
+
+def _orphan_engine_pids() -> list[int]:
+    """列出 ppid=1 且 cmdline 含 'VLLM::EngineCore' 的 pid（ps args= 读 cmdline 不截断）。
+
+    v14 实测：comm= 截断 16 字符名为 15（VLLM::EngineCor），'VLLM::EngineCore' 子串
+    恒不匹配 -> 清理从未执行；args= 读 /proc/PID/cmdline（setproctitle 修改后不截断）。
+    纯函数，CPU 可单测（monkeypatch ps 输出）。
+    """
+    import subprocess as _sp
+    out = _sp.run(["ps", "-eo", "pid=,ppid=,args="],
+                  capture_output=True, text=True).stdout
+    pids: list[int] = []
+    for line in out.splitlines():
+        if "VLLM::EngineCore" not in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "1":   # ppid=1 → 子进程已退出
+            pids.append(int(parts[0]))
+    return pids
+
+
+def _count_orphan_engines() -> int:
+    """统计 ppid=1 的 EngineCore 孤儿数（不 kill）。供清理后检查防静默失效。"""
+    try:
+        return len(_orphan_engine_pids())
+    except Exception:   # pragma: no cover —— 统计失败返回 -1 表示无法判定
+        return -1
+
+
+def _cleanup_orphan_engines() -> None:
+    """join 后清理【孤儿】vLLM EngineCore（ppid=1，其子进程已 os._exit 退出）。
+
+    与 _cleanup_stray_engines（pkill 全部）不同：只杀 ppid=1 的 EngineCore，不误杀仍
+    在运行实验的引擎。并行双实验先完成的那个 os._exit 跳过清理 → 其 EngineCore 变孤儿
+    继续占目标卡显存（v13 实测：E1 残留 12.76GB 致 E2 refresh OOM 80.94GB 撞顶）。
+    每 join 一个子进程后立即调用，及时释放其引擎占用的显存，避免拖到全 join 后。
+    """
+    import os as _os
+    try:
+        for pid in _orphan_engine_pids():
+            _os.kill(pid, 9)
+    except Exception as e:   # pragma: no cover —— 清理失败只告警
+        print(f"  [S2][警告] 孤儿引擎清理失败: {e}", flush=True)
 
 
 def _cleanup_stray_engines() -> None:
