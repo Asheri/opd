@@ -523,10 +523,17 @@ class VLLMRolloutEngine:
 
             def _send():
                 try:
+                    # 2026-08-22 加固（与 _trainer_init_on_device 同款）：trainer_send_weights
+                    # 在【后台线程】执行，torch.cuda.set_device 是线程局部——旧实现用
+                    # `with torch.cuda.device(_wt_dev):` 只覆盖取 stream 一行，with 退出后
+                    # 设备恢复默认（E2 sender 线程默认 cuda:0），trainer_send_weights 在
+                    # cuda:0 上下文执行却用 cuda:1 的 communicator+stream。实测广播能跑
+                    # （communicator/stream 已绑定正确设备），但任何临时张量分配会静默错位。
+                    # 改为线程开头 set_device，覆盖整个函数。
+                    torch.cuda.set_device(_wt_dev)
                     # stream 必须是对应 NCCL comm 设备（训练卡）的流；当前设备可能已被
                     # 其他 CUDA 操作改到 rollout 卡/参考模型卡 → 显式切回 comm 设备取流。
-                    with torch.cuda.device(_wt_dev):
-                        _stream = torch.cuda.current_stream()
+                    _stream = torch.cuda.current_stream()
                     NCCLWeightTransferEngine.trainer_send_weights(
                         iter(sd_dev.items()), self._wt_group, stream=_stream)
                 except BaseException as e:      # noqa: BLE001 —— 立即日志 + 记录，主线程抛

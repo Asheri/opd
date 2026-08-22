@@ -587,9 +587,11 @@ def _fast_run_with_timeout(monkeypatch):
 
 
 def _patch_cuda_stream(monkeypatch):
-    """CPU-only 环境：把 torch.cuda.device / current_stream 打成 no-op（send 线程用）。"""
+    """CPU-only 环境：把 torch.cuda.device / current_stream / set_device 打成 no-op
+    （send 线程 2026-08-22 起在函数开头 set_device，覆盖整个 broadcast）。"""
     monkeypatch.setattr(torch.cuda, "device", _NoopCM)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda *a, **k: None)
 
 
 def _mk_wt_engine(**attrs):
@@ -783,3 +785,36 @@ def test_nccl_trainer_init_sets_device_in_thread(monkeypatch):
     assert "cuda:1" in set_calls, f"set_device 未用训练卡：{set_calls}"
     assert inited.get("n") is not None
     _t.cuda.set_device = _orig_set
+
+# --------------------------- _send 线程设备作用域（2026-08-22） ---------------------------
+def test_send_sets_device_before_broadcast(monkeypatch):
+    """_weight_transfer_broadcast_round 的 _send：set_device(_wt_dev) 必须在广播前、
+    覆盖整个函数（线程局部）——否则 E2 sender 线程默认 cuda:0 与 cuda:1 communicator 错位。"""
+    import fullstack_opd_v2.rollout_vllm as rv
+    _install_fake_nccl_module(monkeypatch)
+    _patch_cuda_stream(monkeypatch)
+    set_calls = []
+    monkeypatch.setattr(torch.cuda, "set_device",
+                        lambda d: set_calls.append(str(d)))
+    eng = _mk_wt_engine(_wt_double_send=True)
+    class _LLM:
+        def __init__(self):
+            self.llm_engine = self
+        def collective_rpc(self, *a, **k):
+            return None
+    eng.llm = _LLM()
+    _FakeNCCLWeightTransferEngine.trainer_init = lambda info: _FakeGroup("cuda:1")
+    # 记录广播调用时已 set_device（模拟线程当前设备 = group 设备）
+    sent = []
+    def _fake_send(iterable, group, stream):
+        sent.append(set_calls[-1] if set_calls else None)
+    _FakeNCCLWeightTransferEngine.trainer_send_weights = _fake_send
+    # 直接跑 broadcast_round（绕过 update_16 的 init——这里单独验证 send 线程设备作用域）
+    eng._wt_group = _FakeGroup("cuda:1")
+    from fullstack_opd_v2.rollout_vllm import _build_nccl_update_info
+    sd = {"w": torch.zeros(2, dtype=torch.float32)}
+    info = _build_nccl_update_info(sd)
+    eng._weight_transfer_broadcast_round(sd, info, "test")
+    # 广播执行前必须已 set_device 到 group 设备（cuda:1）
+    assert "cuda:1" in set_calls
+    assert sent and sent[0] == "cuda:1", f"广播时线程设备未设为 cuda:1: {sent}"
