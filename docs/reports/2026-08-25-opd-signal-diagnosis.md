@@ -78,3 +78,41 @@ cd /root/opd/main
 - 数据：`docs/reports/budget_aware_data/d3_report_20260825.json`
 - D1 功能（eval_holdout/eval_every）已实现并单测通过（523 passed），**保留待 C3 通过后使用**
 - 服务器/本地均已提交（服务器 `e6ba14b` / 本地 `d30e401`、`d246cb0`）
+
+---
+
+## C3 教师模板一致性审计（2026-08-25，服务器实证）
+
+### 背景
+D3 判据 FAIL（teacher top-K 支撑 Δ 均值 -1.159 < -1.0）→ 按任务回 C3 审计教师对方向/模板/数据源。
+
+### 审计 1：教师词表 + 模板（`audit_teacher_templates.py`，8 + 50 条样本）
+| 项 | 结果 |
+|---|---|
+| 词表 | student=151643 / teacher_rl(JustRL)=151643 / teacher_ref(R1-Distill)=151643 —— **三者一致** |
+| 学生 response token 越界 | rl=0 / ref=0（共 4096）—— **无跨词表错位** |
+| Δ_student（共用学生模板） | 50 条均值 **-0.127** |
+| Δ_teacher（教师各自模板） | 50 条均值 **-0.121** |
+| 模板影响 | Δ 差 +0.006 —— **教师模板不是方向根因** |
+
+**关键**：实际 response token 上的 Δ 均值 ≈ **-0.12（轻微负）**，远非 D3 的 -1.159。D3 的深度负是 **teacher top-K=256 支撑统计的固有偏置**（JustRL 分布较平坦、R1-Distill 较集中 → 在 rl 的 top-K 上 ref 平均更高），不代表训练实际信号深度负。
+
+### 审计 2：cache 与训练数据同源性（`audit_delta_support.py` + 手工统计）
+| 项 | 结果 |
+|---|---|
+| cache.lengths vs jsonl 编码长度 | **413/500 一致（82.6%）**，87 条差异 |
+| 差异分布 | 20 条 cache 更长（max +1593，如 i=28: jsonl=455 vs cache=2048）；67 条 jsonl 更长（max -72） |
+| teacher top-K 命中 jsonl token | i=0/8/12=100%、i=28=98.7% —— cache 的 Δ_T 位置与 jsonl response **开头对齐** |
+| 结论 | cache 与 jsonl **基本同源但 17.4% 行长度/尾部错位**（cache build 时 response 与当前 jsonl 部分行不同版本） |
+
+**含义**：训练用当前 jsonl response 前向 s_cur，cache 用构建时 response 算 Δ_T——17.4% 行的 pad 尾部位置存在**信号错位**（cache 在真实 token 上有 Δ_T、student 在 pad 上预测）。这是 reward 无收敛的**部分根因**（非全部：大部分行同源）。
+
+### C3 审计结论（修正 D3 FAIL 的解读）
+1. ✅ 教师词表一致、模板一致性无问题 → **不指向"教师对模板错位"**
+2. ✅ 实际 Δ ≈ -0.12（轻微负）→ **教师对方向并非深度负**；D3 的 -1.159 是 teacher top-K 支撑指标的口径偏置
+3. ⚠️ **cache 与训练 jsonl 17.4% 行错位** → 需确认 cache build 数据源；若重建 cache 须与训练用**同一 jsonl/response 版本**
+
+### 建议下一步（需用户决策）
+- **A（推荐）**：重建 cache（用当前 skywork_50k.jsonl 前 500 条，与训练完全同源），同时 D3 判据改用「实际 token 或 student 支撑 Δ」口径复评；通过后进 D1
+- **B**：接受「实际 Δ -0.12 非深负」的修正结论，直接用现有 cache 进 D1（但需接受 17.4% 行错位噪声）
+- 产物：`audit_teacher_templates.py` / `audit_delta_support.py`；数据 `d3_report_20260825.json`、`c3v2_align_20260825.log`
