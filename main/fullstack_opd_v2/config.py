@@ -131,6 +131,7 @@ class Stage2Cfg(_Strict):
     # eval_every>0：每 N 步在固定集上评估当前策略 E[Δ_T]（no_grad），记 metrics eval_reward。
     eval_holdout_size: int = 0
     eval_every: int = 0
+    eval_chunk: int = 8   # D1：固定评估集分 chunk 前向大小（双卡并行共卡时降到 2 防 OOM）
 
 
 # --------------------------- L2 Adaptive Teacher Cache（§2-§7）-----------------
