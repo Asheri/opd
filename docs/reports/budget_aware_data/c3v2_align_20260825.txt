@@ -1,0 +1,18 @@
+/root/miniconda3/lib/python3.12/site-packages/megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py:114: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/root/miniconda3/lib/python3.12/site-packages/megatron/core/optimizer/__init__.py:24: UserWarning: Transformer Engine and Apex are not installed. Falling back to Torch optimizers.
+  warnings.warn(
+/root/miniconda3/lib/python3.12/site-packages/megatron/core/optimizer/optimizer.py:28: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/root/miniconda3/lib/python3.12/site-packages/megatron/core/optimizer/clip_grads.py:29: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier, multi_tensor_l2norm, and multi_tensor_scale
+  warnings.warn(
+[C3v2] cache samples=500 T=2048 K=256 resp_len=2048
+[C3v2] 采用 max_prompt_len=1024 （来自 cache_skywork_chat.pt.metadata.json）
+[C3v2][ALIGN] jsonl mtime=2026-08-18T02:20:19.078224  cache metadata mtime=2026-08-18T02:53:57.994503
+[C3v2][ALIGN] jsonl path=/root/autodl-tmp/datasets/skywork_50k.jsonl  cache=/root/autodl-tmp/cache_skywork_chat.pt
+[C3v2][ALIGN] mismatch 明细（前 3 条）：
+  i=0 jsonl_len=2048 cache_len=2047
+  i=8 jsonl_len=2048 cache_len=2046
+  i=12 jsonl_len=2048 cache_len=2047
+[C3v2][ALIGN][FAIL] 长度匹配率 0.850 < 0.90 —— jsonl 与 cache 非同源/索引错位，审计无效。
+[C3v2][ALIGN] 请先确认 cache build 时的真实数据文件（materialized response 来源），修正 DATA/CACHE 后重跑。
