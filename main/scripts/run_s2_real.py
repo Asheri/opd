@@ -89,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--set", dest="extra_sets", action="append", default=[],
                    metavar="KEY=VALUE",
                    help="额外 config 覆盖（可重复），如 --set stage2.rollout_engine=vllm")
-    return p.parse_args()
     p.add_argument("--resume", action="store_true", help="从 run-dir 最新断点续跑剩余步（需与断点同配置；metrics 截断到断点前，step 编号不重复）")
+    return p.parse_args()
 
 
 def _mean(xs):

@@ -8,7 +8,53 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from vllm_budget_eval import _aggregate_budget
+from vllm_budget_eval import _aggregate_budget, build_prompts
+from fullstack_opd_v2.budget_eval import wrap_chat, format_prompt
+
+
+class _FakeTok:
+    """fake tokenizer：记录 apply_chat_template 调用参数，返回 Qwen 系 chat 包裹文本。"""
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, messages, **kw):
+        self.calls.append((messages, kw))
+        return ("<|im_start|>user\n" + messages[0]["content"]
+                + "<|im_end|>\n<|im_start|>assistant\n")
+
+
+def test_wrap_chat_format():
+    """wrap_chat 用 apply_chat_template 把文本作为 user 消息包裹，add_generation_prompt=True。"""
+    tok = _FakeTok()
+    out = wrap_chat("Q?", tok)
+    assert out == "<|im_start|>user\nQ?<|im_end|>\n<|im_start|>assistant\n"
+    msgs, kw = tok.calls[0]
+    assert msgs == [{"role": "user", "content": "Q?"}]
+    assert kw["add_generation_prompt"] is True
+    assert kw["tokenize"] is False
+
+
+def test_build_prompts_bare():
+    """build_prompts 裸路径（tok=None）：与 format_prompt 一致（零回归）。"""
+    problems = [("p0", "42"), ("p1", "7")]
+    got = build_prompts(problems, "boxed")
+    assert got == [format_prompt(p, "boxed") for p, _ in problems]
+    assert got[0].startswith("p0")
+    assert got[1].startswith("p1")
+
+
+def test_build_prompts_chat():
+    """build_prompts 传 fake tok：每条 prompt 被 apply_chat_template 包裹（user 消息）。"""
+    tok = _FakeTok()
+    problems = [("p0", "42")]
+    got = build_prompts(problems, "boxed", tok=tok)
+    bare = format_prompt("p0", "boxed")
+    assert len(got) == 1
+    assert got[0] == "<|im_start|>user\n" + bare + "<|im_end|>\n<|im_start|>assistant\n"
+    msgs, kw = tok.calls[0]
+    assert msgs == [{"role": "user", "content": bare}]
+    assert kw["add_generation_prompt"] is True
+    assert kw["tokenize"] is False
 
 
 class _Out:

@@ -52,6 +52,15 @@ def extract_final_answer(text: str) -> str | None:
     return fallback or None
 
 
+def wrap_chat(prompt: str, tok) -> str:
+    """用模型 chat template 包裹单条 prompt（对齐 eval_aime.generate 与训练
+    apply_chat_template=true）。产出 <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+    （Qwen 系）。prompt 作为 user 消息，add_generation_prompt=True 追加 assistant 头。"""
+    return tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True, tokenize=False)
+
+
 # --------------------------- 数据集注册表（GSM8K 基础泛化 / MATH-500 主结果 / AIME 补充） ----
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -455,6 +464,6 @@ def _write_plots(all_results: list[dict], out_dir: str) -> list[str]:
     return written
 
 
-__all__ = ["BudgetEvaluator", "extract_final_answer", "run_matrix", "write_report",
-           "DatasetSpec", "DATASET_REGISTRY",
+__all__ = ["BudgetEvaluator", "extract_final_answer", "wrap_chat", "run_matrix",
+           "write_report", "DatasetSpec", "DATASET_REGISTRY",
            "ANSWER_COMPLETION_PROMPT", "DEFAULT_BUDGETS", "DEFAULT_COMPLETION_MAX_TOKENS"]

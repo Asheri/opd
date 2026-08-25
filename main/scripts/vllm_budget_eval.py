@@ -23,7 +23,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fullstack_opd_v2.budget_eval import extract_final_answer, format_prompt
+from fullstack_opd_v2.budget_eval import extract_final_answer, format_prompt, wrap_chat
 from fullstack_opd_v2.budget_eval import BudgetEvaluator
 from fullstack_opd_v2.eval_aime import _grade_answer_sympy
 
@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--draft", default=None, help="投机解码 draft 小模型路径")
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--gpu-mem", type=float, default=0.9)
+    p.add_argument("--chat-template", action="store_true",
+                   help="用模型 chat template 包裹 prompt（对齐训练 apply_chat_template=true，"
+                        "重测 B512 与训练协议对齐用）")
+    p.add_argument("--tokenizer", default=None,
+                   help="chat 模板 tokenizer 路径；默认取各模型自身路径（三模型同族分词器，"
+                        "按模型路径加载最稳）")
     return p.parse_args()
 
 
@@ -50,6 +56,20 @@ def _load_problems(dataset_ref: str, n_limit: int | None):
     if n_limit is not None:
         problems = problems[:int(n_limit)]
     return problems
+
+
+def build_prompts(problems: list[tuple[str, str]], style: str = "boxed",
+                  tok=None) -> list[str]:
+    """纯函数：problems → prompts（可单测，不依赖 vLLM/GPU）。
+
+    tok=None（默认）：裸 format_prompt 文本（零回归，等价旧行为，vLLM 按裸文本处理）；
+    tok 提供：用 tok.apply_chat_template 把每条 prompt 作为 user 消息包裹
+    （<|im_start|>user/assistant，对齐 eval_aime generate 与训练 apply_chat_template=true）。
+    """
+    prompts = [format_prompt(p, style) for p, _ in problems]
+    if tok is not None:
+        prompts = [wrap_chat(p, tok) for p in prompts]
+    return prompts
 
 
 def _aggregate_budget(problems, outs, budget: int, label: str) -> dict:
@@ -96,9 +116,10 @@ def main() -> None:
     budgets = [int(b) for b in args.budgets.split(",") if b.strip()]
     os.makedirs(args.out_dir, exist_ok=True)
     problems = _load_problems(args.dataset, args.n_limit)
-    prompts = [format_prompt(p, "boxed") for p, _ in problems]
+    base_prompts = build_prompts(problems, "boxed")          # tok=None：裸 prompt（零回归）
     print(f"[vllm-budget] dataset={args.dataset} n={len(problems)} budgets={budgets} "
-          f"fp8={args.fp8} draft={args.draft} device={args.device}", flush=True)
+          f"fp8={args.fp8} draft={args.draft} device={args.device} "
+          f"chat_template={args.chat_template}", flush=True)
 
     all_results = []
     for label, path in models:
@@ -115,6 +136,17 @@ def main() -> None:
             llm_kw["speculative_config"] = {"model": args.draft}
         llm = LLM(**llm_kw)
         print(f"[vllm-budget] {label} 加载 {round(time.time()-t0,1)}s", flush=True)
+        # chat 模板必须在 llm.generate 之前构造好 prompts：每个模型用各自 tokenizer 加载
+        # （三模型同族 Qwen3 分词器，但按模型路径加载最稳；--tokenizer 可显式覆盖）。
+        if args.chat_template:
+            from transformers import AutoTokenizer
+            tok_path = args.tokenizer or path
+            tok = AutoTokenizer.from_pretrained(tok_path)
+            prompts = build_prompts(problems, "boxed", tok=tok)
+            print(f"[vllm-budget] {label}: chat template 启用（tokenizer={tok_path}），"
+                  f"对齐训练 apply_chat_template=true", flush=True)
+        else:
+            prompts = base_prompts
         for B in budgets:
             t1 = time.time()
             params = SamplingParams(temperature=0.0, max_tokens=B)
