@@ -124,3 +124,32 @@ D3 判据 FAIL（teacher top-K 支撑 Δ 均值 -1.159 < -1.0）→ 按任务回
   判定 H1 遍历不足 vs H2 KL 压制）；D1 的 eval_reward 用 student 支撑口径（非 teacher 支撑均值）。
 - 附带修复项（低优先级）：cache build 的 pad_id 应传实际 pad_token_id（当前默认 0 导致 lengths 元数据不准）。
 - 产物：`audit_teacher_templates.py` / `audit_delta_support.py`；数据 `d3_report_20260825.json`、`c3v2_align_20260825.txt`
+
+---
+
+## D1/D2/正式训练结果（2026-08-25）
+
+### D1：固定评估集 80 步探针（kl=0.5，E2 口径）
+- 固定集 eval_reward：step9=-0.424 → step79=-0.517（首段≈-0.44、末段≈-0.52，**-0.08，判据 FAIL**）
+- 结论：kl=0.5 下策略固定集 E[Δ_T] 下降 → 进 D2
+
+### D2：KL 消融三档（同一 64 条 holdout，各 40 步，eval_chunk=2 防双卡 OOM）
+| 组 | kl | 首段(0-20) | 末段(30-40) | 末-首 | 判定 |
+|---|---|---|---|---|---|
+| A | 0.5 | ≈-0.51 | ≈-0.49 | +0.02 | ✗ |
+| B | 0.1 | ≈-0.34 | ≈-0.36 | -0.02 | ✗ |
+| **C** | **0.02** | **≈-0.074** | **≈+0.065** | **+0.139** | **✅ 通过** |
+
+- **结论：H2（KL 压制）确诊**——kl_reg_coef=0.5（原配置）过强压制策略移动；0.02 时固定集 E[Δ_T] 转正。
+- 证据：d2A/B/C_metrics.csv 入库。
+
+### 正式训练（kl=0.02，batch=4，双卡并行 E1/E2，300 步）
+- **E2 完整完成（300 步）**：eval_reward -0.017 → **+0.524**（末 100 步均值≈0.510 - 首≈-0.017 ≈ **+0.527 > +0.05 ✅ 判据通过**）；checkpoints 保留 5 个关键步。
+- **E1 被 SIGKILL（exitcode=-9）**：cgroup 内存硬限 220GB，单进程 RSS 峰值 206GB（94%），双并行 checkpoint 保存超限 → cgroup OOM killer。→ 已修复（checkpoint 内存归还 + cgroup 断言）并计划**串行单实验重跑 E1**（待服务器恢复）。
+- E2 收尾曾因磁盘满（checkpoints 173GB）失败 → 已清理释放 252GB。
+- H1-H4 最终判定：**H2 确诊**（KL 压制）；H1（遍历不足）、H3（lr 压制）非主因；H4（Δ_T 信号）经 C3 审计排除（教师一致、cache 同源、实际 Δ≈-0.12）。
+
+### 待办（服务器恢复后）
+1. E1 串行 300 步重跑（含 VmRSS 峰值对比）
+2. MATH500 B512 / AIME24 评估（step 0/100/200/300 checkpoint + 最优 checkpoint）
+3. 服务器 pytest 529 同步确认
