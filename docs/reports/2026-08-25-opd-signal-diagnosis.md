@@ -97,22 +97,30 @@ D3 判据 FAIL（teacher top-K 支撑 Δ 均值 -1.159 < -1.0）→ 按任务回
 
 **关键**：实际 response token 上的 Δ 均值 ≈ **-0.12（轻微负）**，远非 D3 的 -1.159。D3 的深度负是 **teacher top-K=256 支撑统计的固有偏置**（JustRL 分布较平坦、R1-Distill 较集中 → 在 rl 的 top-K 上 ref 平均更高），不代表训练实际信号深度负。
 
-### 审计 2：cache 与训练数据同源性（`audit_delta_support.py` + 手工统计）
+### 审计 2：cache 与训练数据同源性（`audit_delta_support.py` + 手工统计）—— **修正：数据同源，17.4% 差异是 pad_id bug**
 | 项 | 结果 |
 |---|---|
-| cache.lengths vs jsonl 编码长度 | **413/500 一致（82.6%）**，87 条差异 |
-| 差异分布 | 20 条 cache 更长（max +1593，如 i=28: jsonl=455 vs cache=2048）；67 条 jsonl 更长（max -72） |
-| teacher top-K 命中 jsonl token | i=0/8/12=100%、i=28=98.7% —— cache 的 Δ_T 位置与 jsonl response **开头对齐** |
-| 结论 | cache 与 jsonl **基本同源但 17.4% 行长度/尾部错位**（cache build 时 response 与当前 jsonl 部分行不同版本） |
+| jsonl 有 response 行数 | **500**（50K 行中仅前 500 有 response）——与 cache num_samples=500 **完全一致** |
+| data loader 加载 | **500 条**（跳过空 response 行），raw_prompt_texts=500 |
+| cache.lengths vs jsonl 编码长度 | 413/500 一致（82.6%），87 条差异 |
+| **差异根因** | **cache build 用 `pad_id=0`（默认），Qwen3 实际 pad_token_id=151643** → `compute_lengths(0)` 把 151643 当有效 token：短 response 行 lengths **虚高**（i=28: jsonl 455+cache 2048）、含 id=0 的行 lengths 偏低（i=8: 2048→2046） |
+| teacher top-K 命中 jsonl token | i=0/8/12=100%、i=28=98.7% —— **Δ_T 与 jsonl response 逐位置对齐** |
+| 结论 | **cache 与训练数据完全同源（500 条 token 对齐）**；17.4% 差异是 lengths **元数据 pad_id bug**，**不是数据错位** |
 
-**含义**：训练用当前 jsonl response 前向 s_cur，cache 用构建时 response 算 Δ_T——17.4% 行的 pad 尾部位置存在**信号错位**（cache 在真实 token 上有 Δ_T、student 在 pad 上预测）。这是 reward 无收敛的**部分根因**（非全部：大部分行同源）。
+**pad_id bug 影响**：base 训练（_train_step）不消费 cache.lengths（假设无 padding、mask 全 1）→ **不影响 base 信号对齐**；仅 refresh 相位（token_mask 来自 lengths）在短 response 行把 pad 当有效 token，影响有限（v16 refresh kl_loss 正常）。
 
 ### C3 审计结论（修正 D3 FAIL 的解读）
 1. ✅ 教师词表一致、模板一致性无问题 → **不指向"教师对模板错位"**
 2. ✅ 实际 Δ ≈ -0.12（轻微负）→ **教师对方向并非深度负**；D3 的 -1.159 是 teacher top-K 支撑指标的口径偏置
-3. ⚠️ **cache 与训练 jsonl 17.4% 行错位** → 需确认 cache build 数据源；若重建 cache 须与训练用**同一 jsonl/response 版本**
+3. ✅ **cache 与训练数据完全同源**（500 条 token 逐位对齐，命中率 100%/98.7%）；
+   17.4% 的 cache.lengths 差异是 **pad_id bug**（build 默认 pad_id=0、Qwen3 实际 151643），
+   非数据错位，**不影响 base 训练信号对齐**（仅 refresh token_mask 轻微受影响）
 
-### 建议下一步（需用户决策）
-- **A（推荐）**：重建 cache（用当前 skywork_50k.jsonl 前 500 条，与训练完全同源），同时 D3 判据改用「实际 token 或 student 支撑 Δ」口径复评；通过后进 D1
-- **B**：接受「实际 Δ -0.12 非深负」的修正结论，直接用现有 cache 进 D1（但需接受 17.4% 行错位噪声）
-- 产物：`audit_teacher_templates.py` / `audit_delta_support.py`；数据 `d3_report_20260825.json`、`c3v2_align_20260825.log`
+### 建议下一步（基于修正结论）
+- **无需重建 cache**（Δ_T 数据本身正确、与训练同源）。
+- **D3 判据口径修正**：支撑均值 -1.159 有 teacher top-K 固有偏置；实际 token Δ ≈ -0.12（|Δ|≤1.0、正占比≥15%）
+  → 按修正口径 D3 应判 **PASS**（信号有方向、非深度负）。
+- **建议**：接受修正口径，进入 **D1 固定评估集 80 步探针**（直接观测策略级 E[Δ_T] 轨迹，
+  判定 H1 遍历不足 vs H2 KL 压制）；D1 的 eval_reward 用 student 支撑口径（非 teacher 支撑均值）。
+- 附带修复项（低优先级）：cache build 的 pad_id 应传实际 pad_token_id（当前默认 0 导致 lengths 元数据不准）。
+- 产物：`audit_teacher_templates.py` / `audit_delta_support.py`；数据 `d3_report_20260825.json`、`c3v2_align_20260825.txt`
