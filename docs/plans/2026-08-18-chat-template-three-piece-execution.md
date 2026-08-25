@@ -93,8 +93,8 @@ cd /root/opd/main
 | valid_rate | ≥ 0.5（IMP-1 原目标；模板下实测应远高于此） | ✅ **E1=1.0（3/3 refresh 相位）、E2=1.0（3/3）**——8/8 全 valid |
 | refresh pool | ≥ 8（不再触发冷启动跳过，refresh 训练真正跑起来） | ✅ **E1 n_appended=8、E2 n_appended=8**；refresh 训练实际执行（α=0.300→实际 0.200，5 步） |
 | decode 样本 | 报告中附 2-3 条完整 rollout decode（正常推理内容） | ✅ 见下方「decode 样本证据」：3 条完整 decode（chat 模板包裹 + thinking 前缀 + 正常推理，0 loop） |
-| C1 | verify_weight_sync.py 三关全过 | ⏳ 服务器恢复后补跑（本轮 focus pilot） |
-| 回归 | 服务器 pytest 全绿 + 本地 434 passed | ✅ 本地 511 passed（≥基线）；服务器 pytest 待阶段4 |
+| C1 | verify_weight_sync.py 三关全过 | ✅ **三关全过（2026-08-25 13:36 实测）**：扰动 3 层（layers.0/layers.27 q_proj + embed_tokens）注入 +0.1 后 logp 变化 5.10/0.83/7.98（overwrite 生效）且复原差异 0.000000（可逆）；分布级 512pos top1=0.9941、自信位置(n=468) top1==1.0、top1 logp MAE=0.003080；贪心分歧全为 near-tie 无置信翻转——**权重同步判定为正确加载** |
+| 回归 | 服务器 pytest 全绿 + 本地 434 passed | ✅ 本地 511 passed（≥基线）；服务器 pytest 511 passed（阶段4） |
 
 - 顺带把 loop 检测器在模板 rollout 上重新抽样校准（calibrate_rollout.py，
   periods/min_len 可能可收紧）——旧校准已标注 stale。
@@ -217,3 +217,30 @@ run_s2_real.py --config configs/skywork_17b.yaml --run-dir .../runs_s2_vllm_chat
 - **原因**：服务器（AutoDL 35318 端口）在当前会话中已失联；用户主动取消关机，保留服务器供后续使用（如 200 步正式训练 / C1 verify 三关补跑）。
 - **影响**：目标范围收缩为「pilot 验收 + TP=1 评估 + 同步」——此三项已全部完成并有证据（§6/§7/§8）。关闭服务器从待办中移除。
 - **遗留（需服务器恢复）**：§6 验收表 C1 行 ⏳ `verify_weight_sync.py` 三关补跑（正式训练前置）；若未来仍需关机，须由用户在 seetacloud 控制台操作或明确重新授权 SSH 关机。
+
+---
+
+## 10. C1 verify_weight_sync.py 三关补跑证据（2026-08-25 13:36，服务器）
+
+### 运行环境与命令
+- 服务器：autodl-container-ncv091d5ce-a7f8e622（SSH 已恢复）；模型 /root/autodl-tmp/models/Qwen__Qwen3-1.7B；torch 2.9.1+cu128 / transformers 4.57.6 / vllm 0.16.0 / NCCL 2.27.5+cuda12.9。
+- 命令（交叉分卡，与 AGENTS.md NCCL 布局硬约束一致）：
+  ```
+  cd /root/opd/main && CUDA_VISIBLE_DEVICES=1,0 NCCL_DEBUG=INFO OPD_WT_DEBUG=1 \
+    nohup /root/miniconda3/bin/python -u scripts/verify_weight_sync.py > /tmp/verify_c1.log 2>&1 &
+  ```
+- 完整日志已拉回本地：`main/docs/superpowers/reports/verify_c1_20260825.log`。
+
+### 结果（三关全 PASS）
+1. **扰动测试（overwrite 生效 + 可逆）**：
+   - `model.layers.0.self_attn.q_proj.weight`：注入 +0.1 后 logp 变化 **5.102142 → OK**；复原 base 差异 **0.000000 → OK**
+   - `model.layers.27.self_attn.q_proj.weight`：logp 变化 **0.826399 → OK**；复原 **0.000000 → OK**
+   - `model.embed_tokens.weight`：logp 变化 **7.977750 → OK**；复原 **0.000000 → OK**
+2. **分布级（共享前缀 512 pos）**：top1 一致 **0.9941**（≥0.99）；自信位置（vLLM top1 logp>-0.5，n=468）top1 一致 **1.0000**；top-1 logp MAE（自信位置）**0.003080**（<0.03）。
+3. **贪心审计（逐序列首分叉点）**：seq0/5/6 全 128 位置一致；seq1/2/3/4/7 首分叉点 HF_gap / vLLM_gap 均 ≤0.375（阈值 0.4 内，near-tie）；无置信翻转；greedy overall positional agree 0.6035（分歧集中在低置信近并列）。
+- 终判：`PASS：扰动生效+可逆、分布级一致（自信位置全部一致）、贪心分歧均为近并列 —— 权重同步可判定为正确加载。`
+- 运行时佐证：NCCL 交叉分卡正确（trainer rank0 @ 物理 GPU1、worker rank1 @ 物理 GPU0）；base sync True（311 keys，双发 send_err=0）；进程退出后双卡显存清空 0 MiB、无 EngineCore 残留。
+
+### 结论
+- 报告措辞可由「静态一致性初步通过」**升级为「权重加载正确」**（C1 加强验证三关全过，overwrite 生效且可逆，非"引擎里本来就有同样的值"）。
+- 200 步正式训练前置的 C1 阻塞项已清除。
