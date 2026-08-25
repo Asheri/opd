@@ -485,3 +485,32 @@ def test_count_orphan_engines_counts_only_ppid1(rs2, monkeypatch):
     monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
     assert rs2._count_orphan_engines() == 2
     assert killed == []          # count 不杀
+# ---------------------------------------------------------------- cgroup 内存断言 ---
+
+def test_cgroup_warning_no_file_returns_none(rs2):
+    """cgroup 文件缺失 → None，不误报。"""
+    assert rs2.cgroup_memory_warning(2, cgroup_path="/nonexistent/memory.max") is None
+
+
+def test_cgroup_warning_max_returns_none(rs2, tmp_path):
+    """配额=max（无限制）→ None。"""
+    f = tmp_path / "memory.max"
+    f.write_text("max\n")
+    assert rs2.cgroup_memory_warning(2, cgroup_path=str(f)) is None
+
+
+def test_cgroup_warning_within_quota_none(rs2, tmp_path):
+    """220GB 配额下单进程（210GB 预估）→ None。"""
+    f = tmp_path / "memory.max"
+    f.write_text(str(220 * 1024 ** 3) + "\n")
+    assert rs2.cgroup_memory_warning(1, cgroup_path=str(f)) is None
+
+
+def test_cgroup_warning_over_quota_warns(rs2, tmp_path):
+    """220GB 配额下双进程（420GB 预估）→ 返回警告文案（含 SIGKILL 提示）。"""
+    f = tmp_path / "memory.max"
+    f.write_text(str(220 * 1024 ** 3) + "\n")
+    w = rs2.cgroup_memory_warning(2, cgroup_path=str(f))
+    assert w is not None
+    assert "SIGKILL" in w
+    assert "220GB" in w

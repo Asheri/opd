@@ -15,6 +15,22 @@ import torch
 from .exceptions import CheckpointError
 
 
+def _release_cpu_memory() -> None:
+    """checkpoint 保存后归还 CPU 内存（E1 SIGKILL 根因缓解）。
+
+    torch.save 的 CPU payload 可达 13.5GB，PyTorch CPU allocator 缓存 + glibc malloc
+    arena 碎片使单进程 RSS 峰值 206GB（占 cgroup 220GB 配额 94%）。gc.collect +
+    malloc_trim 强制归还空闲页；非 glibc / 非 Linux 平台静默跳过，绝不抛异常。
+    """
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _opt_state_to_cpu(optimizer) -> dict:
     """把 optimizer state 中的张量搬 CPU（§B 精确续跑，供 checkpoint 落盘）。
 
@@ -81,6 +97,12 @@ class CheckpointManager:
             payload["refresh_buffer"] = refresh_buffer
         torch.save(payload, tmp)
         os.replace(tmp, path)                     # 原子替换，避免半写
+        # cgroup 内存修复（2026-08-25）：checkpoint 的 CPU payload 可达 13.5GB，
+        # torch.save 后不归还 → PyTorch CPU allocator 缓存 + glibc malloc arena 碎片
+        # 使单进程 RSS 峰值 206GB（占 cgroup 220GB 配额 94%），双进程并行必被 SIGKILL。
+        # 保存后立即释放 payload 并强制归还空闲页（E1 SIGKILL 根因的缓解）。
+        del payload
+        _release_cpu_memory()   # gc.collect + malloc_trim（cgroup 内存修复，见函数 docstring）
         return path
 
     # --------------------------- 定位 ---------------------------

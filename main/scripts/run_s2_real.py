@@ -198,6 +198,28 @@ def _run_experiment(args, name, load_cache, prefix=None):
 _STRIP_OPTIONS = ("--names", "--device", "--parallel", "--stagger")
 
 
+def cgroup_memory_warning(n_parallel: int, per_proc_gb: float = 210.0,
+                        cgroup_path: str = "/sys/fs/cgroup/memory.max") -> str | None:
+    """读 cgroup 内存配额（默认 /sys/fs/cgroup/memory.max），若 并行数×单进程峰值 > 配额返回警告。
+    三态：无 cgroup 文件 / 配额=max → None；配额内 → None；超限 → 警告文案。
+    E1 SIGKILL 根因（2026-08-25）：容器 cgroup 内存硬限 220GB，单进程 RSS 峰值 206GB，
+    双进程并行 checkpoint 保存时超限 → cgroup OOM killer 发 SIGKILL（exitcode=-9）。
+    """
+    try:
+        with open(cgroup_path, encoding="utf-8") as f:
+            raw = f.read().strip()
+        if raw in ("max", ""):
+            return None
+        quota = int(raw)
+    except (OSError, ValueError):
+        return None
+    peak = n_parallel * per_proc_gb * (1024 ** 3)
+    if peak > quota:
+        gb = quota / (1024 ** 3)
+        return ("[S2][警告] cgroup 内存配额 {:.0f}GB，{} 进程 × 预估峰值 {:.0f}GB = {:.0f}GB 超限"
+                " —— 建议串行跑（或降低 batch/offload）。E1 曾因双并行 + checkpoint CPU payload"
+                " 超 220GB 被 SIGKILL（exitcode=-9）。").format(gb, n_parallel, per_proc_gb, peak / (1024 ** 3))
+    return None
 def build_parallel_argv(base_argv, name, i, n_cards):
     """父进程 sys.argv → 单个并行子进程 argv（纯函数，单测覆盖）。
 
@@ -490,6 +512,12 @@ def main() -> None:
     names = args.names or list(STAGE2_ROLLOUT_MATRIX)
     os.makedirs(args.run_dir, exist_ok=True)
     if args.parallel > 1:
+        # cgroup 内存配额断言（2026-08-25 E1 SIGKILL 根因）：双并行 × 206GB 峰值 > 220GB 配额
+        _cw = cgroup_memory_warning(args.parallel)
+        if _cw:
+            print(_cw, flush=True)
+        _run_parallel(args, names)
+        return
         _run_parallel(args, names)
         return
     _run_serial(args, names)
