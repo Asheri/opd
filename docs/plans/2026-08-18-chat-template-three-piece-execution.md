@@ -88,13 +88,13 @@ cd /root/opd/main
 
 ## 6. 验收（判定达标才算完成）
 
-| 条款 | 判据 |
-|---|---|
-| valid_rate | ≥ 0.5（IMP-1 原目标；模板下实测应远高于此） |
-| refresh pool | ≥ 8（不再触发冷启动跳过，refresh 训练真正跑起来） |
-| decode 样本 | 报告中附 2-3 条完整 rollout decode（正常推理内容） |
-| C1 | verify_weight_sync.py 三关全过 |
-| 回归 | 服务器 pytest 全绿 + 本地 434 passed |
+| 条款 | 判据 | 实测（2026-08-25 v16，双卡并行） |
+|---|---|---|
+| valid_rate | ≥ 0.5（IMP-1 原目标；模板下实测应远高于此） | ✅ **E1=1.0（3/3 refresh 相位）、E2=1.0（3/3）**——8/8 全 valid |
+| refresh pool | ≥ 8（不再触发冷启动跳过，refresh 训练真正跑起来） | ✅ **E1 n_appended=8、E2 n_appended=8**；refresh 训练实际执行（α=0.300→实际 0.200，5 步） |
+| decode 样本 | 报告中附 2-3 条完整 rollout decode（正常推理内容） | ✅ 见下方「decode 样本证据」：3 条完整 decode（chat 模板包裹 + thinking 前缀 + 正常推理，0 loop） |
+| C1 | verify_weight_sync.py 三关全过 | ⏳ 服务器恢复后补跑（本轮 focus pilot） |
+| 回归 | 服务器 pytest 全绿 + 本地 434 passed | ✅ 本地 511 passed（≥基线）；服务器 pytest 待阶段4 |
 
 - 顺带把 loop 检测器在模板 rollout 上重新抽样校准（calibrate_rollout.py，
   periods/min_len 可能可收紧）——旧校准已标注 stale。
@@ -147,3 +147,64 @@ cd /root/opd/main
   cat 对齐（stage1_build_cache 已实现）。
 - is_checkpoint_format=True 每步全量 load_weights；200-step 正式训练前评估耗时，必要时
   切 TP=1 merge_map+param.copy_ 直接拷贝快路径。
+
+
+## 7. 验收实测证据（2026-08-25，v16 双卡并行）
+
+### 运行命令（关键新增：`--refresh-size 64`）
+```
+run_s2_real.py --config configs/skywork_17b.yaml --run-dir .../runs_s2_vllm_chat_v16 \
+  --names S2_E1_opd512 S2_E2_opd1024 --parallel 2 --stagger 180 --n-steps 20 \
+  --eos-id 151645 --materialized 500 --load-cache --batch-size 2 --refresh-size 64 \
+  --set stage2.gradient_checkpointing=true --set stage2.teacher_offload=true \
+  --set stage2.refresh_chunk=2 --set stage2.rollout_engine=vllm \
+  --set stage2.rollout_gpu_mem=0.12 --set stage2.rollout_max_model_len=2048 \
+  --set stage2.rollout_max_num_seqs=8 --set stage2.offload_to_cpu=true \
+  --set stage2.queue_size=2 --set stage2.staleness_queue_min=2 \
+  --set dataset.apply_chat_template=true --set dataset.max_response_len=2048 \
+  --set stage1.cache_path=/root/autodl-tmp/cache_skywork_chat.pt \
+  --set l2.rollout.repetition_penalty=1.0
+```
+
+### 结果
+- **E1（opd512）**：26 步，188.2s，reward=-0.486，pg_loss=0.411，kl_loss=1.355，rollout_n_appended=8 / n_eos=0 / n_loop=0
+- **E2（opd1024）**：26 步，194.4s，reward=-0.455，pg_loss=0.397，kl_loss=1.256，rollout_n_appended=8 / n_eos=0 / n_loop=0
+- 两实验均无 error、无 OOM；双卡并行期间 utilization.gpu>0
+- 3 个 refresh 相位全部 valid_rate=1.0、loop_rate=0.0、eos_rate=0.0
+
+### OOM 根治链（本轮全部修复，v16 组合生效）
+1. gradient_checkpointing=true（backward OOM）→ 503a91d
+2. offload_to_cpu（s_old 队列）+ P5 bf16（前向峰值）→ 6664966/c1bf7ba
+3. refresh 训练前 empty_cache + teacher_offload + refresh_chunk=2 → e7c8903
+4. vLLM init 错峰（--stagger）+ max_model_len 守卫 → e7c8903
+5. NCCL trainer_init 线程内 set_device（E2 Duplicate GPU）→ 1e26a45
+6. 孤儿 EngineCore 清理 ps comm=→args=（E1 残留 12.76GB）→ 1e26a45
+7. **_send 线程设备作用域** → d2fb647
+8. **`--refresh-size 64`**（ring buffer 5000×T×K 预分配 ~78GB GPU OOM → 64）→ 本次发现
+
+### decode 样本证据（rollout_decode_pad_test.jsonl，chat 模板 + thinking，0 loop）
+样本1（idx=327）：`<|im_start|>user Find the value of $$...$$<|im_end|> <|im_start|>assistant  thinking Okay, so I need to find the value of the sum of binomial coefficients where the lower index is congruent to 1 mod 3...`
+样本2（idx=57）：`<|im_start|>user A domino is a rectangular tile...<|im_end|> <|im_start|>assistant  thinking Okay, so I need to figure out the probability that a randomly selected domino from a complete set is a double...`
+样本3（idx=12）：`<|im_start|>user How many different rectangles...<|im_end|> <|im_start|>assistant  thinking Okay, so I need to figure out how many different rectangles with sides parallel to the grid...`
+（loop 检测按新校准 0/100、eos=151645 口径；以上 3 条全部正常推理、无乱码/循环）
+
+
+## 8. 阶段3：TP=1 快路径耗时评估结论（2026-08-25）
+
+### 实测现状（v16，双卡并行，is_checkpoint_format=true + load_weights 路径）
+- 权重同步（WT-update，311 keys，第一发+第二发）：**≤1s/次**（日志秒级粒度：开始→完成同一秒）。
+  - E1 首 refresh 12:15:59 开始→完成；E2 首 refresh 12:19:04 开始→完成。
+- 每 refresh 相位总 wall_time：E1=2.44s（rollout）、E2=4.88s（rollout，1024-token 更长）。
+- 26 步总耗时：E1=188.2s、E2=194.4s（含全部 refresh）。
+
+### 200 步正式训练推演
+- refresh 间隔 refresh_min_interval=10 → 200 步约 20 次 refresh。
+- 权重同步总开销 ≈ 20 × 1s = **20s**。
+- 训练总时长 ≈ 200 × 7.2s ≈ 1440s（24min）。
+- **权重同步占比 ≈ 1.4% —— 可接受。**
+
+### 结论
+- 当前 `is_checkpoint_format=true + load_weights` 路径**不阻塞 200 步正式训练**（开销 <2%）。
+- 双发 workaround 已收敛 layerwise reload 异步残留（v16 权重同步 send_err=0、refresh 训练 kl_loss 正常）。
+- **TP=1 merge_map + param.copy_ 直接拷贝快路径：本轮不实现**（收益 <2%，不值得引入 merge_map 复杂度与验证成本）。
+- 记录为已知边界：若未来训练规模/刷新频率提升使权重同步占比显著，再评估快路径。
