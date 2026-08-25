@@ -514,3 +514,20 @@ def test_cgroup_warning_over_quota_warns(rs2, tmp_path):
     assert w is not None
     assert "SIGKILL" in w
     assert "220GB" in w
+
+# ---------------------------------------------------------------- resume metrics 截断 ---
+
+def test_truncate_metrics_no_file(rs2, tmp_path):
+    """无 metrics.csv → 静默跳过，不抛。"""
+    rs2._truncate_metrics_csv(str(tmp_path), 80)   # 不抛即通过
+
+
+def test_truncate_metrics_keeps_before_resume(rs2, tmp_path):
+    """step < resume_step 保留，>= 截断；空 step 行保留。"""
+    p = tmp_path / "metrics.csv"
+    p.write_text("step,reward\n0,0.1\n40,0.2\n80,0.3\n100,0.4\n,0.9\n", encoding="utf-8")
+    rs2._truncate_metrics_csv(str(tmp_path), 80)
+    rows = list(__import__("csv").DictReader(open(p, encoding="utf-8")))
+    steps = [r["step"] for r in rows]
+    assert steps == ["0", "40", ""]     # 80/100 被截断，空 step 保留
+    assert rows[-1]["reward"] == "0.9"

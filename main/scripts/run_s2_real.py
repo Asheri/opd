@@ -90,6 +90,7 @@ def parse_args() -> argparse.Namespace:
                    metavar="KEY=VALUE",
                    help="额外 config 覆盖（可重复），如 --set stage2.rollout_engine=vllm")
     return p.parse_args()
+    p.add_argument("--resume", action="store_true", help="从 run-dir 最新断点续跑剩余步（需与断点同配置；metrics 截断到断点前，step 编号不重复）")
 
 
 def _mean(xs):
@@ -144,6 +145,29 @@ def _build_overrides(args, name, load_cache):
     return overrides
 
 
+def _truncate_metrics_csv(run_dir: str, resume_step: int) -> None:
+    """resume 续跑前，把旧 metrics.csv 截断到断点 step 之前（避免续跑 step 编号重复）。
+
+    只保留 step < resume_step 的行（空 step 行也保留）；无 metrics 文件时静默跳过。
+    """
+    import csv as _csv
+    p = os.path.join(run_dir, "metrics.csv")
+    if not os.path.isfile(p):
+        return
+    with open(p, encoding="utf-8", newline="") as f:
+        reader = list(_csv.DictReader(f))
+    if not reader:
+        return
+    fieldnames = list(reader[0].keys())
+    keep = [r for r in reader
+            if not r.get("step") or not r["step"].strip()
+            or int(r["step"]) < resume_step]
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(keep)
+
+
 def _run_experiment(args, name, load_cache, prefix=None):
     """串行跑单个实验；返回 results 元素 {name, summary, run_dir}。
 
@@ -159,8 +183,19 @@ def _run_experiment(args, name, load_cache, prefix=None):
         f"materialized={args.materialized}, load_cache={load_cache})", flush=True)
     try:
         from fullstack_opd_v2.pipeline import FullStackOPDv2
-        out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d)
-        metrics = out["metrics"]
+        resume = None
+        if args.resume:
+            from fullstack_opd_v2.checkpoint import CheckpointManager
+            cm = CheckpointManager(d, every=int((cfg.get("run") or {}).get("checkpoint_every", 10)))
+            resume = cm.resume()
+            if resume:
+                _rs = int(resume.get("step", resume.get("version", 0)))
+                _res_v = resume.get("version", 0)
+                log(f"  [resume] 从断点 step={_rs} 续跑（version={_res_v}）", flush=True)
+            else:
+                log("  [resume][警告] run-dir 无断点，从 0 开始", flush=True)
+        out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d, resume=resume)
+        out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d, resume=resume)
         # M3：均值只统计【含该键】的训练步 metric——rollout 相位 metric 缺键时
         # 旧实现 m.get(k, 0.0) 会往 reward/pg/kl 均值里混入大量 0，污染口径。
         def _keyed_mean(key):

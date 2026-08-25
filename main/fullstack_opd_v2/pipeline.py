@@ -625,11 +625,12 @@ class FullStackOPDv2:
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
         initial_version = 0
         resume_ref = None
-        # §B 精确续跑（L2，任务 6.1）：断点可含 optimizer state + RNG + L2 ring buffer
+        _resume_start = 0
         _resume_opt = _resume_rng = _resume_rb = None
         if resume is not None:
             student.load_state_dict(resume["state"])
             initial_version = int(resume.get("version", 0))
+            _resume_start = int(resume.get("step", resume.get("version", 0)))
             resume_ref = resume.get("ref")       # A3/D4：断点内 KL 锚点（旧断点可能为 None）
             _resume_opt = resume.get("optimizer")
             _resume_rng = resume.get("rng")
@@ -981,8 +982,8 @@ class FullStackOPDv2:
                     last_refresh = -refresh_min
                     # base_done 只计 base 训练步（=n_total 口径）；step_done 全局单调（含 refresh
                     # 补充步），供 step 编号与 checkpoint 文件名递增不冲突。
-                    base_done = 0
-                    step_done = 0
+                    base_done = _resume_start   # resume：从断点 step 续跑（不重训已完成的步）
+                    step_done = _resume_start
                     while base_done < n_total:
                         # 训练相位：跑 n_phase 步（_train_step teacher-free 不动）。
                         # ⚠️ scheduler.run 每次会 set self.stop 且 metrics 跨相位累计——
@@ -1226,7 +1227,13 @@ class FullStackOPDv2:
                                     logger=logger,
                                     message="[P3] teacher offload: refresh 完成（回 CPU + empty_cache）")
                 else:
-                    metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
+                    if _resume_start > 0:
+                        # resume：从断点 step 续跑剩余步（scheduler.run 的 start_step）
+                        metrics = scheduler.run(
+                            s2cfg.get("n_steps", 30) - _resume_start,
+                            on_step=_on_step, start_step=_resume_start)
+                    else:
+                        metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
         finally:
             # C1：drain 后台队列（成功/异常都执行），确保 metrics/checkpoint 全部落盘
             try:
