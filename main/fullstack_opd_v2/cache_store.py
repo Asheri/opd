@@ -330,3 +330,15 @@ class DiskTeacherCache:
     def to(self, device) -> "DiskTeacherCache":
         self.device = torch.device(device)                     # memmap 无需搬移，仅换目标设备
         return self
+
+    def slice(self, start: int, end: int | None = None) -> "DiskTeacherCache":
+        """D1（2026-08-25）：按样本行切片（固定评估集用）→ 返回只含 [start:end] 行的新 cache。
+        memmap 视图切片（不复制数据），num_samples 同步收缩。
+        """
+        import copy
+        out = copy.copy(self)
+        out._ids = self._ids[start:end]
+        out._delta = self._delta[start:end]
+        out._lengths = self._lengths[start:end]
+        out.num_samples = int(out._lengths.shape[0])
+        return out

@@ -845,10 +845,39 @@ class FullStackOPDv2:
                                     weight_sync_mode=s2cfg.get("rollout_weight_sync", "auto"),
                                     device=rollout_device,
                                     learner_device=self.device)
+                # D1（2026-08-25）：固定评估集 + 周期评估（OPD 信号诊断，默认全关零回归）。
+                # eval_holdout_size>0 且 eval_every>0：从训练数据末尾划出 holdout 条不参与训练，
+                # 每 eval_every 步在固定集上评估当前策略 E[Δ_T]（scheduler._eval_holdout）。
+                # cache / ref 锚点 / fat_prompts 同步切片到训练子集；holdout 子集单独给 scheduler。
+                _eval_holdout = int(s2cfg.get("eval_holdout_size", 0))
+                _eval_every = int(s2cfg.get("eval_every", 0))
+                _eval_cache = None
+                _eval_prompts = None
+                _eval_responses = None
+                if _eval_holdout > 0 and _eval_every > 0:
+                    _n_all = fat_prompts.size(0)
+                    if _eval_holdout >= _n_all:
+                        raise ValueError(f"eval_holdout_size={_eval_holdout} 需 < 训练数据行数 {_n_all}")
+                    _train_n = _n_all - _eval_holdout
+                    _eval_cache = cache.slice(_train_n)
+                    _eval_prompts = fat_prompts[_train_n:].to(self.device)
+                    _eval_responses = fat_responses[_train_n:].to(self.device)
+                    cache = cache.slice(0, _train_n)
+                    fat_prompts = fat_prompts[:_train_n]
+                    fat_responses = fat_responses[:_train_n]
+                    if ref_dists is not None:
+                        ref_dists = ref_dists[:_train_n]
+                    if ref_ids is not None:
+                        ref_ids = ref_ids[:_train_n]
+                    if ref_logp is not None:
+                        ref_logp = ref_logp[:_train_n]
+                    logger.info(f"[D1] 固定评估集：holdout={_eval_holdout} 条（末尾），训练 {_train_n} 条；每 {_eval_every} 步评估 eval_reward")
                 scheduler = AsyncBatchedScheduler(
                     student, cache, fat_prompts, fat_responses,
                     ref_dists, ref_ids, ref_logp, s2cfg, self.device,
-                    rollout_engine=rollout_engine, initial_version=initial_version)
+                    rollout_engine=rollout_engine, initial_version=initial_version,
+                    eval_cache=_eval_cache, eval_prompts=_eval_prompts,
+                    eval_responses=_eval_responses)
                 _scheduler_ref = scheduler
                 # G8：resume 精确续跑——恢复 optimizer 状态（scheduler 刚新建 self.opt，
                 # 从断点 load_state_dict 还原 Adam 动量/方差，否则续跑动量丢失）。

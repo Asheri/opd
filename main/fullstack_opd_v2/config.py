@@ -126,6 +126,12 @@ class Stage2Cfg(_Strict):
     # 把 ring buffer 样本拆成独立小批 + 梯度累积，控制 (chunk,T,V) 前向/反向峰值。
     refresh_chunk: int = 4
 
+    # D1（2026-08-25）：固定评估集 + 周期评估（OPD 信号诊断，默认全关零回归）
+    # eval_holdout_size>0：从训练数据末尾划出 N 条作固定评估集（不参与训练）；
+    # eval_every>0：每 N 步在固定集上评估当前策略 E[Δ_T]（no_grad），记 metrics eval_reward。
+    eval_holdout_size: int = 0
+    eval_every: int = 0
+
 
 # --------------------------- L2 Adaptive Teacher Cache（§2-§7）-----------------
 # 默认全关（enabled=False 退回 L0/L1 静态路径）；每模块双 enabled 开关支持单项 ablation
