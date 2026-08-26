@@ -177,9 +177,9 @@ vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。L2 �
 监控记录补救——**永远不许再发生**。
 
 - **resume 续跑前必须备份 metrics**：`run_s2_real.py` 的 `_truncate_metrics_csv` 是
-  破坏性操作（把 metrics.csv 截断到断点前），执行 `--resume` 前必须先
-  `cp <run_dir>/metrics.csv <run_dir>/metrics_pre_resume.csv`（或等价备份）；
-  无备份禁止 resume。
+  破坏性操作（把 metrics.csv 截断到断点前）。**代码已内置自动备份**：`--resume`
+  续跑前自动 `cp metrics.csv → metrics_pre_resume_step<N>.csv`（已存在不覆盖），
+  无需手工备份；任何手工清理仍需先确认备份/监控记录存在，无备份禁止删。
 - **任何清理/覆盖/删除 run-dir、metrics.csv、checkpoint、评估 jsonl 前，先检查目标**：
   确认已有备份或监控记录可替代才允许删除；不确定就不删，先问。
 - **监控是 metrics 的兜底**：训练期间保持 monitor.sh 抓取 eval_reward 等关键指标

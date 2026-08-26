@@ -531,3 +531,39 @@ def test_truncate_metrics_keeps_before_resume(rs2, tmp_path):
     steps = [r["step"] for r in rows]
     assert steps == ["0", "40", ""]     # 80/100 被截断，空 step 保留
     assert rows[-1]["reward"] == "0.9"
+
+
+def test_truncate_metrics_backup_created(rs2, tmp_path):
+    """截断前自动备份完整 metrics 为 metrics_pre_resume_step<N>.csv（不可再生约束）。"""
+    p = tmp_path / "metrics.csv"
+    p.write_text("step,reward\n0,0.1\n40,0.2\n80,0.3\n100,0.4\n", encoding="utf-8")
+    rs2._truncate_metrics_csv(str(tmp_path), 80)
+    bak = tmp_path / "metrics_pre_resume_step80.csv"
+    assert bak.is_file()
+    rows = list(__import__("csv").DictReader(open(bak, encoding="utf-8")))
+    assert [r["step"] for r in rows] == ["0", "40", "80", "100"]   # 备份=截断前完整
+    # 主文件仍被截断
+    rows = list(__import__("csv").DictReader(open(p, encoding="utf-8")))
+    assert [r["step"] for r in rows] == ["0", "40"]
+
+
+def test_truncate_metrics_backup_no_overwrite(rs2, tmp_path):
+    """同 step 重复截断不覆盖已有备份（重复 resume 也不丢历史）。"""
+    p = tmp_path / "metrics.csv"
+    p.write_text("step,reward\n0,0.1\n100,0.5\n", encoding="utf-8")
+    rs2._truncate_metrics_csv(str(tmp_path), 50)
+    bak = tmp_path / "metrics_pre_resume_step50.csv"
+    first = bak.read_text(encoding="utf-8")
+    # 主文件变化后再次截断：备份仍保留第一次的完整内容
+    p.write_text("step,reward\n0,0.1\n", encoding="utf-8")
+    rs2._truncate_metrics_csv(str(tmp_path), 50)
+    assert bak.read_text(encoding="utf-8") == first
+    assert "100" in first
+
+
+def test_truncate_metrics_backup_disabled(rs2, tmp_path):
+    """backup=False 时只截断不备份（显式关闭兜底）。"""
+    p = tmp_path / "metrics.csv"
+    p.write_text("step,reward\n0,0.1\n80,0.3\n", encoding="utf-8")
+    rs2._truncate_metrics_csv(str(tmp_path), 80, backup=False)
+    assert not (tmp_path / "metrics_pre_resume_step80.csv").exists()

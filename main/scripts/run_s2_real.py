@@ -145,15 +145,24 @@ def _build_overrides(args, name, load_cache):
     return overrides
 
 
-def _truncate_metrics_csv(run_dir: str, resume_step: int) -> None:
+def _truncate_metrics_csv(run_dir: str, resume_step: int, backup: bool = True) -> None:
     """resume 续跑前，把旧 metrics.csv 截断到断点 step 之前（避免续跑 step 编号重复）。
 
     只保留 step < resume_step 的行（空 step 行也保留）；无 metrics 文件时静默跳过。
+    backup=True（默认）：截断前先把完整 metrics.csv 备份为
+    `metrics_pre_resume_step<N>.csv`（已存在则不覆盖）——训练产物不可再生约束
+    （AGENTS.md）：metrics 一旦丢失无法重建，resume 重复截断 + 清理失误曾让 E1
+    丢失 120 步 eval_reward（2026-08-26 教训），备份保证历史曲线始终可恢复。
     """
     import csv as _csv
+    import shutil
     p = os.path.join(run_dir, "metrics.csv")
     if not os.path.isfile(p):
         return
+    if backup:
+        bak = os.path.join(run_dir, f"metrics_pre_resume_step{resume_step}.csv")
+        if not os.path.isfile(bak):
+            shutil.copyfile(p, bak)
     with open(p, encoding="utf-8", newline="") as f:
         reader = list(_csv.DictReader(f))
     if not reader:
@@ -192,9 +201,11 @@ def _run_experiment(args, name, load_cache, prefix=None):
                 _rs = int(resume.get("step", resume.get("version", 0)))
                 _res_v = resume.get("version", 0)
                 log(f"  [resume] 从断点 step={_rs} 续跑（version={_res_v}）", flush=True)
+                # 训练产物不可再生约束（AGENTS.md）：续跑前截断旧 metrics 到断点前
+                # （避免重复 step 行）；截断前自动备份 metrics_pre_resume_step<N>.csv。
+                _truncate_metrics_csv(d, _rs)
             else:
                 log("  [resume][警告] run-dir 无断点，从 0 开始", flush=True)
-        out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d, resume=resume)
         out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d, resume=resume)
         # M3：均值只统计【含该键】的训练步 metric——rollout 相位 metric 缺键时
         # 旧实现 m.get(k, 0.0) 会往 reward/pg/kl 均值里混入大量 0，污染口径。
