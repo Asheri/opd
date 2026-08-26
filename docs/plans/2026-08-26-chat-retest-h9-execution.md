@@ -32,12 +32,7 @@ scp -P 35318 main/tests/test_vllm_budget_eval.py \
   root@connect.westd.seetacloud.com:/root/opd/main/tests/
 ```
 
-> 注：`main/scripts/run_s2_real.py` 有一处**未提交的一行修复**（会话开始前已存在的改动）：把 `return p.parse_args()` 移到 `--resume` 的 `add_argument` 之后——否则 `--resume` 根本没注册、续跑命令会报未知参数。文档二 Step 4 若需续跑训练，请一并同步该文件：
-> ```bash
-> scp -P 35318 main/scripts/run_s2_real.py \
->   root@connect.westd.seetacloud.com:/root/opd/main/scripts/
-> ```
-> （若以上文件已 commit，也可改为 `git push` + 服务器 `git pull`，二选一即可。）
+> 注：`main/scripts/run_s2_real.py` 的 `--resume` 注册修复（把 `return p.parse_args()` 移到 `add_argument` 之后，否则续跑报未知参数）**已随 053ec56 提交**——同步走 `git push` + 服务器 `git pull` 即可，无需单独 scp。
 
 ### 0.2 服务器全量回归
 
