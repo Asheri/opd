@@ -215,7 +215,11 @@ commit `6ae3628` 的论证错误（"from_pretrained 无 device 默认落 cuda:0"
 
 ## 任务 D（可选、独立提交、时间盒）：E-1b 判别实验脚本
 
-> 这是新增工具而非 bug 修复；时间紧可整体跳过，不影响 A-C 验收。
+> **2026-08-26 更新：本任务已由原始会话 commit 81b227e 实现**--
+> （三阶段 sample/logp/correlate +
+> Spearman/AUC + 23 单测）+ （E-0b）+ 
+> （E-0d）均已入库。**执行本提示词时跳过任务 D**，仅当核对上述脚本与下述规格
+> 有实质缺口时才补差。
 
 **目的**：量化「序列级 Δ_T 与答案正确性的相关性」--OPD 失败归因的决定性实验
 （`docs/reports/2026-08-26-opd-failure-analysis.md` §5 E-1b）。
