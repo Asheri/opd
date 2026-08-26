@@ -104,9 +104,11 @@ cd /root/opd/main
 
 > 背景：eval-aime 默认 `chat_template=False`（裸 prompt），Base 循环退化、旧 AIME24 结果作废；MATH500 B512 的 vllm_budget_eval 此前也是裸 prompt（现补 `--chat-template` 重测）。训练事实：`apply_chat_template=true`、`eos=151645`、chat 校准 0/100 loop、`repetition_penalty=1.0`。
 
-**模型路径约定**：
-- Base = `/root/autodl-tmp/models/Qwen__Qwen3-1.7B`
-- E1/E2 = `export_student_ckpt.py` 导出的 HF 目录（见 Step 3），如 `/root/autodl-tmp/models/student_e1_step311`、`student_e2_step311`
+**模型路径约定（2026-08-26 服务器实测修正）**：
+- Base = `/root/autodl-tmp/models/Qwen__Qwen3-1.7B`（存在 ✅）
+- E1 = `/root/autodl-tmp/exported/e1_s300`（存在 ✅，即 E1 最终导出，对应清单旧写 `student_e1_step311`）
+- E2 = `/root/autodl-tmp/exported/e2_s311`（存在 ✅，E2 最终导出，对应清单旧写 `student_e2_step311`）
+- ⚠️ **E2 中间 checkpoint step_120/200 已确认在服务器丢失**（`models/student_17b_ms_step120` 为空壳、`runs_s2_fix/S2_E2_opd1024` 无文件、全盘无 `step_*.pt`）——拐点扫描降级为：只跑 `e2_s311` 档 + Base 对比，**120/200 标 N/A 不伪造**；若需拐点需重新训练（另行决策）
 - 骨架：`--model /root/autodl-tmp/models/Qwen__Qwen3-1.7B`（服务器 HF 缓存已有该 id，给全路径最稳）
 
 ## 文档一 Step 1：MATH500 脚本 chat 支持确认（5 分钟）
