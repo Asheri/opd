@@ -108,7 +108,7 @@ cd /root/opd/main
 - Base = `/root/autodl-tmp/models/Qwen__Qwen3-1.7B`（存在 ✅）
 - E1 = `/root/autodl-tmp/exported/e1_s300`（存在 ✅，即 E1 最终导出，对应清单旧写 `student_e1_step311`）
 - E2 = `/root/autodl-tmp/exported/e2_s311`（存在 ✅，E2 最终导出，对应清单旧写 `student_e2_step311`）
-- ⚠️ **E2 中间 checkpoint step_120/200 已确认在服务器丢失**（`models/student_17b_ms_step120` 为空壳、`runs_s2_fix/S2_E2_opd1024` 无文件、全盘无 `step_*.pt`）——拐点扫描降级为：只跑 `e2_s311` 档 + Base 对比，**120/200 标 N/A 不伪造**；若需拐点需重新训练（另行决策）
+- ⏳ **E2 中间 checkpoint step_120/200 拷贝进行中**（2026-08-26 用户确认：数据正从旧实例拷贝；当前 `models/student_17b_ms_step120` 为空壳、全盘无 `step_*.pt` 是拷贝未完成所致，**非丢失**）——拐点扫描排到数据同步完成后确认；在 checkpoint 到位前先跑不依赖它的评估（B2048/AIME24/B512），拐点表 120/200 待数据到位后补
 - 骨架：`--model /root/autodl-tmp/models/Qwen__Qwen3-1.7B`（服务器 HF 缓存已有该 id，给全路径最稳）
 
 ## 文档一 Step 1：MATH500 脚本 chat 支持确认（5 分钟）
