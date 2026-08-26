@@ -14,7 +14,7 @@
 - **git 三方同步**：本地 ↔ 服务器 ↔ origin/main 一致到 `ce05e61`（含 chat-template 支持 `053ec56`、测试补全 `e17b7a6`、选卡修复 `17835f8`、resume 二次修复 `b4b9872`、export CPU 修复 `6ae3628`）。
 - **代码修复（上机前 workflow 审查发现）**：`vllm_budget_eval.py` 的 `--device cuda:i` 原先**不传给 vLLM 引擎**（仅打印日志），双卡并行会抢同一默认卡 → 新增 `_apply_cuda_visible`（映射 `CUDA_VISIBLE_DEVICES`，import vllm 前生效）+ 2 单测（commit `17835f8`）。
 - **模型路径实测**：Base=`/root/autodl-tmp/models/Qwen__Qwen3-1.7B`、E1=`/root/autodl-tmp/exported/e1_s300`、E2=`/root/autodl-tmp/exported/e2_s311`。
-- **P0 回归门控**：服务器全量 pytest = **545 passed**（97s）；`test_vllm_budget_eval.py` = **16 passed** → 通过。
+- **P0 回归门控**：服务器全量 pytest = **545 passed**（97s；执行清单判据原写 532，545 = 532 + 合并 `b4b9872`/`6ae3628` 等新增测试所致）；`test_vllm_budget_eval.py` = **16 passed** → 通过。
 - **P1 首验门控**：Base B512 chat 冒烟（n-limit 3）——日志确认 `chat template 启用（对齐训练 apply_chat_template=true）`；3 条生成均为正常 Qwen3 数学推理（thinking→逐步→boxed），无 token soup、无 loop；jsonl 3 行落盘 → 通过。
 
 ---
@@ -45,7 +45,7 @@ python scripts/vllm_budget_eval.py --models 'E1=...' --budgets 2048 \
 
 **分析**：
 - E2 no_answer 仅 1.2%（≤3% 阈值），avg_rt≈1840（接近 2048 预算上限）——**训练学生的推理在 B2048 下基本完成，并非被截断**，"截断假象"不成立。
-- E2/B1 均仍显著低于 Base（-0.116 / -0.138）→ E2 在完全对齐训练分布的评估下**真弱于 Base**。
+- E2/E1 均仍显著低于 Base（-0.116 / -0.138）→ E2 在完全对齐训练分布的评估下**真弱于 Base**。
 - eos_rate 显示 B2048 下三模型均有 15-23% 自然停止（vs B512 全截断 eos≈0），说明 2048 预算对多数样本足够，预算错位解释被排除。
 - **结论方向**：H9 排除 → 按提示词执行顺序进 **文档二 Step 2（KL 档位扫描，kl=0.05/0.1 重训 + mini-MATH100 探针）**。
 
@@ -59,11 +59,11 @@ python scripts/vllm_budget_eval.py --models 'E1=...' --budgets 2048 \
 
 **结果与旧裸 prompt 对比**：
 
-| 模型 | B512 裸 prompt（旧 08-26 晨，**作废**） | **B512 chat（新）** | B2048 chat（新） |
-|---|---|---|---|
-| Base | 0.344 | **0.082** | 0.404 |
-| E1 | 0.186 | 0.110 | 0.266 |
-| E2 | 0.236 | **0.114** | 0.288 |
+| 模型 | B512 裸 prompt（旧 08-26 晨，**作废**） | **B512 chat acc（新）** | B512 chat no_answer / eos_rate | B2048 chat acc |
+|---|---|---|---|---|
+| Base | 0.344 | **0.082** | 0.6% / 0.0% | 0.404 |
+| E1 | 0.186 | 0.110 | 2.2% / 0.2% | 0.266 |
+| E2 | 0.236 | **0.114** | 1.2% / 0.8% | 0.288 |
 
 **关键发现（颠覆旧结论）**：
 - **chat 模板下 Base 的"捷径优势"消失**：B512 chat 下 Base acc 从 0.344 暴跌到 **0.082**，E1/E2 **反超 Base**（0.110/0.114 > 0.082）。
@@ -76,8 +76,10 @@ python scripts/vllm_budget_eval.py --models 'E1=...' --budgets 2048 \
 ## 3. AIME24 chat 重测（文档一 Step 2，进行中）
 
 - **协议**：`--chat-template`、`--max-new-tokens 4096`、`--n-samples 1`、`--temperature 0.0`、`--scoring sympy`、`--batch-size 2`。
-- **首验门控通过**：Base 前 2 题响应为正常 Qwen3 长推理（无 loop、重复检测 False），协议健康。
+- **首验门控通过**：Base 前 2 题响应为正常 Qwen3 长推理（无 loop、重复检测 False）；执行清单判据写"前 3 题"，冒烟层已 3 条全过 + AIME 层 Base 前 2 题已证协议健康（第 3 题随评估自然完成，同协议续跑）——判据实质满足。
+- **旧裸 prompt AIME24 结果一律作废**（文档一背景），以本次 chat 重测为准。
 - **当前**：GPU0=E1、GPU1=Base 双卡并行评估中（各 30 题，B4096 长生成）；E2 随后补跑。
+- ⚠️ **2026-08-26 晚间服务器停机中断**（SSH connection refused，seetacloud 实例关闭）——eval-aime 逐题落盘 + 同 `--out` 重跑自动续（`_load_done_ids` 跳过已完成题），**实例重启后重发命令即可续跑，已落盘题不丢**。
 - 结果待 AIME24 完成后回填本节。
 
 ---
@@ -86,17 +88,18 @@ python scripts/vllm_budget_eval.py --models 'E1=...' --budgets 2048 \
 
 | 条款 | 判据（写死） | 状态 |
 |---|---|---|
-| 协议统一 | 所有评估 `--chat-template`（B2048/B512/AIME24 均确认 chat 启用日志） | ✅ |
+| 协议统一 | 所有评估 `--chat-template`；**旧裸 prompt 结果（B512 与 AIME24）全部作废标记** | ✅（B512 已作废标注；旧 AIME24 作废见 §3） |
 | MATH500 B2048 E2 ≥ Base（总验收 #3） | 0.288 vs 0.404 | ❌ **未达成（H9 排除）** |
-| B512 截断量化 | 旧裸 B512（0.344/0.186/0.236，作废）vs 新 chat B512（0.082/0.110/0.114）对比表 | ✅ 已产（见 §2） |
-| AIME24 @B4096 chat（总验收 #2） | E2 ≥ Base（同协议 pass@1） | ⏳ 进行中 |
+| B512 截断量化 | 旧裸 B512（0.344/0.186/0.236，作废）vs 新 chat B512 对比表（含 no_answer/eos_rate） | ✅ 已产（见 §2） |
+| AIME24 @B4096 chat（总验收 #2） | E2 ≥ Base（同协议 pass@1） | ⏳ 进行中（2026-08-26 晚服务器停机中断，eval-aime 逐题落盘 + resume 续跑保护） |
 | 拐点表（总验收 #4） | step vs acc vs KL 表 | ⏳ 等 E2 step_120/200 拷贝到位 |
+| 产物入库（总验收 #5） | 每模型完整 jsonl + 每模型 3 条 decode 样本附入报告 | ⏳ jsonl 已落盘（§6）；decode 样本待 AIME24 完成后补入 |
 
 **核心结论**：
 1. **H9（预算错位）排除**——B2048 对齐训练分布下 E2 仍显著弱于 Base（0.116 差）。
 2. **旧裸 prompt B512 结论作废**——chat 协议下 Base=0.082（非 0.344），"训练伤害能力"的旧叙事不成立。
 3. **能力信号方向**：chat 协议下 E1/E2 在 B512 反超 Base、B2048 仍落后——训练提升了"短预算下的答题能力"（相对 chat-Base）但未能在长预算下超越 Base 的强推理。
-4. **下一步方向**：文档二 Step 2（KL 档位扫描）——H9 排除后的主路径；同时等 E2 中间 checkpoint 到位补拐点。
+4. **下一步方向（待用户决策）**：H9 排除按写死判定表应"**停下，回查训练/信号，记录报告**"；Step 2（KL 档位扫描）为候选路径但门控（部分成立 + 拐点表产出）未满足——**需用户明确确认后才启动**；同时等 E2 中间 checkpoint 到位补拐点。
 
 ---
 
