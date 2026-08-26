@@ -3,7 +3,7 @@
 > **状态：服务器恢复后执行**（服务器已关闭、SSH 暂缓；本清单为恢复后唯一执行依据，零决策、按序门控）。
 >
 > 前置事实（本地已完成的实现与审计，勿在服务器重做）：
-> - vllm_budget_eval 已加 `--chat-template`/`--tokenizer` + `build_prompts` 纯函数（parse_args 支持 argv 注入）；budget_eval 已加 `wrap_chat`；单测 **14 例通过**（CLI 默认零回归 / tokenizer 覆盖 / chat 顺序 / eos·budget_stop 与 no_answer 解耦对照）。
+> - vllm_budget_eval 已加 `--chat-template`/`--tokenizer` + `build_prompts` 纯函数（parse_args 支持 argv 注入）+ **`--device`→`CUDA_VISIBLE_DEVICES` 选卡修复**（原缺陷：--device 仅打印不生效，双卡并行会抢卡）；budget_eval 已加 `wrap_chat`；单测 **16 例通过**（CLI 默认零回归 / tokenizer 覆盖 / chat 顺序 / eos·budget_stop 与 no_answer 解耦对照 / CUDA_VISIBLE_DEVICES 映射）。
 > - export_student_ckpt.py 支持任意中间 step 手动导出（纯路径驱动、服务器可直接用），批量导出为可选增强（本清单用三次单步导出即可，不做）。
 > - prepare_skywork_responses.py 500→2000 补生成无需任何代码改动（`--max-samples 1500 --seed S --apply-chat-template` 即可），重建 cache 自动按 jsonl 非空行数走。
 > - 全量回归 532 passed（本地）。
@@ -41,10 +41,62 @@ cd /root/opd/main
 /root/miniconda3/bin/python -m pytest tests/ -q | tail -1
 # 期望：532 passed（全量）；至少确认本清单相关文件：
 /root/miniconda3/bin/python -m pytest tests/test_vllm_budget_eval.py -q | tail -1
-# 期望：14 passed（test_wrap_chat_format / test_build_prompts_bare / test_build_prompts_chat / test_aggregate_*）
+# 期望：16 passed（test_wrap_chat_format / test_build_prompts_bare / test_build_prompts_chat / test_aggregate_* / test_apply_cuda_visible_*）
 ```
 
-- **判据（写死）**：全量 `532 passed, 0 failed` 且 `test_vllm_budget_eval.py` 14 例全过 → 才允许进入 Step 1；任一失败先修后进，失败记录追加 training-errors.md。
+- **判据（写死）**：全量 `532 passed, 0 failed` 且 `test_vllm_budget_eval.py` 16 例全过 → 才允许进入 Step 1；任一失败先修后进，失败记录追加 training-errors.md。
+
+---
+
+---
+
+# 0.5 优化调度 v2（2026-08-26 workflow 审查结论，替代上文 0-3 的串行编排）
+
+> 7-agent workflow 审查（扫描 vllm_budget_eval/eval-aime/导出补生成 + 设计 + 对抗验证）。判据与协议不变，只优化"怎么跑"。服务器硬件：2×RTX PRO 6000 96GB×2（本地文档，恢复后 nvidia-smi 核验）。
+
+## 0.5.1 前置修复（已 commit，本地完成）
+
+- **致命 FAIL 已修**：`vllm_budget_eval.py` 原 `--device` 不传给 vLLM 引擎（仅打印），双卡并行会抢同一默认卡。已加 `_apply_cuda_visible`（`--device cuda:i` → `CUDA_VISIBLE_DEVICES=i`，import vllm 前生效）+ 2 单测（共 16 例）。**服务器同步走 git pull 即可。**
+
+## 0.5.2 实验设计补充（判据外，建议必做）
+
+- **D1（必改）**：补跑 Base/E1/E2 的 **B512 chat** 重测（原 3b 只跑 E2 三 step）——H9"截断假象"叙事不能混入裸→chat 模板变化，需"三模型×{B512,B2048} 全 chat"网格才可辩护。M1 一次调用顺手完成（+0.75h）。
+- **D2（强烈建议）**：Base 的 **B1024** 对照——验证"Base 也随预算升"（截断曲线 vs 两档跳跃），合并进 M3（+0.5h）。
+
+## 0.5.3 Phase 编排（双卡满载）
+
+| Phase | GPU0（vLLM 轨道） | GPU1（eval-aime 轨道） | CPU/其他 | 墙钟 | 门控 |
+|---|---|---|---|---|---|
+| P0 同步回归 | — | — | git pull + pytest 全量 532 + chat 16 例 | ~10 min | 通过才进 P1 |
+| P1 首验+导出 | 冒烟：Base B512 n=3 chat（~3min） | 空闲（首验安全闸保留） | 并行 CPU 导出 E2 step120/200/311 + 确认 E1 step311/Base 目录存在 | ~15 min | 冒烟无 loop + 导出完整 |
+| P2 主战役 | ① B2048 `Base+E2`（2h）→② **B512 六模型一次调用**（1.5h）→③ B1024 扫描（判定后，1.5-2h） | ① E1 B2048（1h）→② AIME24 队列：Base→S120→S200→S311→E1→E2（3-6h） | 拐点表 CPU 聚合 | 5.5-7h | **判定点 @2h**；B1024 门控于判定∈{确诊,部分成立} |
+| P3 分流 | 确诊→进 Step 1 + 提前 Step 2 KL 训练；排除→停下游回查训练 | KL 训练 / 数据扩展补生成双卡 shard | cache 重建独占一卡（或 CPU 随时） | 小时级 | Step 0 判定 + 拐点表 |
+
+## 0.5.4 命令级合并（M1-M6）
+
+| # | 合并 | 命令要点 |
+|---|---|---|
+| M1 | B512 六模型一次调用（含 D1 补测） | `vllm_budget_eval.py --models "Base=...,E1=...,E2=...,S120=...,S200=...,S311=..." --budgets 512 --dataset MATH500 --chat-template --device cuda:0 --out-dir <dir>/B512` |
+| M2 | B2048 拆 2+1 | GPU0 `--models "Base=...,E2=..." --budgets 2048 --device cuda:0`；GPU1 `--models "E1=..." --budgets 2048 --device cuda:1` |
+| M3 | B1024 判定后一次跑（含 D2 Base） | `--models "S120=...,S200=...,S311=...,Base=..." --budgets 1024 --device cuda:0` |
+| M4 | AIME24 队列入 GPU1 | 6 次 `eval-aime --model <p> --datasets AIME24 --max-new-tokens 4096 --n-samples 1 --temperature 0.0 --scoring sympy --chat-template --device cuda:1 --batch-size 2 --out <dir>/aime_eval_chat/<label>`（顺序排队，同 --out 自动续跑） |
+| M5 | 导出提前 P1 与冒烟并行 | `export_student_ckpt.py --ckpt <run>/checkpoints/step_<N>.pt --model Qwen__Qwen3-1.7B --out <dir>/models/student_e2_step<N>` ×3（纯 CPU） |
+| M6 | vLLM 断点续跑薄包装 | `nohup ... > log 2>&1 &`；完成判据=对应 jsonl 存在且 500 行；崩了只补缺失 (label,budget)（缩小 --models/--budgets 重跑） |
+
+> GPU1 AIME24 顺序取 Base→S120→S200→S311→E1→E2：满足 Step 2 首验门控 + 让拐点表/KL 门控尽早（~4h）；E2 的 AIME24 验收（总验收 #2）延后到 ~6-7h。
+
+## 0.5.5 风险与降级
+
+1. **显存**：vLLM `--gpu-mem 0.9` 预占 86GB，**绝不与任何 GPU 任务共卡**（eval-aime 走 GPU1 异卡已规避）；OOM 降 `--gpu-mem 0.8` 或 `--max-model-len 6144`。
+2. **失败续跑**：eval-aime 同 --out 自动续；vLLM 按 M6 补缺口（all_results.json 缺失用各 jsonl 现场聚合）；prepare 有 --resume+同 seed；export/cache 幂等。
+3. **双卡不均衡**：任卡空闲取"最长未启动任务"；优先级 = B2048 未完成 → AIME24 未跑 → B512 → B1024(判定后)；vLLM 调用可按模型粒度拆分迁移。
+4. **B4096 应急**（任一模型 no_answer>3%）：抢占 vLLM 队列，GPU0=Base+E2、GPU1=E1（复用 M2 分法），判定重走表。
+5. **硬件核验**：恢复后先 `nvidia-smi`；若 <96GB 或单卡，P2 退化为 GPU0 串行 + GPU1 轻载（AIME24），B1024/Base-B1024 降级为可选。
+
+## 0.5.6 墙钟对比（依据：~280 tok/s、AIME24 20-60min/模型）
+
+- 直接压缩：慢锚点同证据集 10.2h → **7.0h（-31%）**；快锚点 6.6h → **5.5h（-16%）**。
+- **决策延迟（真正杠杆）**：H9 判定 ~7.4h → **~2h**（3.7×）；拐点表/KL 门控 ~8.9h → **~4-5h**（2×）——下游 KL 训练/补生成/cache 重建整条链级联提前。
 
 ---
 
@@ -52,9 +104,11 @@ cd /root/opd/main
 
 > 背景：eval-aime 默认 `chat_template=False`（裸 prompt），Base 循环退化、旧 AIME24 结果作废；MATH500 B512 的 vllm_budget_eval 此前也是裸 prompt（现补 `--chat-template` 重测）。训练事实：`apply_chat_template=true`、`eos=151645`、chat 校准 0/100 loop、`repetition_penalty=1.0`。
 
-**模型路径约定**：
-- Base = `/root/autodl-tmp/models/Qwen__Qwen3-1.7B`
-- E1/E2 = `export_student_ckpt.py` 导出的 HF 目录（见 Step 3），如 `/root/autodl-tmp/models/student_e1_step311`、`student_e2_step311`
+**模型路径约定（2026-08-26 服务器实测修正）**：
+- Base = `/root/autodl-tmp/models/Qwen__Qwen3-1.7B`（存在 ✅）
+- E1 = `/root/autodl-tmp/exported/e1_s300`（存在 ✅，即 E1 最终导出，对应清单旧写 `student_e1_step311`）
+- E2 = `/root/autodl-tmp/exported/e2_s311`（存在 ✅，E2 最终导出，对应清单旧写 `student_e2_step311`）
+- ⚠️ **E2 中间 checkpoint step_120/200 已确认在服务器丢失**（`models/student_17b_ms_step120` 为空壳、`runs_s2_fix/S2_E2_opd1024` 无文件、全盘无 `step_*.pt`）——拐点扫描降级为：只跑 `e2_s311` 档 + Base 对比，**120/200 标 N/A 不伪造**；若需拐点需重新训练（另行决策）
 - 骨架：`--model /root/autodl-tmp/models/Qwen__Qwen3-1.7B`（服务器 HF 缓存已有该 id，给全路径最稳）
 
 ## 文档一 Step 1：MATH500 脚本 chat 支持确认（5 分钟）

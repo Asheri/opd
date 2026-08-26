@@ -49,6 +49,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _apply_cuda_visible(device: str | None) -> str | None:
+    """把 --device cuda:i 映射为 CUDA_VISIBLE_DEVICES=i（vLLM 通过环境变量选卡）。
+
+    vLLM 的 LLM() 不接受 device 参数，GPU 选择只走 CUDA_VISIBLE_DEVICES；不设置时
+    多进程（双卡并行）会全部抢同一默认卡。非 cuda:N 格式（如 "cpu"/None）返回 None、
+    不改环境。必须在 import vllm / 创建引擎之前调用。
+    """
+    if device and device.startswith("cuda:"):
+        idx = device.split(":", 1)[1]
+        if idx.isdigit():
+            os.environ["CUDA_VISIBLE_DEVICES"] = idx
+            return idx
+    return None
+
+
 def _load_problems(dataset_ref: str, n_limit: int | None):
     """复用 BudgetEvaluator 的 load_problems（仅取题集，不实例化 HF 模型）。"""
     ev = object.__new__(BudgetEvaluator)
@@ -110,6 +125,7 @@ def _aggregate_budget(problems, outs, budget: int, label: str) -> dict:
 
 def main() -> None:
     args = parse_args()
+    _apply_cuda_visible(args.device)   # 选卡必须在 import vllm / LLM() 之前生效
     from vllm import LLM, SamplingParams
     models = [(lab, path) for lab, path in
               (kv.split("=", 1) for kv in args.models.split(",") if "=" in kv)]

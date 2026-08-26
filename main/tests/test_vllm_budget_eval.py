@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from vllm_budget_eval import _aggregate_budget, build_prompts, parse_args
+from vllm_budget_eval import _aggregate_budget, _apply_cuda_visible, build_prompts, parse_args
 from fullstack_opd_v2.budget_eval import wrap_chat, format_prompt
 
 
@@ -86,6 +86,25 @@ def test_parse_args_tokenizer_explicit():
     a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x",
                     "--tokenizer", "/tok/here"])
     assert a.tokenizer == "/tok/here"
+
+
+def test_apply_cuda_visible_cuda(monkeypatch):
+    """--device cuda:i → CUDA_VISIBLE_DEVICES=i（vLLM 选卡唯一途径，双卡并行前提）。"""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert _apply_cuda_visible("cuda:1") == "1"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "1"
+    assert _apply_cuda_visible("cuda:0") == "0"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_apply_cuda_visible_non_cuda(monkeypatch):
+    """非 cuda:N（"cpu"/None）不改环境，避免误伤。"""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert _apply_cuda_visible("cpu") is None
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    assert _apply_cuda_visible(None) is None
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    assert _apply_cuda_visible("cuda:") is None
 
 
 class _Out:
