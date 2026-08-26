@@ -184,3 +184,12 @@ E1 正式训练（kl=0.02，batch4，串行续跑）eval_reward 全轨迹（15 �
   正方向但未带来 MATH500 提升，可能原因：500 条 materialized 数据规模小、教师对 Δ_T 非
   答案导向、kl=0.02 策略偏移削弱基座能力。**这是重要警示，需在结论中说明。**
 - 产物：`budget_eval/s2_formal/all_results.json`（Base/E1/E2 @B512）
+
+### ⚠️ 2026-08-26 作废标注：上述 MATH500 B512 为裸 prompt 协议，结果作废
+
+- 2026-08-26 chat 模板重测（完整报告 `docs/reports/2026-08-26-chat-retest-h9-results.md`）证实：
+  裸 prompt 下 Base 走捷径、B512 截断伤不到它 → Base=0.344 是**协议假象**；
+  **chat 协议下 Base B512 acc=0.082**（E1=0.110 / E2=0.114，学生反超 Base）。
+- "训练伤害能力"的旧叙事（E1/E2 < Base，-0.16/-0.11）在 chat 协议下**不成立**。
+- B2048 chat 决定性实验：**H9 排除**（Base=0.404 > E2=0.288，差 0.116 ≥ 0.05）——E2 在
+  对齐训练分布的评估下仍真弱于 Base（非截断假象），下一步进文档二 Step 2（KL 档位扫描）。
