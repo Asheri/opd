@@ -108,7 +108,7 @@ cd /root/opd/main
 - Base = `/root/autodl-tmp/models/Qwen__Qwen3-1.7B`（存在 ✅）
 - E1 = `/root/autodl-tmp/exported/e1_s300`（存在 ✅，即 E1 最终导出，对应清单旧写 `student_e1_step311`）
 - E2 = `/root/autodl-tmp/exported/e2_s311`（存在 ✅，E2 最终导出，对应清单旧写 `student_e2_step311`）
-- ⚠️ **E2 中间 checkpoint step_120/200 已确认在服务器丢失**（`models/student_17b_ms_step120` 为空壳、`runs_s2_fix/S2_E2_opd1024` 无文件、全盘无 `step_*.pt`）——拐点扫描降级为：只跑 `e2_s311` 档 + Base 对比，**120/200 标 N/A 不伪造**；若需拐点需重新训练（另行决策）
+- ⏳ **E2 中间 checkpoint step_120/200 拷贝进行中**（2026-08-26 用户确认：数据正从旧实例拷贝；当前 `models/student_17b_ms_step120` 为空壳、全盘无 `step_*.pt` 是拷贝未完成所致，**非丢失**）——拐点扫描排到数据同步完成后确认；在 checkpoint 到位前先跑不依赖它的评估（B2048/AIME24/B512），拐点表 120/200 待数据到位后补
 - 骨架：`--model /root/autodl-tmp/models/Qwen__Qwen3-1.7B`（服务器 HF 缓存已有该 id，给全路径最稳）
 
 ## 文档一 Step 1：MATH500 脚本 chat 支持确认（5 分钟）
@@ -342,3 +342,30 @@ cd /root/opd/main
 3. **不伪造结果**：所有数字来自真实运行输出（jsonl / 日志 / metrics csv）；缺数据标注 N/A。
 4. **报错档案**：服务器端任何训练/评估报错（含堆栈片段、根因、修复、验证）追加到本地 `C:\Users\12062\OneDrive\Desktop\items\training-errors.md`，完成后回复用户"已追加到 training-errors.md"。
 5. **报告更新**：每步完成后把实跑数字回填到对应报告（文档一/文档二结论、与旧 Base=0.344 / E1=0.186 / E2=0.236 B512 数字对比），不改结论只填证据。
+
+---
+
+# E 系列判别实验（归因分析 §5，2026-08-26 新增）
+
+> 依据：`docs/reports/2026-08-26-opd-failure-analysis.md`。B2048 后 H9 排除 → 按判定表"停下回查训练/信号" = 本系列。
+> 已本地实现的脚本（commit `81b227e`，23 单测全过，服务器 git pull 即得）：
+> - `scripts/delta_correctness_corr.py`（E-1b 决定性，三阶段 sample/logp/correlate 双卡流水）
+> - `scripts/export_sanity_check.py`（E-0b config diff + HF 冒烟）
+> - `scripts/onpolicy_share.py`（E-0d metrics pool 占比）
+
+## GPU 优化编排（双卡满载，替代顺序执行）
+
+| 步骤 | GPU0 | GPU1 | 命令要点 |
+|---|---|---|---|
+| E-0b 导出健全性 | —（CPU） | — | `export_sanity_check.py --exported <dir> --reference /root/autodl-tmp/models/Qwen__Qwen3-1.7B`（可随时穿插） |
+| E-0c 拐点扫描 | vLLM：S120/S200/S311（+E1 序列若有）一次调用 | 空闲→接 E-1a | `vllm_budget_eval.py --models "S120=...,S200=...,S311=..." --budgets 2048 --chat-template --device cuda:0`（等 step_120/200 拷贝到位） |
+| E-1a 教师对体检 | — | vLLM：JustRL+R1Distill 一次调用 | `vllm_budget_eval.py --models "JustRL=...,R1Distill=..." --budgets 2048 --n-limit 500 --chat-template --device cuda:1`（与 E-0c 同窗并行） |
+| E-0d on-policy 占比 | —（CPU） | — | `onpolicy_share.py --run-dir <E2 run 目录>` |
+| E-1b 采样 | vLLM sample（200×4=800 条） | — | `delta_correctness_corr.py --stage sample --dataset MATH500 --n-problems 200 --n-samples 4 --budget 2048 --temperature 1.0 --chat-template --device cuda:0 --out <dir>` |
+| E-1b logp | 教师 rl forward | 教师 ref forward | `--stage logp --teacher rl --device cuda:0` / `--teacher ref --device cuda:1`（双卡并行） |
+| E-1b correlate | —（CPU） | — | `--stage correlate --out <dir>` → report.json |
+
+**判据（写死，归因分析 §5）**：
+- E-0c：step_20/60 已 ≤ Base−0.05 → RC1/RC4 主导；≈Base 且随 step 单调劣化 → RC3；中途峰值 → 混合
+- E-1a：`teacher_rl < teacher_ref` → Δ_T 方向存疑 → RC4 加权 + 查 JustRL 论文 RL 目标
+- E-1b：Spearman ρ ≥ 0.2 → **分支 A**（on-policy 化）；0.05 ≤ ρ < 0.2 → **分支 B2**（信号改造）；ρ < 0.05 → **分支 B1**（换教师对 Qwen3 同族）
