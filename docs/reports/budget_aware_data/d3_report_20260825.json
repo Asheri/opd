@@ -1,0 +1,60 @@
+{
+  "cache_prefix": "/root/autodl-tmp/cache_skywork_chat.pt",
+  "meta": {
+    "num_samples": 500,
+    "T": 2048,
+    "top_k": 256,
+    "prompt_format": "chat",
+    "dataset_size": 500,
+    "max_response_len": 2048,
+    "dtype": "bf16"
+  },
+  "full_distribution": {
+    "n": 262066688,
+    "pos_ratio": 0.2511957757866578,
+    "pos_ratio_gt05": 0.1612612053921176,
+    "pos_ratio_gt1": 0.09933617736261084,
+    "clip_ratio": 0.3210634996844773,
+    "dist": {
+      "n": 262066688,
+      "mean": -1.1589884757995605,
+      "median": -1.0,
+      "std": 1.9154595136642456,
+      "p10": -3.625,
+      "p25": -2.25,
+      "p50": -1.0,
+      "p75": 0.01611328125,
+      "p90": 1.0
+    }
+  },
+  "position_breakdown": {
+    "early_0_25": {
+      "n": 65520896,
+      "pos_ratio": 0.22870903657971955,
+      "mean": -1.1442039012908936
+    },
+    "mid_25_75": {
+      "n": 131023616,
+      "pos_ratio": 0.2580166845647124,
+      "mean": -1.1687102317810059
+    },
+    "late_75_1": {
+      "n": 65522176,
+      "pos_ratio": 0.2600424167842045,
+      "mean": -1.1543247699737549
+    }
+  },
+  "clip_interaction": {
+    "clip": 2.0,
+    "clip_ratio_full": 0.3210634996844773,
+    "clip_ratio_pos": 0.3210634996844773
+  },
+  "student_topk_overlap": {
+    "status": "not-provided"
+  },
+  "verdict": {
+    "passed": false,
+    "verdict": "FAIL",
+    "reason": "正Δ占比 0.251<0.05 或 均值 -1.159<-1.0（信号弱/方向可疑）"
+  }
+}

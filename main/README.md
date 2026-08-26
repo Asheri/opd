@@ -101,6 +101,8 @@ student = AsyncOPDScheduler(student_init, cache, prompts, responses).run(n_steps
 
 ## 5. v2：批量化重构版（fullstack_opd_v2/）
 
+> 📌 `fullstack_opd/`（v1）仅作**算法正确性基线**保留，不用于新工作；所有新开发一律走 v2。
+
 v1 验证算法正确性后，v2 **从底层重写执行底座**（算法内核不变：因果 LM、π_old 加权 PG、
 k3 KL、staleness 双截断）：
 

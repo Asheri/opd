@@ -1,6 +1,6 @@
 # Rollout Loop Detector 校准报告（IMP-1）
 
-> 日期：2026-08-18 ｜ 状态：已填充 ｜ 模型：/root/autodl-tmp/models/Qwen__Qwen3-1.7B ｜ N=100 ｜ max_new=512 ｜ eos_token_id=151645 ｜ 人工标注：无
+> 日期：2026-08-18 ｜ 状态：已填充 ｜ 模型：/root/autodl-tmp/models/Qwen__Qwen3-1.7B ｜ N=48 ｜ max_new=1024 ｜ eos_token_id=151645 ｜ 人工标注：无
 
 ## 背景与目标
 
@@ -40,12 +40,12 @@
 | `periods=(2, 3, 4),min_len=8` | 0 | 0.000 | - | - | - |
 | `periods=(2, 3, 4),min_len=16` | 0 | 0.000 | - | - | - |
 | `periods=(2, 3, 4),min_len=24` | 0 | 0.000 | - | - | - |
-| `periods=(4, 6, 8),min_len=8` | 1 | 0.010 | - | - | 81 |
-| `periods=(4, 6, 8),min_len=16` | 1 | 0.010 | - | - | 81 |
-| `periods=(4, 6, 8),min_len=24` | 1 | 0.010 | - | - | 81 |
-| `periods=(6, 8, 12),min_len=8` | 1 | 0.010 | - | - | 81 |
-| `periods=(6, 8, 12),min_len=16` | 1 | 0.010 | - | - | 81 |
-| `periods=(6, 8, 12),min_len=24` | 1 | 0.010 | - | - | 81 |
+| `periods=(4, 6, 8),min_len=8` | 0 | 0.000 | - | - | - |
+| `periods=(4, 6, 8),min_len=16` | 0 | 0.000 | - | - | - |
+| `periods=(4, 6, 8),min_len=24` | 0 | 0.000 | - | - | - |
+| `periods=(6, 8, 12),min_len=8` | 0 | 0.000 | - | - | - |
+| `periods=(6, 8, 12),min_len=16` | 0 | 0.000 | - | - | - |
+| `periods=(6, 8, 12),min_len=24` | 0 | 0.000 | - | - | - |
 
 ## 人工抽样检查清单（需 GPU + 人工）
 

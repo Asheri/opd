@@ -515,3 +515,146 @@ def test_l2_rollout_mem_enough_split_card():
     # 异卡 min_free=2.0：86.4+2=88.4 <= 94.4 → 通过
     assert _l2_rollout_mem_enough(94.4, 86.4, 2.0) is True
     assert _l2_rollout_mem_enough(85.0, 86.4, 2.0) is False
+
+
+# --------------------------- P3 teacher offload + max_model_len 守卫（2026-08-19） ---------------------------
+
+def _fake_teacher_model(device="cuda:0"):
+    """记录 .to() 调用序列的 fake 教师模型。"""
+    class _Fake:
+        def __init__(self, device):
+            self.device = device
+            self.calls = []
+        def to(self, d):
+            self.calls.append(str(d))
+            self.device = d
+            return self
+    return _Fake(device)
+
+
+class _SilentLogger:
+    def __init__(self):
+        self.msgs = []
+    def info(self, m):
+        self.msgs.append(m)
+
+
+def test_teacher_offload_default_false():
+    """默认 teacher_offload=False（零回归）。"""
+    from fullstack_opd_v2.config import load_config
+    cfg = load_config()
+    assert bool(cfg["stage2"].get("teacher_offload", False)) is False
+
+
+def test_teacher_offload_config_parsed():
+    """--set stage2.teacher_offload=true 能正确解析到 Stage2Cfg。"""
+    from fullstack_opd_v2.config import load_config
+    cfg = load_config(overrides=["stage2.teacher_offload=true"])
+    assert cfg["stage2"]["teacher_offload"] is True
+
+
+def test_refresh_chunk_default_and_config():
+    """refresh_chunk 默认 4，--set stage2.refresh_chunk=2 可覆盖。"""
+    from fullstack_opd_v2.config import load_config
+    assert load_config()["stage2"]["refresh_chunk"] == 4
+    assert load_config(overrides=["stage2.refresh_chunk=2"])["stage2"]["refresh_chunk"] == 2
+
+
+def test_p3_teacher_move_offloads_models():
+    """teacher_offload=true + cuda → teacher_rl/ref 搬 cpu；student_ref 不被触碰。"""
+    from fullstack_opd_v2.pipeline import _p3_teacher_move
+    rl = _fake_teacher_model("cuda:0")
+    ref = _fake_teacher_model("cuda:0")
+    student_ref = _fake_teacher_model("cuda:0")
+    _p3_teacher_move(rl, ref, "cpu", enabled=True, device="cuda:0",
+                     logger=_SilentLogger(), message="offload")
+    assert rl.device == "cpu" and ref.device == "cpu"
+    assert rl.calls == ["cpu"] and ref.calls == ["cpu"]
+    # student_ref 未被 helper 触碰（它只接收 teacher_rl/teacher_ref）
+    assert student_ref.calls == [] and student_ref.device == "cuda:0"
+
+
+def test_p3_teacher_move_reload_on_refresh(monkeypatch):
+    """refresh 相位：reload 搬回 GPU → 完成后 offload 回 CPU，empty_cache 被调用。"""
+    from fullstack_opd_v2.pipeline import _p3_teacher_move
+    import fullstack_opd_v2.pipeline as pl
+    rl = _fake_teacher_model("cpu")
+    ref = _fake_teacher_model("cpu")
+    lg = _SilentLogger()
+    ec = {"n": 0}
+    # empty_cache 仅在 torch.cuda.is_available() 时被调用（_p3_teacher_move 有守卫）。
+    # CPU-only 环境 is_available()=False → 不调用；CUDA 环境 reload+offload 各调一次。
+    expected_ec = 2 if pl.torch.cuda.is_available() else 0
+    if hasattr(pl.torch.cuda, "empty_cache"):
+        def _ec():
+            ec["n"] += 1
+        monkeypatch.setattr(pl.torch.cuda, "empty_cache", _ec)
+    _p3_teacher_move(rl, ref, "cuda:0", enabled=True, device="cuda:0", logger=lg, message="reload")
+    assert rl.device == "cuda:0" and ref.device == "cuda:0"
+    _p3_teacher_move(rl, ref, "cpu", enabled=True, device="cuda:0", logger=lg, message="offload")
+    assert rl.device == "cpu" and ref.device == "cpu"
+    assert lg.msgs == ["reload", "offload"]
+    if expected_ec is not None:
+        assert ec["n"] == expected_ec
+
+
+
+def test_p3_teacher_move_exception_still_offloads():
+    """refresh 相位抛异常时，finally 仍把教师 offload 回 CPU（try/finally 语义）。"""
+    from fullstack_opd_v2.pipeline import _p3_teacher_move
+    rl = _fake_teacher_model("cuda:0")
+    ref = _fake_teacher_model("cuda:0")
+    lg = _SilentLogger()
+    try:
+        # reload（模拟 refresh 相位入口）
+        _p3_teacher_move(rl, ref, "cuda:0", enabled=True, device="cuda:0", logger=lg, message="reload")
+        raise RuntimeError("fake rollout failure")   # 模拟 run_refresh_phase 抛异常
+    except RuntimeError:
+        pass
+    finally:
+        # pipeline 的 finally 必然执行 offload 回 CPU
+        _p3_teacher_move(rl, ref, "cpu", enabled=True, device="cuda:0", logger=lg, message="offload")
+    assert rl.device == "cpu" and ref.device == "cpu"
+    assert lg.msgs == ["reload", "offload"]
+
+
+def test_p3_teacher_move_noop_when_disabled():
+    """enabled=False → no-op（不搬、不日志）。"""
+    from fullstack_opd_v2.pipeline import _p3_teacher_move
+    rl = _fake_teacher_model()
+    ref = _fake_teacher_model()
+    class _Bad:
+        def info(self, *a):
+            raise AssertionError("disabled 时不应调用日志")
+    _p3_teacher_move(rl, ref, "cpu", enabled=False, device="cuda:0", logger=_Bad(), message="m")
+    assert rl.calls == [] and ref.calls == []
+
+
+def test_p3_teacher_move_noop_on_cpu_device():
+    """非 cuda 设备 → no-op（CPU demo 零回归）。"""
+    from fullstack_opd_v2.pipeline import _p3_teacher_move
+    rl = _fake_teacher_model()
+    class _Bad:
+        def info(self, *a):
+            raise AssertionError("cpu 设备不应调用日志")
+    _p3_teacher_move(rl, None, "cpu", enabled=True, device="cpu", logger=_Bad(), message="m")
+    assert rl.calls == []
+
+
+def test_max_model_len_guard_rejects_too_small():
+    """rollout_max_model_len=1024 < 1024+512=1536 → RuntimeError。"""
+    from fullstack_opd_v2.pipeline import _check_rollout_max_model_len
+    cfg = {"dataset": {"max_prompt_len": 1024}}
+    s2cfg = {"rollout_max_model_len": 1024}
+    l2cfg = {"rollout": {"max_new_tokens": 512}}
+    with pytest.raises(RuntimeError, match="rollout_max_model_len"):
+        _check_rollout_max_model_len(cfg, s2cfg, l2cfg)
+
+
+def test_max_model_len_guard_accepts_valid():
+    """rollout_max_model_len=2048 >= 1536 → 不抛，返回下限。"""
+    from fullstack_opd_v2.pipeline import _check_rollout_max_model_len
+    cfg = {"dataset": {"max_prompt_len": 1024}}
+    s2cfg = {"rollout_max_model_len": 2048}
+    l2cfg = {"rollout": {"max_new_tokens": 512}}
+    assert _check_rollout_max_model_len(cfg, s2cfg, l2cfg) == 1536

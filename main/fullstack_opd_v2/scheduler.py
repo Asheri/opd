@@ -104,7 +104,9 @@ class AsyncBatchedScheduler:
                  responses: torch.Tensor, ref_dists: torch.Tensor | None,
                  ref_ids: torch.Tensor | None, ref_logp: torch.Tensor | None,
                  cfg: dict, device, rollout_engine=None,
-                 initial_version: int = 0):
+                 initial_version: int = 0,
+                 eval_cache=None, eval_prompts: torch.Tensor | None = None,
+                 eval_responses: torch.Tensor | None = None):
         self.student = student
         self.cache = cache
         self.prompts = prompts          # (N, P) device
@@ -146,6 +148,9 @@ class AsyncBatchedScheduler:
         # bf16 自动混合精度（L1）；仅在 cuda + 配置时启用
         self.dtype = _DTYPE_MAP.get(str(cfg.get("dtype", "fp32")).lower(), torch.float32)
         self.amp = (str(device).startswith("cuda") and self.dtype == torch.bfloat16)
+        # P3（2026-08-19）：refresh 训练 chunk 大小可配（原模块级 _REFRESH_CHUNK=4 硬编码，
+        # v5 OOM 实测双卡并行 + vLLM 共卡时 chunk=4 的 (4,T,V) 前向仍撞顶，降到 2 可减半）。
+        self.refresh_chunk = max(1, int(cfg.get("refresh_chunk", 4)))
 
         # colocated CPU offload 钩子（L6）：rollout 阶段把 learner 权重换出到 CPU
         self.offload_to_cpu = bool(cfg.get("offload_to_cpu", False))
@@ -233,6 +238,18 @@ class AsyncBatchedScheduler:
                                       n_layers=getattr(student, "n_layers",
                                                        cfg.get("n_layers", 2))).to(device)
         self._loaded_ver = -1
+
+        # D1（2026-08-25）：固定评估集 + 周期评估（OPD 信号诊断，默认全关零回归）。
+        # eval_cache/eval_prompts/eval_responses 为从训练数据末尾划出的 holdout 子集；
+        # eval_every>0 时每 N 步在 holdout 上算当前策略 E[Δ_T]（no_grad），记 eval_reward。
+        self.eval_cache = eval_cache
+        self.eval_prompts = eval_prompts
+        self.eval_responses = eval_responses
+        self.eval_every = int(cfg.get("eval_every", 0))
+        self.eval_chunk = max(1, int(cfg.get("eval_chunk", 8)))
+        if (eval_cache is None) != (eval_prompts is None or eval_responses is None):
+            raise ValueError("eval_cache 与 eval_prompts/eval_responses 必须同时提供或同时省略")
+        # 行数一致性由 pipeline 切分时保证（cache 无统一 num_samples 接口，此处不重复校验）
 
     # --------------------------- 优化器 ---------------------------
     def _build_optimizer(self, student, cfg):
@@ -365,6 +382,43 @@ class AsyncBatchedScheduler:
                 self._n_dropped_qfull += 1     # M5：scored 样本因队满被丢弃
                 continue
 
+    @torch.no_grad()
+    def _eval_holdout(self) -> float | None:
+        """D1（2026-08-25）：固定评估集上当前策略 E[Δ_T]（no_grad），返回标量。
+
+        与 _train_step 同口径：student top-K 支撑上 Σ π_cur(v)·Δ(v)，跨样本平均；
+        分 chunk 前向累加避免 (chunk,T,K) 峰值。默认全关（eval_cache=None → None）。
+        """
+        if self.eval_cache is None or self.eval_every <= 0:
+            return None
+        self.student.eval()
+        total = 0.0
+        denom = 0
+        n = self.eval_prompts.size(0)
+        try:
+            for i in range(0, n, self.eval_chunk):
+                b = min(self.eval_chunk, n - i)
+                idxs = torch.arange(i, i + b, device=self.device)
+                p_b = self.eval_prompts[idxs]
+                r_b = self.eval_responses[idxs]
+                with torch.amp.autocast(device_type="cuda", dtype=self.dtype,
+                                        enabled=self.amp):
+                    s_cur = self.student.response_dists(p_b, r_b, dtype=self.dtype)
+                    if self.use_topk:
+                        s_topk = torch.topk(s_cur, self.top_k_student, dim=-1)
+                        delta_at = self.eval_cache.delta_at_student_topk(
+                            idxs, s_topk.indices, self.device)
+                        if self.dtype is not None and delta_at.dtype != self.dtype:
+                            delta_at = delta_at.to(self.dtype)
+                        rew = (s_topk.values.exp() * delta_at).sum(-1)   # (B,T)
+                    else:
+                        delta = self.eval_cache.get_delta(idxs)
+                        rew = expected_reward(s_cur, delta)              # (B,T)
+                    total += float(rew.sum().item())
+                    denom += int(rew.numel())
+        finally:
+            self.student.train()
+        return total / max(denom, 1)
     def _train_step(self, done, idxs, s_old, delta, ver):
         """单步训练（线程版与分布式版共用）。
 
@@ -537,7 +591,7 @@ class AsyncBatchedScheduler:
         # 拆 chunk（_REFRESH_CHUNK=4，batch=8 → 2 块）【独立小批更新】：每 chunk 完整
         # forward/backward/step（4 条/次），峰值增量减半（~5GB），图完全独立无共享。
         # refresh 训练的小批粒度是超参选择（更接近标准 SGD），不影响 rollout/验收口径。
-        chunks = list(rb_idxs.split(max(1, min(_REFRESH_CHUNK, rb_idxs.size(0)))))
+        chunks = list(rb_idxs.split(max(1, min(self.refresh_chunk, rb_idxs.size(0)))))
         self.student.train()
         acc = {"loss": [], "pg": [], "kl": [], "rew": [], "adv": []}
         version = self.staleness_q.current_version
@@ -675,6 +729,9 @@ class AsyncBatchedScheduler:
                 continue
             last_progress = time.monotonic()
             self.metrics.append(m)
+            # D1（2026-08-25）：每 eval_every 步在固定评估集上算当前策略 E[Δ_T]（无梯度）
+            if self.eval_every > 0 and (done + 1) % self.eval_every == 0:
+                m["eval_reward"] = self._eval_holdout()
             if on_step is not None:            # T8：每成功一步回调（checkpoint/metrics 用）
                 try:
                     on_step(m)

@@ -232,8 +232,9 @@ class TensorTeacherCache:
         return out if device is None else out.to(device)
 
     # --------------------------- 设备迁移 ---------------------------
+    # --------------------------- 设备迁移 ---------------------------
     def to(self, device) -> "TensorTeacherCache":
-        """把缓存全部张量（含可选 fat prompts/responses）搬到 device。
+        """把缓存全部张量（含可选 fat prompts/responses）搬到 device.
 
         P1-A（二次审查）：load() 用 map_location="cpu" 把缓存钉在 CPU，load_cache 训练
         分支若不搬设备，GPU 路径在 KL 锚点 / scheduler 索引处必崩设备不匹配。
@@ -244,6 +245,28 @@ class TensorTeacherCache:
             if t is not None:
                 setattr(self, attr, t.to(device))
         return self
+
+    def slice(self, start: int, end: int | None = None) -> "TensorTeacherCache":
+        """D1（2026-08-25）：按样本行切片（固定评估集用）→ 返回只含 [start:end] 行的新 cache。
+        与训练 cache 共享底层张量（不复制数据），切片后行索引从 0 重排。
+        """
+        out = TensorTeacherCache(enforce_consistency=self.enforce, top_k=self.top_k)
+        out.mode = self.mode
+        out.vocab = self.vocab
+        if self.mode == "dense":
+            out.delta = self.delta[start:end]
+        else:
+            out.ids = self.ids[start:end]
+            out.rl_k = self.rl_k[start:end]
+            out.ref_k = self.ref_k[start:end]
+            out.delta_k = self.delta_k[start:end]
+            out.ids_sorted = self.ids_sorted[start:end]
+            out.delta_k_sorted = self.delta_k_sorted[start:end]
+        for attr in ("prompts", "responses"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                setattr(out, attr, t[start:end])
+        return out
 
     # --------------------------- 持久化 ---------------------------
     def save(self, path: str, prompts: torch.Tensor | None = None,

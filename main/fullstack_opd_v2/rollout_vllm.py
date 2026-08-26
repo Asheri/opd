@@ -31,7 +31,9 @@ ratio(v) = π_cur(v)/π_old(v)，需要完整的 π_old 分布。
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 
 import torch
 
@@ -114,12 +116,19 @@ class VLLMRolloutEngine:
                  gpu_memory_utilization: float = 0.9, max_model_len: int = 2048,
                  vocab_size: int | None = None, full_logprobs_cap: int = 4096,
                  device: str = "cuda:0", weight_sync_mode: str = "auto",
+                 learner_device: str | None = None,
                  **engine_kwargs):
         if not _VLLM_AVAILABLE:
             raise RuntimeError(
                 "vLLM 未安装（统一 GPU 环境应含 vllm）。L3 rollout 需要 vLLM 引擎。")
         self.tp_size = int(tp_size)
         self._wt_sync_mode = weight_sync_mode  # auto=0.16 NCCL 同步；off=逃生舱
+        self._learner_device = learner_device   # trainer 侧 NCCL 组所在卡（训练卡）
+        # WT poisoned 状态（2026-08-19）：NCCL init/update 一旦超时或失败即标记，后续
+        # 禁止复用该 engine（daemon 线程无法安全杀死、communicator 状态不可信 →
+        # fail-closed；正确恢复方式是进程退出 / 重建 engine）。
+        self._wt_poisoned = False
+        self._wt_failure_reason = None
         self.dtype = dtype
         self.device = device
         self.full_cap = int(full_logprobs_cap)
@@ -173,42 +182,76 @@ class VLLMRolloutEngine:
         # C3：注册进进程级清理表
         _ACTIVE_ENGINES.append(self)
 
+    # --------------------------- WT poisoned 状态 ---------------------------
+    @property
+    def weight_sync_poisoned(self) -> bool:
+        """engine 是否已被标记为 weight-transfer poisoned（不可恢复，禁止复用）。"""
+        return bool(getattr(self, "_wt_poisoned", False))
+
+    @property
+    def weight_sync_poison_reason(self) -> str | None:
+        """poisoned 原因（原始异常 repr）。"""
+        return getattr(self, "_wt_failure_reason", None)
+
+    def _mark_weight_transfer_poisoned(self, reason: str) -> None:
+        """把 engine 标记为 poisoned（不可恢复）：NCCL init/update 超时或失败后调用。
+
+        - daemon 线程无法被 Python 安全杀死；超时后 NCCL communicator 状态不可信；
+        - 一旦标记，engine 禁止复用，正确恢复方式是进程退出 / 重建 engine；
+        - shutdown() 不得清除本状态（后续 update_weights 仍必须拒绝复用）。
+        """
+        self._wt_poisoned = True
+        self._wt_failure_reason = str(reason)
+        logging.getLogger(__name__).error(
+            "[WT] engine poisoned: %s；该进程应中止；如需继续实验，请重建 vLLM engine。",
+            self._wt_failure_reason)
+
+
     # --------------------------- 清理 ---------------------------
     def shutdown(self) -> None:
         """关闭 vLLM 引擎，避免 EngineCore 子进程残留（实测 ~40GB/卡）。
-        同时销毁 trainer 侧 NCCL weight-transfer 组。
+        同时销毁 trainer 侧 NCCL weight-transfer 组并从活跃注册表移除。
 
         vLLM V1 的 EngineCore 是独立进程；主进程 kill 不会带走它。
-        多版本适配：先试 LLM.shutdown()（>=0.16），再尝试
-        engine 层 API；都失败时通知注册表移除即可
-        （atexit 盘点）。可重入，无双次关闭副作用。
+        多版本适配：先试 LLM.shutdown()（>=0.16），再尝试 engine 层 API。
+        修复（2026-08-19）：此前 LLM.shutdown() 成功即 return，跳过 NCCL 组清理与
+        注册表移除——串行多实验时泄漏 EngineCore / NCCL communicator / 端口。
+        现在无论引擎关闭成功与否，都走到尾部清理。可重入，无双次关闭副作用。
         """
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
+        _engine_shut = False
         try:
             if self.llm is not None and hasattr(self.llm, "shutdown"):
                 self.llm.shutdown()
-                return
+                _engine_shut = True
         except Exception as e:     # noqa: BLE001
-            import logging
             logging.getLogger(__name__).warning(f"vLLM shutdown 第一路失败：{e}")
-        try:
-            me = self.llm.llm_engine
-            if hasattr(me, "shutdown"):
-                me.shutdown()
-                return
-        except Exception as e:     # noqa: BLE001
-            import logging
-            logging.getLogger(__name__).warning(f"vLLM shutdown 第二路失败：{e}")
-        # 销毁 trainer 侧 NCCL weight-transfer 组
+        if not _engine_shut:
+            try:
+                me = self.llm.llm_engine
+                if hasattr(me, "shutdown"):
+                    me.shutdown()
+            except Exception as e:     # noqa: BLE001
+                logging.getLogger(__name__).warning(f"vLLM shutdown 第二路失败：{e}")
+        # 销毁 trainer 侧 NCCL weight-transfer 组（引擎关闭后不得残留 NCCL 组）
         g = getattr(self, "_wt_group", None)
         if g is not None:
             try:
+                _destroy = getattr(g, "destroy", None) or getattr(g, "close", None)
+                if callable(_destroy):
+                    _destroy()
                 del g
-            except Exception:          # noqa: BLE001
+            except Exception:          # noqa: BLE001 —— 清理路径绝不抛
                 pass
             self._wt_group = None
+        # 从进程级活跃注册表移除（避免 atexit 二次 shutdown / 列表泄漏）
+        if self in _ACTIVE_ENGINES:
+            try:
+                _ACTIVE_ENGINES.remove(self)
+            except Exception:          # noqa: BLE001
+                pass
 
     # --------------------------- generate 版本兼容 ---------------------------
     def _generate(self, seqs, sampling):
@@ -253,6 +296,12 @@ class VLLMRolloutEngine:
           - 旧版 v0      : llm.llm_engine.model_executor.model.load_weights。
         返回 True=同步成功；False=版本不支持（已警告）。
         """
+        # poisoned 统一在最外层拦截（不受 rollout_weight_sync=off 影响）：一旦 NCCL
+        # init/update 超时或失败，engine 的 communicator 状态不可信，禁止复用。
+        if self.weight_sync_poisoned:
+            raise RuntimeError(
+                "vLLM NCCL weight transfer engine poisoned; "
+                f"reason={getattr(self, '_wt_failure_reason', None)}")
         if hasattr(self.llm, "update_weights"):
             import inspect
             try:
@@ -294,49 +343,97 @@ class VLLMRolloutEngine:
 
         vLLM 0.16 的 WeightTransferEngine：trainer 建 NCCL 组（master_addr/port 共享），
         worker 侧 init_weight_transfer_engine 加入。world_size = 1(trainer) + tp_size。
+
+        修复（2026-08-19）：trainer_init 与 worker_init 都是阻塞集合操作，任何一侧
+        失败/不加入都会让另一侧永久挂起（日志停在 [WT] trainer_init 开始、GPU 0%）。
+        现在 trainer_init 走 _run_with_timeout 主进程侧 fail-fast；worker_init join 后
+        检查 is_alive（超时仍存活即抛，不再静默继续）。
+
+        poisoned 语义（2026-08-19）：任何 init 失败/超时（trainer_init 超时、worker init
+        线程超时仍存活、worker init 抛异常、NCCL init 异常）都会把 engine 标记为
+        poisoned——daemon 线程无法被 Python 安全杀死，超时后 NCCL communicator 状态
+        不可信；poisoned engine 禁止复用，正确恢复方式是进程退出 / 重建 engine。
         """
+        if self.weight_sync_poisoned:
+            raise RuntimeError(
+                "vLLM NCCL weight transfer engine poisoned; "
+                f"reason={getattr(self, '_wt_failure_reason', None)}")
         if getattr(self, "_wt_group", None) is not None:
             return
         try:
-            from vllm.distributed.weight_transfer.nccl_engine import (
-                NCCLWeightTransferEngine)
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError(f"vLLM NCCL WeightTransferEngine 不可用：{e}")
-        import socket
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        self._wt_init_info = {
-            "master_address": "127.0.0.1",
-            "master_port": int(port),
-            "rank_offset": 1,                     # trainer=0，worker 从 1 起
-            "world_size": 1 + int(self.tp_size),
-        }
-        # NCCL 组建立是【阻塞集合操作】：trainer（rank0）与 worker（rank1）必须【并发】
-        # 调 init，否则一方等另一方加入 → 死锁（2026-08-17 实测：base 训练 20 步完成后
-        # 卡死在 update_weights 初始化）。故 worker 侧 init 放后台线程，主线程 trainer_init
-        # 阻塞握手；两者在同一 master_port/store 上完成 NCCL 组建立。
-        _init_err: list[Exception] = []
-
-        def _worker_init():
             try:
-                self.llm.init_weight_transfer_engine({"init_info": self._wt_init_info})
-            except Exception as e:  # noqa: BLE001
-                _init_err.append(e)
+                from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLWeightTransferEngine)
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError(f"vLLM NCCL WeightTransferEngine 不可用：{e}")
+            import socket
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            self._wt_init_info = {
+                "master_address": "127.0.0.1",
+                "master_port": int(port),
+                "rank_offset": 1,                     # trainer=0，worker 从 1 起
+                "world_size": 1 + int(self.tp_size),
+            }
+            # NCCL 组建立是【阻塞集合操作】：trainer（rank0）与 worker（rank1）必须【并发】
+            # 调 init，否则一方等另一方加入 → 死锁（2026-08-17 实测：base 训练 20 步完成后
+            # 卡死在 update_weights 初始化）。故 worker 侧 init 放后台线程，主线程 trainer_init
+            # 阻塞握手；两者在同一 master_port/store 上完成 NCCL 组建立。
+            _init_err: list[BaseException] = []
 
-        import threading
-        t = threading.Thread(target=_worker_init, daemon=True)
-        t.start()
-        # NCCL 通信组禁止两个 rank 同卡（"Duplicate GPU detected"，2026-08-17 实测）。
-        # trainer（rank0）必须在【训练卡】建组，vLLM worker（rank1）在 rollout 卡——
-        # 布局必须是交叉分卡（CUDA_VISIBLE_DEVICES 重排）。显式把当前设备切到训练卡。
-        if str(self.device).startswith("cuda"):
-            torch.cuda.set_device(self.device)
-        # trainer 侧 NCCL 组（rank 0，用当前 CUDA 设备 = 训练卡）
-        self._wt_group = NCCLWeightTransferEngine.trainer_init(self._wt_init_info)
-        t.join(timeout=120)
-        if _init_err:
-            raise RuntimeError(f"vLLM NCCL 权重同步初始化失败（worker 侧）：{_init_err[0]}")
+            def _worker_init():
+                try:
+                    self.llm.init_weight_transfer_engine({"init_info": self._wt_init_info})
+                except BaseException as e:      # noqa: BLE001 —— 记录后主线程抛
+                    _init_err.append(e)
+
+            _wlog = logging.getLogger(__name__)
+            t = threading.Thread(target=_worker_init, daemon=True, name="wt-worker-init")
+            t.start()
+            _wlog.info("[WT] worker_init 线程已启动（端口 %s, world_size=%s）",
+                       port, 1 + int(self.tp_size))
+            # NCCL 通信组禁止两个 rank 同卡（"Duplicate GPU detected"，2026-08-17 实测）。
+            # trainer（rank0）必须在【训练卡】建组，vLLM worker（rank1）在 rollout 卡——
+            # 布局必须是交叉分卡（CUDA_VISIBLE_DEVICES 重排）。显式把当前设备切到训练卡。
+            # 2026-08-19 修复：此前误用 self.device（rollout 卡）建 trainer 侧 NCCL 组
+            # → rank0/rank1 同卡 → NCCL_INVALID_USAGE(5)（NCCL_DEBUG 实锤 init.cc:737
+            # "Duplicate GPU detected"）。NCCL 组禁止两个 rank 同卡，trainer 必须在该
+            # 实验的【训练卡】建组（worker 在 rollout 卡）；未显式给定 learner_device 时
+            # 回落 rollout 卡（旧调用兼容：单卡部署时两者同卡合法）。
+            _trainer_dev = self._learner_device or self.device
+            if str(_trainer_dev).startswith("cuda"):
+                torch.cuda.set_device(_trainer_dev)
+            _timeout = float(getattr(self, "_wt_timeout", 120.0))
+            _wlog.info("[WT] trainer_init 开始（trainer_dev=%s, 端口 %s）", _trainer_dev, port)
+            # ⚠️ 2026-08-22 GPU 实测（E2 交叉布局 train@GPU1+vLLM@GPU0）：NCCL trainer_init
+            # 在 _run_with_timeout 的【新线程】里执行，而 torch.cuda.set_device 是【线程局部】
+            # ——主线程设的 cuda:1 在新线程不生效，新线程用默认 cuda:0，导致 rank0(trainer) 与
+            # rank1(worker) 都在 GPU0 → "Duplicate GPU detected / NCCL_INVALID_USAGE"。
+            # E1（train@GPU0）恰好默认卡=训练卡所以从未暴露。修复：把 set_device 放线程内。
+            def _trainer_init_on_device():
+                if str(_trainer_dev).startswith("cuda"):
+                    torch.cuda.set_device(_trainer_dev)
+                return NCCLWeightTransferEngine.trainer_init(self._wt_init_info)
+
+            # trainer_init 可能因 worker 未加入而永久阻塞 → 主进程侧限时 fail-fast
+            self._wt_group = _run_with_timeout(
+                _trainer_init_on_device,
+                _timeout + 30.0, "trainer_init")
+            _wlog.info("[WT] trainer_init 完成")
+            t.join(timeout=_timeout + 30.0)
+            if t.is_alive():
+                raise RuntimeError(
+                    "[WT] worker_init 线程超时仍存活——worker 未完成 init_weight_transfer_engine，"
+                    "NCCL 组不完整；已 fail-fast。请检查 vLLM 侧日志（weight_transfer_config 是否"
+                    "已配置、worker 是否启动）。")
+            _wlog.info("[WT] worker_init join 返回（init_err=%d）", len(_init_err))
+            if _init_err:
+                raise RuntimeError(
+                    f"vLLM NCCL 权重同步初始化失败（worker 侧）：{_init_err[0]}")
+        except BaseException as e:      # noqa: BLE001 —— 含 KeyboardInterrupt/SystemExit
+            self._mark_weight_transfer_poisoned(f"init: {e!r}")
+            raise
 
     def _weight_transfer_update_16(self, state_dict: dict) -> bool:
         """0.16 NCCL 广播：update_info + 后台线程发权重。
@@ -353,64 +450,123 @@ class VLLMRolloutEngine:
         第二次相同同步后才精确收敛（0.000000）。训练每步只同步一次 → rollout 走的是
         部分旧权重（off-policy）。解决：同权重双发（第二发强制收敛），~200ms/步
         （1.7B bf16 全量 NCCL），可接受。重度优化：TP=1 时改 param.copy_ 直拷可省。
+
+        修复（2026-08-19）：
+        - payload preflight（_prepare_weight_transfer_payload）：把空 dict / 非 Tensor /
+          非法 dtype / 空形状 / device 错位 / 非连续等在 collective_rpc 之前拦截；
+        - collective_rpc 主进程侧限时（_run_with_timeout）+ sender 线程 is_alive 检查，
+          杜绝 [WT-update] 开始后 0% 空等；
+        - sender 线程异常即时 error 日志（此前只 append，主线程卡住时不可见）。
+
+        poisoned 语义（2026-08-19）：任何 update 失败（含 payload preflight / 第一发 /
+        第二发 / collective_rpc 超时 / sender 线程异常或超时）都会把 engine 标记为
+        poisoned——daemon 线程无法被 Python 安全杀死，超时后 NCCL communicator 状态
+        不可信；poisoned engine 禁止复用，正确恢复方式是进程退出 / 重建 engine。
         """
-        import threading
-        self._weight_transfer_init_16()
-        update_info = _build_nccl_update_info(state_dict)
-        # 防御：广播要求 tensor 在 NCCL 组设备（训练卡）上——调用方传 CPU 态会
-        # AssertionError 且被吞 → collective_rpc 永久挂（2026-08-17 实测）。
-        sd_dev = {k: (v.to(self.device) if v.device != torch.device(self.device)
-                      else v) for k, v in state_dict.items()}
-        update_info = _build_nccl_update_info(sd_dev)
-        from vllm.distributed.weight_transfer.nccl_engine import (
-            NCCLWeightTransferEngine)
-        err: list[Exception] = []
-
-        def _send():
-            try:
-                NCCLWeightTransferEngine.trainer_send_weights(
-                    iter(sd_dev.items()), self._wt_group,
-                    stream=torch.cuda.current_stream())
-            except Exception as e:  # noqa: BLE001 —— 广播失败记入并让主线程抛
-                err.append(e)
-
-        t = threading.Thread(target=_send, daemon=True)
-        t.start()
+        if self.weight_sync_poisoned:
+            raise RuntimeError(
+                "vLLM NCCL weight transfer engine poisoned; "
+                f"reason={getattr(self, '_wt_failure_reason', None)}")
         try:
-            # 用 engine 层 collective_rpc + 显式超时：广播失败时不无限挂，超时即抛。
-            self.llm.llm_engine.collective_rpc(
-                "update_weights", timeout=float(getattr(self, "_wt_timeout", 120.0)),
-                kwargs={"update_info": update_info})
-        finally:
-            t.join(timeout=float(getattr(self, "_wt_timeout", 120.0)) + 30)
-        if err:
-            raise RuntimeError(f"vLLM NCCL 权重广播失败：{err[0]}")
-        if getattr(self, "_wt_double_send", True):
-            # P0 收敛修复：worker 端 layerwise reload 的异步拷回使「变更后首次同步」只部分
-            # 生效（实测 ~3% logp 残留）。同权重再发一次强制收敛（实测第二次精确 0.000000）。
-            # 关闭逃生舱：_wt_double_send=False（不推荐，训练会 off-policy）。
-            update_info2 = _build_nccl_update_info(sd_dev)
-            err2: list[Exception] = []
+            _ulog = logging.getLogger(__name__)
+            self._weight_transfer_init_16()
+            _ulog.info("[WT-update] 开始（keys=%d）", len(state_dict))
+            # 广播要求 tensor 在【NCCL 组设备】（训练卡 = self._wt_group.device）上：
+            # - 传 CPU 态 → PyNcclCommunicator 的 broadcast 无 device assert，NCCL 用
+            #   comm device 操作错误指针 → illegal memory access（异步）→ 后续挂起
+            #   （2026-08-17 实测）；
+            # - 传 rollout 卡张量 → 同样不匹配（2026-08-19 verify_weight_sync 实测：
+            #   [WT-update] 开始后永久卡）。旧实现 to(self.device)（rollout 卡）是错的，
+            #   run_s2_real 恰好因 current_device=训练卡 + 流巧合未暴露。
+            # preflight 同时完成：非空/Tensor/dtype/空形状/device/contiguous 校验。
+            sd_dev = _prepare_weight_transfer_payload(state_dict, self._wt_group.device)
+            update_info = _build_nccl_update_info(sd_dev)
+            self._weight_transfer_broadcast_round(sd_dev, update_info, "第一发")
+            if getattr(self, "_wt_double_send", True):
+                # P0 收敛修复：worker 端 layerwise reload 的异步拷回使「变更后首次同步」只部分
+                # 生效（实测 ~3% logp 残留）。同权重再发一次强制收敛（实测第二次精确 0.000000）。
+                # 关闭逃生舱：_wt_double_send=False（不推荐，训练会 off-policy）。
+                update_info2 = _build_nccl_update_info(sd_dev)
+                self._weight_transfer_broadcast_round(sd_dev, update_info2, "第二发")
+            _ulog.info("[WT-update] 完成")
+            return True
+        except BaseException as e:      # noqa: BLE001 —— 含 KeyboardInterrupt/SystemExit
+            # init 已标记则保留更具体的 init 原因（不覆盖）；否则标记 update 原因。
+            if not self.weight_sync_poisoned:
+                self._mark_weight_transfer_poisoned(f"update: {e!r}")
+            raise
 
-            def _send2():
+    def _weight_transfer_broadcast_round(self, sd_dev: dict, update_info: dict,
+                                         label: str) -> None:
+        """单轮 NCCL 权重广播：sender 线程 trainer_send_weights + 主线程 collective_rpc 并发。
+
+        修复（2026-08-19）：
+        - collective_rpc 传参 timeout 只影响远端 worker，vLLM 0.16 的 call_utility 内部
+          future.result() 不带超时——主线程可能永久卡在 [WT-update] 开始、GPU 0%。
+          这里用 _run_with_timeout 给【主进程侧】加超时，超时即 fail-fast；
+        - sender 线程 join 后检查 is_alive：仍存活说明 NCCL 广播未完成，继续执行会
+          并发操作同一 communicator → 抛错；
+        - sender 线程异常立即 error 日志（此前只 append，主线程卡住时不可见）。
+
+        poisoned 语义（2026-08-19）：本函数是最外层广播入口——_run_with_timeout 超时 /
+        collective_rpc 异常 / sender 线程异常 / sender join 超时 / sender 仍存活都会把
+        engine 标记为 poisoned（daemon 线程无法被 Python 安全杀死，超时后 NCCL
+        communicator 状态不可信）；poisoned engine 禁止复用，正确恢复是重建 engine。
+        """
+        try:
+            _ulog = logging.getLogger(__name__)
+            _timeout = float(getattr(self, "_wt_timeout", 120.0))
+            from vllm.distributed.weight_transfer.nccl_engine import (
+                NCCLWeightTransferEngine)
+            _wt_dev = self._wt_group.device
+            err: list[BaseException] = []
+
+            def _send():
                 try:
+                    # 2026-08-22 加固（与 _trainer_init_on_device 同款）：trainer_send_weights
+                    # 在【后台线程】执行，torch.cuda.set_device 是线程局部——旧实现用
+                    # `with torch.cuda.device(_wt_dev):` 只覆盖取 stream 一行，with 退出后
+                    # 设备恢复默认（E2 sender 线程默认 cuda:0），trainer_send_weights 在
+                    # cuda:0 上下文执行却用 cuda:1 的 communicator+stream。实测广播能跑
+                    # （communicator/stream 已绑定正确设备），但任何临时张量分配会静默错位。
+                    # 改为线程开头 set_device，覆盖整个函数。
+                    torch.cuda.set_device(_wt_dev)
+                    # stream 必须是对应 NCCL comm 设备（训练卡）的流；当前设备可能已被
+                    # 其他 CUDA 操作改到 rollout 卡/参考模型卡 → 显式切回 comm 设备取流。
+                    _stream = torch.cuda.current_stream()
                     NCCLWeightTransferEngine.trainer_send_weights(
-                        iter(sd_dev.items()), self._wt_group,
-                        stream=torch.cuda.current_stream())
-                except Exception as e:  # noqa: BLE001
-                    err2.append(e)
+                        iter(sd_dev.items()), self._wt_group, stream=_stream)
+                except BaseException as e:      # noqa: BLE001 —— 立即日志 + 记录，主线程抛
+                    _ulog.error("[WT] %s sender 线程异常：%r", label, e)
+                    err.append(e)
 
-            t2 = threading.Thread(target=_send2, daemon=True)
-            t2.start()
+            t = threading.Thread(target=_send, daemon=True, name=f"wt-send-{label}")
+            t.start()
+            _rpc_error: BaseException | None = None
             try:
-                self.llm.llm_engine.collective_rpc(
-                    "update_weights", timeout=float(getattr(self, "_wt_timeout", 120.0)),
-                    kwargs={"update_info": update_info2})
+                # 用 _run_with_timeout 包裹：collective_rpc 主进程侧超时即 fail-fast
+                _run_with_timeout(
+                    lambda: self.llm.llm_engine.collective_rpc(
+                        "update_weights", timeout=_timeout,
+                        kwargs={"update_info": update_info}),
+                    _timeout + 30.0, f"{label}/collective_rpc")
+            except BaseException as e:          # noqa: BLE001
+                _rpc_error = e
+                raise
             finally:
-                t2.join(timeout=float(getattr(self, "_wt_timeout", 120.0)) + 30)
-            if err2:
-                raise RuntimeError(f"vLLM NCCL 权重广播失败（第 2 发）：{err2[0]}")
-        return True
+                t.join(timeout=_timeout + 30.0)
+                if t.is_alive():
+                    _ulog.error("[WT] %s sender 线程超时仍存活（NCCL 广播未完成）", label)
+                    if _rpc_error is None:
+                        raise RuntimeError(
+                            f"[WT] {label} sender 线程超时仍存活（NCCL 广播未完成）——"
+                            "已 fail-fast，避免与后续同步并发操作同一 communicator。")
+            _ulog.info("[WT] %s 返回（send_err=%d）", label, len(err))
+            if err:
+                raise RuntimeError(f"vLLM NCCL 权重广播失败（{label}）：{err[0]}")
+        except BaseException as e:      # noqa: BLE001 —— 含 KeyboardInterrupt/SystemExit
+            self._mark_weight_transfer_poisoned(f"{label}: {e!r}")
+            raise
 
     def update_weights_from_flat(self, tensors: list) -> bool:
         """按引擎参数顺序用拉取的扁平张量重建 state_dict 并推入 vLLM。
@@ -620,7 +776,11 @@ class VLLMRolloutEngine:
         if eos_token_id is not None:
             _sp_kw["stop_token_ids"] = [int(eos_token_id)]
         sampling = SamplingParams(**_sp_kw)
-        seqs = [prompts[b].tolist() for b in range(B)]
+        # 2026-08-19 修复：数据层（JsonLinesDataLoader）把 prompt 右 pad 到
+        # max_prompt_len（Qwen3 pad=151643）。HF generate 靠 attention_mask 自动排除
+        # pad；vLLM 不会——尾部 pad token 作为真实上下文进入模型，导致生成退化/loop
+        # （GPU 实测：HF 0 loop vs 旧 vLLM 路径 5/8 loop）。此处按 pad_id 去填充。
+        seqs = _strip_prompt_padding(prompts, pad_id)
         outs = self._generate(seqs, sampling)
         parsed = parse_vllm_outputs(outs, max_new, eos_token_id,
                                     loop_detection, loop_periods, loop_min_len)
@@ -638,6 +798,132 @@ class VLLMRolloutEngine:
         return parsed
 
 
+
+def _run_with_timeout(fn, timeout: float, label: str):
+    """在后台线程执行阻塞调用并限时等待；超时（线程仍存活）立即抛错 fail-fast。
+
+    vLLM 0.16 的 NCCL weight-transfer 阻塞集合调用（trainer_init / collective_rpc）内部
+    用 future.result() 不带超时——主线程可能永久阻塞（日志停在 [WT-...] 开始、GPU
+    利用率 0%、进程不死）。这里用线程 + join + is_alive 实现【主进程侧】超时：
+
+    - 超时且线程仍存活 → RuntimeError（fail-fast，不再 0% 空等）；
+    - 被调函数抛异常 → 原样向上传播（保留 SystemExit / KeyboardInterrupt 语义）。
+
+    超时后 engine 会被调用方标记为 poisoned（2026-08-19）：
+    - daemon 线程无法被 Python 安全杀死——超时后该线程可能仍卡在 NCCL 调用中；
+    - 超时后 NCCL communicator 状态不可信，engine 禁止复用；
+    - 正确恢复方式是进程退出 / 重建 engine；
+    - 本函数【不会】在超时线程内强行 shutdown（vLLM shutdown 可能阻塞，且可能与残留
+      NCCL 线程二次死锁）——本轮策略是 fail-closed，不是在线修复 communicator。
+    """
+    if not callable(fn):
+        raise TypeError(f"_run_with_timeout({label})：fn 必须可调用")
+    _res: dict = {}
+
+    def _runner():
+        try:
+            _res["ret"] = fn()
+        except BaseException as e:      # noqa: BLE001 —— 记录后由主线程原样抛
+            _res["err"] = e
+
+    t = threading.Thread(target=_runner, daemon=True, name=f"wt-timeout-{label}")
+    t.start()
+    t.join(timeout=float(timeout))
+    if t.is_alive():
+        raise RuntimeError(
+            f"[WT] {label} 主进程侧超时（>{float(timeout):.0f}s）：疑似 NCCL 停滞或对端"
+            "未就绪，已 fail-fast（不再 0% 空等）。请检查 worker 侧日志与 NCCL 组状态。")
+    err = _res.get("err")
+    if err is not None:
+        raise err
+    return _res.get("ret")
+
+
+# NCCL 广播支持的 dtype（vLLM NCCLWeightTransferEngine / NCCL 原生数据类型子集）。
+# 权重同步场景实际只出现浮点；显式排除 bool / complex / int16 等非 NCCL 标准类型。
+_NCCL_SUPPORTED_DTYPES = frozenset({
+    torch.int8, torch.uint8,
+    torch.int32, torch.int64,
+    torch.float16, torch.float32, torch.float64, torch.bfloat16,
+})
+
+
+def _prepare_weight_transfer_payload(state_dict: dict, wt_device) -> dict:
+    """NCCL 权重广播 payload 预检与就位（纯函数，CPU 可单测）。
+
+    在调用 collective_rpc() / 启动 sender 线程【之前】校验 state_dict，把常见错误
+    （空 dict、非 Tensor、非法 dtype、空形状、device 错位、非连续）提前拦截，避免在
+    训练线程深处或 NCCL 异步层爆错（配合 worker 线程即 0% 空等）。
+
+    校验项：
+    - state_dict 必须是非空 dict；
+    - 每个值必须是 torch.Tensor；
+    - dtype 必须是 NCCL 可支持类型；
+    - 不允许空 shape / 零元素；
+    - tensor 最终落在 wt_device（.to(wt_device)），非连续先 .contiguous()；
+    - wt_device 不可用（None / 解析失败 / 无 type 属性）时抛清晰错误，而不是后续
+      AttributeError。
+
+    返回可直接广播的 {name: tensor}（全部在 wt_device 上、连续）。
+    """
+    if not isinstance(state_dict, dict) or len(state_dict) == 0:
+        raise ValueError(
+            "vLLM NCCL 权重广播 payload 为空：state_dict 必须是非空 dict。")
+    if wt_device is None:
+        raise RuntimeError(
+            "vLLM NCCL 权重广播：_wt_group.device 为 None——NCCL weight-transfer 组"
+            "未成功建立（trainer_init 未完成/失败）。")
+    if isinstance(wt_device, str):
+        try:
+            wt_device = torch.device(wt_device)
+        except Exception as e:      # noqa: BLE001
+            raise RuntimeError(
+                f"vLLM NCCL 权重广播：_wt_group.device 解析失败：{wt_device!r}") from e
+    if not hasattr(wt_device, "type"):
+        raise RuntimeError(
+            f"vLLM NCCL 权重广播：_wt_group.device 不是有效 torch.device"
+            f"（{type(wt_device).__name__}）。")
+    out: dict = {}
+    for name, v in state_dict.items():
+        if not isinstance(v, torch.Tensor):
+            raise TypeError(
+                f"vLLM NCCL 权重广播：参数 {name} 不是 torch.Tensor"
+                f"（{type(v).__name__}）。")
+        if v.dtype not in _NCCL_SUPPORTED_DTYPES:
+            raise TypeError(
+                f"vLLM NCCL 权重广播：参数 {name} dtype {v.dtype} 非 NCCL 支持类型"
+                f"（支持：{sorted(str(d) for d in _NCCL_SUPPORTED_DTYPES)}）。")
+        if v.numel() == 0 or any(s == 0 for s in v.shape):
+            raise ValueError(
+                f"vLLM NCCL 权重广播：参数 {name} 形状非法（shape={tuple(v.shape)}，"
+                "不允许空维度/零元素）。")
+        if v.device != wt_device:
+            v = v.to(wt_device)
+        if not v.is_contiguous():
+            v = v.contiguous()
+        out[name] = v
+    return out
+
+
+
+def _strip_prompt_padding(prompts: torch.Tensor, pad_id: int) -> list[list[int]]:
+    """去掉每个 prompt 行右侧的 pad token（vLLM 生成前，纯函数，CPU 可单测）。
+
+    数据层（JsonLinesDataLoader）把 prompt 右 pad 到 max_prompt_len（Qwen3 pad=151643）。
+    HF generate 靠 attention_mask 自动排除 pad；vLLM 不会——尾部 pad 作为真实上下文
+    进入模型，导致生成退化/loop。返回去 pad 后的变长 token 序列；空行兜底为 [pad_id]。
+    """
+    seqs: list[list[int]] = []
+    for b in range(int(prompts.size(0))):
+        row = [int(x) for x in prompts[b].tolist()]
+        while row and row[-1] == int(pad_id):
+            row.pop()
+        if not row:
+            row = [int(pad_id)]
+        seqs.append(row)
+    return seqs
+
+
 def _build_nccl_update_info(state_dict: dict) -> dict:
     """从 HF state_dict 构建 vLLM>=0.16 NCCL update_info（纯函数，CPU 可单测）。
 
@@ -646,11 +932,22 @@ def _build_nccl_update_info(state_dict: dict) -> dict:
     注意：不带 "backend" 键——worker 的 NCCLWeightTransferUpdateInfo 只接受
     names/dtype_names/shapes/packed/is_checkpoint_format；backend 由引擎启动时的
     WeightTransferConfig 决定（2026-08-17 实测：带 backend 会 "unexpected keyword"）。
+
+    修复（2026-08-19）：加 names/dtype_names/shapes 长度一致性守卫（三者必须等长，
+    否则 trainer_send_weights 迭代顺序与 worker 端 reload 错位）。
     """
+    names = list(state_dict.keys())
+    values = list(state_dict.values())
+    dtype_names = [str(t.dtype).split(".")[-1] for t in values]
+    shapes = [list(t.shape) for t in values]
+    if not (len(names) == len(dtype_names) == len(shapes)):
+        raise ValueError(
+            "vLLM NCCL update_info 构建失败：names/dtype_names/shapes 长度不一致"
+            f"（{len(names)}/{len(dtype_names)}/{len(shapes)}）。")
     return {
-        "names": list(state_dict.keys()),
-        "dtype_names": [str(t.dtype).split(".")[-1] for t in state_dict.values()],
-        "shapes": [list(t.shape) for t in state_dict.values()],
+        "names": names,
+        "dtype_names": dtype_names,
+        "shapes": shapes,
         "packed": False,
         "is_checkpoint_format": True,
     }

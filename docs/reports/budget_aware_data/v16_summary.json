@@ -1,0 +1,32 @@
+[
+  {
+    "name": "S2_E1_opd512",
+    "summary": {
+      "experiment": "S2_E1_opd512",
+      "n_steps": 25,
+      "reward_mean": -0.4861970937252045,
+      "pg_loss_mean": 0.41128825545310976,
+      "kl_loss_mean": 1.3554035162914202,
+      "total_s": 188.157,
+      "rollout_n_appended": 8,
+      "rollout_n_eos": 0,
+      "rollout_n_loop": 0
+    },
+    "run_dir": "/root/autodl-tmp/runs_s2_vllm_chat_v16/S2_E1_opd512"
+  },
+  {
+    "name": "S2_E2_opd1024",
+    "summary": {
+      "experiment": "S2_E2_opd1024",
+      "n_steps": 25,
+      "reward_mean": -0.45454077422618866,
+      "pg_loss_mean": 0.3965572893619537,
+      "kl_loss_mean": 1.2557158493984146,
+      "total_s": 194.378,
+      "rollout_n_appended": 8,
+      "rollout_n_eos": 0,
+      "rollout_n_loop": 0
+    },
+    "run_dir": "/root/autodl-tmp/runs_s2_vllm_chat_v16/S2_E2_opd1024"
+  }
+]

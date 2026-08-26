@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 # 脚本位于 main/scripts/ 下；直接运行（python scripts/xxx.py）时 sys.path[0] 是 scripts/
 # 而非 repo 根，导致 `from fullstack_opd_v2 ...` 失败。显式把 main/ 加入 sys.path。
@@ -78,12 +79,17 @@ def parse_args() -> argparse.Namespace:
                    help="并行实验数：N>1 时每个实验 spawn 一个子进程，按 N 张卡交叉分卡"
                         "（第 i 个实验训练 cuda:{i%N}、vLLM rollout_device cuda:{(i+1)%N}），"
                         "全部子进程强制 --load-cache 只读复用预建缓存；默认 1=串行（不改原行为）")
+    p.add_argument("--stagger", type=float, default=0.0, metavar="SEC",
+                   help="--parallel N>1 时，子进程间启动间隔秒数（默认 0=同时启动）。"
+                        "vLLM init 与对方训练峰值竞态时设 30-60 可确定性消除"
+                        "（v6 实测：E1 的 vLLM 在 GPU1 init 时 E2 已占 71GB -> profiling 失败）")
     # 内部标记：仅由父进程 --parallel 路径追加到子进程 argv，用户无需使用
     p.add_argument("--parallel-child", action="store_true", help=argparse.SUPPRESS,
                    dest="parallel_child")
     p.add_argument("--set", dest="extra_sets", action="append", default=[],
                    metavar="KEY=VALUE",
                    help="额外 config 覆盖（可重复），如 --set stage2.rollout_engine=vllm")
+    p.add_argument("--resume", action="store_true", help="从 run-dir 最新断点续跑剩余步（需与断点同配置；metrics 截断到断点前，step 编号不重复）")
     return p.parse_args()
 
 
@@ -139,6 +145,29 @@ def _build_overrides(args, name, load_cache):
     return overrides
 
 
+def _truncate_metrics_csv(run_dir: str, resume_step: int) -> None:
+    """resume 续跑前，把旧 metrics.csv 截断到断点 step 之前（避免续跑 step 编号重复）。
+
+    只保留 step < resume_step 的行（空 step 行也保留）；无 metrics 文件时静默跳过。
+    """
+    import csv as _csv
+    p = os.path.join(run_dir, "metrics.csv")
+    if not os.path.isfile(p):
+        return
+    with open(p, encoding="utf-8", newline="") as f:
+        reader = list(_csv.DictReader(f))
+    if not reader:
+        return
+    fieldnames = list(reader[0].keys())
+    keep = [r for r in reader
+            if not r.get("step") or not r["step"].strip()
+            or int(r["step"]) < resume_step]
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(keep)
+
+
 def _run_experiment(args, name, load_cache, prefix=None):
     """串行跑单个实验；返回 results 元素 {name, summary, run_dir}。
 
@@ -154,8 +183,19 @@ def _run_experiment(args, name, load_cache, prefix=None):
         f"materialized={args.materialized}, load_cache={load_cache})", flush=True)
     try:
         from fullstack_opd_v2.pipeline import FullStackOPDv2
-        out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d)
-        metrics = out["metrics"]
+        resume = None
+        if args.resume:
+            from fullstack_opd_v2.checkpoint import CheckpointManager
+            cm = CheckpointManager(d, every=int((cfg.get("run") or {}).get("checkpoint_every", 10)))
+            resume = cm.resume()
+            if resume:
+                _rs = int(resume.get("step", resume.get("version", 0)))
+                _res_v = resume.get("version", 0)
+                log(f"  [resume] 从断点 step={_rs} 续跑（version={_res_v}）", flush=True)
+            else:
+                log("  [resume][警告] run-dir 无断点，从 0 开始", flush=True)
+        out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d, resume=resume)
+        out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d, resume=resume)
         # M3：均值只统计【含该键】的训练步 metric——rollout 相位 metric 缺键时
         # 旧实现 m.get(k, 0.0) 会往 reward/pg/kl 均值里混入大量 0，污染口径。
         def _keyed_mean(key):
@@ -190,9 +230,31 @@ def _run_experiment(args, name, load_cache, prefix=None):
 
 
 # ---------------------------------------------------------------- 并行工具（纯函数，供单测）---
-_STRIP_OPTIONS = ("--names", "--device", "--parallel")
+_STRIP_OPTIONS = ("--names", "--device", "--parallel", "--stagger")
 
 
+def cgroup_memory_warning(n_parallel: int, per_proc_gb: float = 210.0,
+                        cgroup_path: str = "/sys/fs/cgroup/memory.max") -> str | None:
+    """读 cgroup 内存配额（默认 /sys/fs/cgroup/memory.max），若 并行数×单进程峰值 > 配额返回警告。
+    三态：无 cgroup 文件 / 配额=max → None；配额内 → None；超限 → 警告文案。
+    E1 SIGKILL 根因（2026-08-25）：容器 cgroup 内存硬限 220GB，单进程 RSS 峰值 206GB，
+    双进程并行 checkpoint 保存时超限 → cgroup OOM killer 发 SIGKILL（exitcode=-9）。
+    """
+    try:
+        with open(cgroup_path, encoding="utf-8") as f:
+            raw = f.read().strip()
+        if raw in ("max", ""):
+            return None
+        quota = int(raw)
+    except (OSError, ValueError):
+        return None
+    peak = n_parallel * per_proc_gb * (1024 ** 3)
+    if peak > quota:
+        gb = quota / (1024 ** 3)
+        return ("[S2][警告] cgroup 内存配额 {:.0f}GB，{} 进程 × 预估峰值 {:.0f}GB = {:.0f}GB 超限"
+                " —— 建议串行跑（或降低 batch/offload）。E1 曾因双并行 + checkpoint CPU payload"
+                " 超 220GB 被 SIGKILL（exitcode=-9）。").format(gb, n_parallel, per_proc_gb, peak / (1024 ** 3))
+    return None
 def build_parallel_argv(base_argv, name, i, n_cards):
     """父进程 sys.argv → 单个并行子进程 argv（纯函数，单测覆盖）。
 
@@ -308,7 +370,14 @@ def _spawn_entry(child_argv):
     再由 multiprocessing 反序列化调用本入口。
     """
     sys.argv = list(child_argv)
-    main()
+    try:
+        main()
+    finally:
+        # 双引擎并发时 vLLM 引擎 shutdown/解释器退出清理会挂起（非 daemon 线程
+        # join），child 永不退出 → 父 join 永久阻塞、EngineCore 变孤儿占显存
+        # （2026-08-19 双卡实测）。summary.json 在并行子路径也已写完，此处强制
+        # 退出跳过解释器清理；残留 EngineCore 由父进程 join 后统一清理。
+        os._exit(0)
 
 
 def _run_serial(args, names):
@@ -380,6 +449,13 @@ def _run_parallel(args, names):
     ctx = multiprocessing.get_context("spawn")   # vLLM/NCCL 强制 spawn（fork 不兼容）
     procs = []
     for i, name in enumerate(names_to_spawn):
+        # vLLM init 错峰（--stagger）：第 2+ 个子进程延迟启动，避免其 vLLM 引擎在
+        # 对方训练峰值时 profiling 失败（v6 实测：E1 的 vLLM 在 GPU1 init 时 E2 已占
+        # 71GB -> "No available memory for cache blocks"）。
+        if i > 0 and args.stagger > 0:
+            print(f"[S2] stagger: 等待 {args.stagger:.0f}s 后启动第 {i + 1} 个子进程"
+                  f"（{name}，vLLM init 错峰）...", flush=True)
+            time.sleep(args.stagger)
         child_argv = build_parallel_argv(sys.argv, name, i, args.parallel)
         child_argv += ["--parallel-child"]
         p = ctx.Process(target=_spawn_entry, args=(child_argv,), name=f"S2-{name}")
@@ -389,17 +465,94 @@ def _run_parallel(args, names):
     n_failed = 0
     for name, p in procs:
         p.join()
+        # 2026-08-22：子进程 os._exit 跳过清理 → 其 EngineCore 变孤儿占显存。立即清理
+        # 孤儿（ppid=1），否则先完成的实验引擎一直占着目标卡，拖累仍在跑的另一实验
+        # （v13 实测 E1 残留 12.76GB 致 E2 refresh OOM）。
+        _cleanup_orphan_engines()
+        # P1（2026-08-22）：清理后检查是否仍有 EngineCore 孤儿（ppid=1）残留——
+        # 若有，说明清理静默失效（如 ps 格式变化），打警告提示人工核查，不自动
+        # pkill 全部（会误杀仍在跑实验的引擎）。
+        _left = _count_orphan_engines()
+        if _left > 0:
+            print(f"  [S2][警告] 孤儿引擎清理后仍检测到 {_left} 个 ppid=1 的 "
+                  "EngineCore，请检查 ps args= 输出格式", flush=True)
         if p.exitcode not in (0, None):
             n_failed += 1
             print(f"  [S2][警告] 子进程 {name} 非零退出（exitcode={p.exitcode}），计入失败", flush=True)
+    _cleanup_stray_engines()
     _finish_parallel(args, n_failed=n_failed)
 
+
+
+def _orphan_engine_pids() -> list[int]:
+    """列出 ppid=1 且 cmdline 含 'VLLM::EngineCore' 的 pid（ps args= 读 cmdline 不截断）。
+
+    v14 实测：comm= 截断 16 字符名为 15（VLLM::EngineCor），'VLLM::EngineCore' 子串
+    恒不匹配 -> 清理从未执行；args= 读 /proc/PID/cmdline（setproctitle 修改后不截断）。
+    纯函数，CPU 可单测（monkeypatch ps 输出）。
+    """
+    import subprocess as _sp
+    out = _sp.run(["ps", "-eo", "pid=,ppid=,args="],
+                  capture_output=True, text=True).stdout
+    pids: list[int] = []
+    for line in out.splitlines():
+        if "VLLM::EngineCore" not in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "1":   # ppid=1 → 子进程已退出
+            pids.append(int(parts[0]))
+    return pids
+
+
+def _count_orphan_engines() -> int:
+    """统计 ppid=1 的 EngineCore 孤儿数（不 kill）。供清理后检查防静默失效。"""
+    try:
+        return len(_orphan_engine_pids())
+    except Exception:   # pragma: no cover —— 统计失败返回 -1 表示无法判定
+        return -1
+
+
+def _cleanup_orphan_engines() -> None:
+    """join 后清理【孤儿】vLLM EngineCore（ppid=1，其子进程已 os._exit 退出）。
+
+    与 _cleanup_stray_engines（pkill 全部）不同：只杀 ppid=1 的 EngineCore，不误杀仍
+    在运行实验的引擎。并行双实验先完成的那个 os._exit 跳过清理 → 其 EngineCore 变孤儿
+    继续占目标卡显存（v13 实测：E1 残留 12.76GB 致 E2 refresh OOM 80.94GB 撞顶）。
+    每 join 一个子进程后立即调用，及时释放其引擎占用的显存，避免拖到全 join 后。
+    """
+    import os as _os
+    try:
+        for pid in _orphan_engine_pids():
+            _os.kill(pid, 9)
+    except Exception as e:   # pragma: no cover —— 清理失败只告警
+        print(f"  [S2][警告] 孤儿引擎清理失败: {e}", flush=True)
+
+
+def _cleanup_stray_engines() -> None:
+    """join 后清理子进程留下的孤儿 vLLM EngineCore（child os._exit 跳过清理）。
+
+    双卡并行：child 完成即 os._exit(0)（防 vLLM shutdown 挂起），引擎进程残留为
+    init 孤儿（ppid=1）继续占显存；此处按 cmdline 精确匹配 kill。专用云 GPU 机器，
+    pkill 'VLLM::EngineCore' 不匹配父/其他链路。
+    """
+    import subprocess
+    try:
+        subprocess.run(["pkill", "-9", "-f", "VLLM::EngineCore"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:   # pragma: no cover —— 清理失败只告警，不影响汇总
+        print(f"  [S2][警告] 残留引擎清理失败: {e}", flush=True)
 
 def main() -> None:
     args = parse_args()
     names = args.names or list(STAGE2_ROLLOUT_MATRIX)
     os.makedirs(args.run_dir, exist_ok=True)
     if args.parallel > 1:
+        # cgroup 内存配额断言（2026-08-25 E1 SIGKILL 根因）：双并行 × 206GB 峰值 > 220GB 配额
+        _cw = cgroup_memory_warning(args.parallel)
+        if _cw:
+            print(_cw, flush=True)
+        _run_parallel(args, names)
+        return
         _run_parallel(args, names)
         return
     _run_serial(args, names)

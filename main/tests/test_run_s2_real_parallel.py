@@ -315,3 +315,219 @@ def test_run_serial_normal_rethrows_uncaught(rs2, monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="配置错误"):
         rs2._run_serial(args, ["S2_E0_static"])
     assert not (tmp_path / "l2_experiment_summary.json").exists()   # 传播前不写汇总
+
+
+# ---------------------------------------------------------------- --stagger（2026-08-19） ---
+def test_stagger_default_zero(rs2, monkeypatch):
+    """--stagger 不传时默认 0（parse_args）。"""
+    monkeypatch.setattr(sys, "argv", ["run_s2_real.py", "--config", "c.yaml",
+                                      "--run-dir", "r", "--names", "S2_E1_opd512"])
+    args = rs2.parse_args()
+    assert args.stagger == 0.0
+
+
+def test_stagger_strips_from_child_argv(rs2, base_argv):
+    """--stagger 45 不透传到子进程 argv（只有父进程用）。"""
+    argv = list(base_argv) + ["--stagger", "45"]
+    child = rs2.build_parallel_argv(argv, "S2_E1_opd512", 0, 2)
+    assert "--stagger" not in child
+    assert "45" not in child
+
+
+def test_stagger_sleeps_between_children(rs2, monkeypatch):
+    """--parallel 2 --stagger 30：第 1 个子进程立即启动，sleep(30) 后再启动第 2 个。"""
+    import time
+    import multiprocessing
+    sleeps = []
+    real_sleep = time.sleep
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    # 用一个假的 ctx 记录 p.start() 调用顺序
+    started = []
+    class _FakeProc:
+        def __init__(self, *a, **k):
+            self.name = k.get("name", "?")
+            self.exitcode = 0
+        def start(self):
+            started.append(self.name)
+        def join(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(multiprocessing, "get_context", lambda *a, **k: type("C", (), {"Process": _FakeProc})())
+    # 直接调 _run_parallel 的循环逻辑（通过模块函数）
+    from types import SimpleNamespace
+    args = SimpleNamespace(stagger=30.0, parallel=2, config="c.yaml", run_dir="r",
+                           load_cache=True, cache_path=None, eos_id=None,
+                           materialized=0, m_refresh=8, refresh_min=10,
+                           refresh_size=None, batch_size=None, extra_sets=[],
+                           names=None, device="cuda:0", n_steps=20,
+                           parallel_child=False, refresh_cold=0)
+    # 需要 names 合法 + cache 存在（否则走 build 路径）——这里只验证 sleep 行为，
+    # 通过 monkeypatch _resolve_cache_path/_cache_exists/_run_experiment 短路。
+    rs2._resolve_cache_path = lambda a, n: "x.pt"
+    rs2._cache_exists = lambda p: True
+    rs2._spawn_entry = lambda argv: None
+    rs2._finish_parallel = lambda a, n_failed=0: None
+    rs2._cleanup_stray_engines = lambda: None
+    names = ["S2_E1_opd512", "S2_E2_opd1024"]
+    rs2._run_parallel(args, names)
+    # 第 1 个立即启动，第 2 个在 sleep 后 → 只 sleep 一次（30s）
+    assert started == ["S2-S2_E1_opd512", "S2-S2_E2_opd1024"]
+    assert len(sleeps) == 1
+    assert sleeps[0] == 30.0
+
+# ---------------------------------------------------------------- 孤儿引擎清理（2026-08-22） ---
+def test_cleanup_orphan_engines_only_kills_ppid1(rs2, monkeypatch):
+    """_cleanup_orphan_engines：只杀 ppid=1 的 EngineCore（子进程已退出），不误杀运行中的。"""
+    import subprocess
+    fake_ps = (
+        "1234 1 VLLM::EngineCore\n"    # 孤儿（ppid=1）→ 杀
+        "5678 999 VLLM::EngineCore\n"  # 有父进程（运行中）→ 不杀
+        "9999 1 python run_s2_real\n"  # 非 EngineCore → 不杀
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [1234]
+
+# ---------------------------------------------------------------- 孤儿引擎清理 args= 修复（2026-08-22）---
+def test_cleanup_orphan_engines_parses_args_and_kills_ppid1(rs2, monkeypatch):
+    """_cleanup_orphan_engines：args= 格式（cmdline 完整路径）解析 + 只杀 ppid=1 的 EngineCore。
+
+    模拟 ps -eo pid=,ppid=,args= 输出：ppid=1 的 EngineCore（应杀）、ppid=其它（不杀）、
+    非 EngineCore 的 ppid=1 进程（不杀）。
+    """
+    import subprocess
+    fake_ps = (
+        "1234 1 /opt/vllm/VLLM::EngineCore --weight-transfer\n"
+        "5678 999 /opt/vllm/VLLM::EngineCore --weight-transfer\n"
+        "9999 1 /usr/bin/python run_s2_real.py\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [1234]
+
+
+def test_cleanup_orphan_engines_matches_truncated_comm_false_positive_guard(rs2, monkeypatch):
+    """回归守卫：comm= 截断 'VLLM::EngineCore'(16)→'VLLM::EngineCor'(15) 的 bug 已修。
+
+    构造含【截断名】与【完整名】混合的 ps 输出：只有完整名（args= cmdline）能匹配
+    'VLLM::EngineCore' 子串并进入 kill；截断名 'VLLM::EngineCor'（comm= 会显示）
+    无法匹配完整子串 → 不被误处理。验证 args= 路径匹配完整名。
+    """
+    import subprocess
+    fake_ps = (
+        "1001 1 VLLM::EngineCor\n"
+        "2002 1 /proc/.../VLLM::EngineCore --worker\n"
+        "3003 999 VLLM::EngineCore\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [2002]
+
+
+def test_count_orphan_engines_counts_only_ppid1(rs2, monkeypatch):
+    """_count_orphan_engines：只统计 ppid=1 的 EngineCore 数量，不执行 kill。"""
+    import subprocess
+    fake_ps = (
+        "1234 1 /path/VLLM::EngineCore a\n"
+        "5678 999 /path/VLLM::EngineCore b\n"
+        "9999 1 /usr/bin/python run_s2_real.py\n"
+        "4321 1 /path/VLLM::EngineCore c\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    assert rs2._count_orphan_engines() == 2
+    assert killed == []          # count 不杀
+
+def test_cleanup_orphan_engines_matches_truncated_comm_false_positive_guard(rs2, monkeypatch):
+    """回归守卫：comm= 截断 'VLLM::EngineCore'(16)→'VLLM::EngineCor'(15) 的 bug 已修。
+
+    构造含【截断名】与【完整名】混合的 ps 输出：只有完整名（args= cmdline）能匹配
+    'VLLM::EngineCore' 子串并进入 kill；截断名 'VLLM::EngineCor'（comm= 会显示）
+    无法匹配完整子串 → 不被误处理。验证 args= 路径匹配完整名。
+    """
+    import subprocess
+    fake_ps = (
+        "1001 1 VLLM::EngineCor\n"                       # 截断名（comm= 旧 bug 源）→ 不匹配完整名
+        "2002 1 /proc/.../VLLM::EngineCore --worker\n"   # 完整名（args=）→ 匹配并杀
+        "3003 999 VLLM::EngineCore\n"                    # 完整名但 ppid=999 → 不杀
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    rs2._cleanup_orphan_engines()
+    assert killed == [2002]
+
+
+def test_count_orphan_engines_counts_only_ppid1(rs2, monkeypatch):
+    """_count_orphan_engines：只统计 ppid=1 的 EngineCore 数量，不执行 kill。"""
+    import subprocess
+    fake_ps = (
+        "1234 1 /path/VLLM::EngineCore a\n"
+        "5678 999 /path/VLLM::EngineCore b\n"
+        "9999 1 /usr/bin/python run_s2_real.py\n"
+        "4321 1 /path/VLLM::EngineCore c\n"
+    )
+    killed = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake_ps})())
+    monkeypatch.setattr(__import__("os"), "kill", lambda pid, sig: killed.append(pid))
+    assert rs2._count_orphan_engines() == 2
+    assert killed == []          # count 不杀
+# ---------------------------------------------------------------- cgroup 内存断言 ---
+
+def test_cgroup_warning_no_file_returns_none(rs2):
+    """cgroup 文件缺失 → None，不误报。"""
+    assert rs2.cgroup_memory_warning(2, cgroup_path="/nonexistent/memory.max") is None
+
+
+def test_cgroup_warning_max_returns_none(rs2, tmp_path):
+    """配额=max（无限制）→ None。"""
+    f = tmp_path / "memory.max"
+    f.write_text("max\n")
+    assert rs2.cgroup_memory_warning(2, cgroup_path=str(f)) is None
+
+
+def test_cgroup_warning_within_quota_none(rs2, tmp_path):
+    """220GB 配额下单进程（210GB 预估）→ None。"""
+    f = tmp_path / "memory.max"
+    f.write_text(str(220 * 1024 ** 3) + "\n")
+    assert rs2.cgroup_memory_warning(1, cgroup_path=str(f)) is None
+
+
+def test_cgroup_warning_over_quota_warns(rs2, tmp_path):
+    """220GB 配额下双进程（420GB 预估）→ 返回警告文案（含 SIGKILL 提示）。"""
+    f = tmp_path / "memory.max"
+    f.write_text(str(220 * 1024 ** 3) + "\n")
+    w = rs2.cgroup_memory_warning(2, cgroup_path=str(f))
+    assert w is not None
+    assert "SIGKILL" in w
+    assert "220GB" in w
+
+# ---------------------------------------------------------------- resume metrics 截断 ---
+
+def test_truncate_metrics_no_file(rs2, tmp_path):
+    """无 metrics.csv → 静默跳过，不抛。"""
+    rs2._truncate_metrics_csv(str(tmp_path), 80)   # 不抛即通过
+
+
+def test_truncate_metrics_keeps_before_resume(rs2, tmp_path):
+    """step < resume_step 保留，>= 截断；空 step 行保留。"""
+    p = tmp_path / "metrics.csv"
+    p.write_text("step,reward\n0,0.1\n40,0.2\n80,0.3\n100,0.4\n,0.9\n", encoding="utf-8")
+    rs2._truncate_metrics_csv(str(tmp_path), 80)
+    rows = list(__import__("csv").DictReader(open(p, encoding="utf-8")))
+    steps = [r["step"] for r in rows]
+    assert steps == ["0", "40", ""]     # 80/100 被截断，空 step 保留
+    assert rows[-1]["reward"] == "0.9"

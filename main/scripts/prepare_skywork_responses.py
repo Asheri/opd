@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
                    help="C3（2026-08-18）：即使 response 已填也重新生成"
                         "（--apply-chat-template 重生成 base responses 用）")
     p.add_argument("--max-samples", type=int, default=None,
-                   help="只生成前 N 条 todo（配合 --seed 可复现限抽样）")
+                   help="随机抽样 N 条待生成样本（非前 N 条；配合 --seed 可复现）")
     p.add_argument("--seed", type=int, default=None, help="todo 采样种子（可复现）")
     p.add_argument("--resume", action="store_true",
                    help="显式 resume（默认也自动检测 tmp）")

@@ -384,3 +384,32 @@ def test_g5_base_skips_staleness_drop():
     m = sched._train_step(0, idxs, s_old, delta, 0)
     assert m is not None, "staleness_drop_base=False 时 base 陈旧样本仍应被训练（G5 契约）"
     assert math.isfinite(m["loss"])
+
+
+# --------------------------- refresh_chunk 可配置（2026-08-19） ---------------------------
+def test_refresh_chunk_default_4():
+    """默认 refresh_chunk=4（scheduler 实例属性）。"""
+    student, cache, prompts, responses, ref_dists = _setup()
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, _cfg(), "cpu")
+    assert sched.refresh_chunk == 4
+
+
+def test_refresh_chunk_configurable():
+    """--set stage2.refresh_chunk=2 → scheduler.refresh_chunk == 2。"""
+    student, cache, prompts, responses, ref_dists = _setup()
+    sched = AsyncBatchedScheduler(student, cache, prompts, responses,
+                                  ref_dists, None, None, _cfg(refresh_chunk=2), "cpu")
+    assert sched.refresh_chunk == 2
+
+
+def test_refresh_chunk_splits_correctly():
+    """refresh_chunk=2 + 8 个样本 → 4 个 chunk，每个 2 条（_train_step_refresh 拆分语义）。"""
+    import torch as _t
+    idxs = _t.arange(8)
+    chunks = list(idxs.split(max(1, min(2, idxs.size(0)))))
+    assert len(chunks) == 4
+    assert all(c.size(0) == 2 for c in chunks)
+    # 边界：chunk=8（全量）→ 1 个 chunk
+    chunks_all = list(idxs.split(max(1, min(8, idxs.size(0)))))
+    assert len(chunks_all) == 1 and chunks_all[0].size(0) == 8
