@@ -567,3 +567,43 @@ def test_truncate_metrics_backup_disabled(rs2, tmp_path):
     p.write_text("step,reward\n0,0.1\n80,0.3\n", encoding="utf-8")
     rs2._truncate_metrics_csv(str(tmp_path), 80, backup=False)
     assert not (tmp_path / "metrics_pre_resume_step80.csv").exists()
+
+
+def test_run_experiment_summary_no_nameerror(rs2, monkeypatch, tmp_path):
+    """_run_experiment 缺 metrics=out['metrics'] 时会 NameError → 被外层 except 吞成
+    summary['error']；修复后 summary 正常（reward_mean=1.0、n_steps=1、无 error 键）。
+    原理：若丢行未修，断言 "error" not in summary 即失败——天然捕雷。"""
+    monkeypatch.setattr(rs2, "load_config",
+                        lambda path, overrides: {"run": {"checkpoint_every": 10}})
+
+    class FakePipeline:
+        def __init__(self, cfg, device=None):
+            self.cfg, self.device = cfg, device
+
+        def run(self, run_dir=None, resume=None):
+            return {"metrics": [{"step": 0, "reward": 1.0, "pg_loss": 0.5,
+                                 "kl_loss": 0.1, "phase": "train"}],
+                    "timings": {"total": 1.0}}
+
+    monkeypatch.setattr("fullstack_opd_v2.pipeline.FullStackOPDv2", FakePipeline)
+
+    args = argparse.Namespace(
+        config="configs/skywork_17b.yaml",
+        run_dir=str(tmp_path),
+        device="cuda:0",
+        n_steps=30,
+        materialized=None,
+        m_refresh=8,
+        refresh_min=10,
+        cache_path=None,
+        batch_size=4,
+        refresh_size=None,
+        eos_id=151645,
+        extra_sets=[],
+        resume=False,
+    )
+    res = rs2._run_experiment(args, "S2_E0_static", load_cache=True, prefix=None)
+    summary = res["summary"]
+    assert "error" not in summary, f"汇总被 NameError 污染: {summary}"
+    assert summary["reward_mean"] == 1.0
+    assert summary["n_steps"] == 1

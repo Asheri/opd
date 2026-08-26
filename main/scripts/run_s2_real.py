@@ -207,6 +207,7 @@ def _run_experiment(args, name, load_cache, prefix=None):
             else:
                 log("  [resume][警告] run-dir 无断点，从 0 开始", flush=True)
         out = FullStackOPDv2(cfg, device=args.device).run(run_dir=d, resume=resume)
+        metrics = out["metrics"]   # 8d1411c 重写时丢行（b4b9872 漏修）：缺此行汇总 NameError
         # M3：均值只统计【含该键】的训练步 metric——rollout 相位 metric 缺键时
         # 旧实现 m.get(k, 0.0) 会往 reward/pg/kl 均值里混入大量 0，污染口径。
         def _keyed_mean(key):
