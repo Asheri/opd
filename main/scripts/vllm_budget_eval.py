@@ -13,6 +13,13 @@
   python vllm_budget_eval.py --device cuda:1 --models "Base=...,E1=..." \
       --budgets 256,512,1024 --dataset MATH500 --n-limit 50 --out-dir <dir> [--fp8] [--draft ...]
 
+多采样（B8192@3 终验口径，2026-08-26 增加）：
+  python vllm_budget_eval.py --models "JustRL=...,R1Distill=..." \
+      --budgets 8192 --n-samples 3 --temperature 0.7 --chat-template \
+      --max-model-len 12288 --device cuda:0 --out-dir <dir>
+  # --n-samples>1 时 accuracy 用 majority vote（多数派答案正确），jsonl 每 (problem,sample) 一行，
+  # 并带 majority_answer/majority_correct 标记；--n-samples=1（默认）保持旧 greedy 口径零回归。
+
 同一 --out-dir 可多次调用/多进程分模型并写：all_results.json 按 (label, budget)
 合并写 + 原子替换（重跑幂等）——E-0c 拐点扫描逐模型调用与 B2048 2+1 分卡
 不再互相覆盖（每 (label,budget) 的 jsonl 仍是唯一事实来源）。
@@ -42,7 +49,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--fp8", action="store_true", help="vLLM 用 float8 量化（Blackwell）")
     p.add_argument("--draft", default=None, help="投机解码 draft 小模型路径")
-    p.add_argument("--max-model-len", type=int, default=8192)
+    p.add_argument("--max-model-len", type=int, default=12288,
+                   help="vLLM max_model_len（默认 12288 覆盖 B8192+prompt；旧 B512/2048 亦兼容）")
     p.add_argument("--gpu-mem", type=float, default=0.9)
     p.add_argument("--chat-template", action="store_true",
                    help="用模型 chat template 包裹 prompt（对齐训练 apply_chat_template=true，"
@@ -50,6 +58,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--tokenizer", default=None,
                    help="chat 模板 tokenizer 路径；默认取各模型自身路径（三模型同族分词器，"
                         "按模型路径加载最稳）")
+    p.add_argument("--n-samples", type=int, default=1,
+                   help="每题采样条数（>1 时 accuracy 用 majority vote，需 --temperature>0）")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="采样温度（--n-samples>1 时必须 >0，否则 n 条生成相同无意义）")
     return p.parse_args(argv)
 
 
@@ -91,39 +103,84 @@ def build_prompts(problems: list[tuple[str, str]], style: str = "boxed",
     return prompts
 
 
-def _aggregate_budget(problems, outs, budget: int, label: str) -> dict:
+def _majority_answer(final_answers: list[str | None]) -> tuple[str | None, int]:
+    """final_answers 的众数（多数派答案）：去 None 后出现次数最多者 → (mode, count)。
+
+    平局取先出现者（3 条采样的典型 2-1/3-0/1-1-1 场景足够）；全 None → (None, 0)。
+    """
+    cnt: dict[str, int] = {}
+    order: list[str] = []
+    for fa in final_answers:
+        if fa is not None:
+            if fa not in cnt:
+                order.append(fa)
+            cnt[fa] = cnt.get(fa, 0) + 1
+    if not cnt:
+        return None, 0
+    best = order[0]
+    for k in order[1:]:
+        if cnt[k] > cnt[best]:
+            best = k
+    return best, cnt[best]
+
+
+def _aggregate_budget(problems, outs, budget: int, label: str,
+                      n_samples: int = 1) -> dict:
     """纯函数：vLLM RequestOutput 列表 → 聚合结果（可单测，不依赖 vLLM）。
 
     隐含协议（与 budget_eval 一致）：outcome=预算内自然产出正确最终答案；status 按
     finish_reason（stop=eos / length=budget_stop）显式区分；reasoning_tokens=生成 token 数。
+
+    n_samples=1（默认）：accuracy = 单条正确率（零回归，等价旧行为）；
+    n_samples>1：每条采样独立判分，accuracy = 多数派（majority vote）答案正确率；
+    rows 每 (problem, sample) 一行，带 sample_idx 与 majority_answer/majority_correct 标记；
+    eos/no_answer/avg_rt 按代表采样（sample 0）口径统计。
     """
     n_outcome = n_noans = n_eos = rt_sum = 0
     rows = []
     for (problem, gt), o in zip(problems, outs):
-        text = o.outputs[0].text
-        rt = len(o.outputs[0].token_ids)
-        is_eos = o.outputs[0].finish_reason == "stop"
-        fa = extract_final_answer(text)
-        ok = False
-        if fa is not None:
-            ok = _grade_answer_sympy(fa, gt)
+        comps = o.outputs
+        samps = []
+        for k, comp in enumerate(comps):
+            text = comp.text
+            rt = len(comp.token_ids)
+            is_eos = comp.finish_reason == "stop"
+            fa = extract_final_answer(text)
+            ok = False
+            if fa is not None:
+                ok = _grade_answer_sympy(fa, gt)
+            samps.append({"sample_idx": k, "status": "eos" if is_eos else "budget_stop",
+                          "reasoning_tokens": rt, "has_final_answer": fa is not None,
+                          "final_answer": fa, "outcome_correct": ok, "response": text})
+        if n_samples > 1:
+            mode, _n_agree = _majority_answer([s["final_answer"] for s in samps])
+            ok_maj = bool(_grade_answer_sympy(mode, gt)) if mode is not None else False
         else:
+            mode, ok_maj = None, samps[0]["outcome_correct"]
+        n_outcome += int(ok_maj)
+        if not samps[0]["has_final_answer"]:
             n_noans += 1
-        n_outcome += int(ok)
-        n_eos += int(is_eos)
-        rt_sum += rt
-        rows.append({"problem_id": len(rows), "budget": budget, "label": label,
-                     "status": "eos" if is_eos else "budget_stop",
-                     "reasoning_tokens": rt, "has_final_answer": fa is not None,
-                     "outcome_correct": ok, "ground_truth": gt,
-                     "final_answer": fa, "response": text})
-    Nn = len(rows)
+        n_eos += int(samps[0]["status"] == "eos")
+        rt_sum += samps[0]["reasoning_tokens"]
+        pid = len(rows)
+        for s in samps:
+            rows.append({"problem_id": pid, "budget": budget, "label": label,
+                         "sample_idx": s["sample_idx"],
+                         "status": s["status"],
+                         "reasoning_tokens": s["reasoning_tokens"],
+                         "has_final_answer": s["has_final_answer"],
+                         "outcome_correct": s["outcome_correct"], "ground_truth": gt,
+                         "final_answer": s["final_answer"], "response": s["response"],
+                         "majority_answer": mode,
+                         "majority_correct": ok_maj if n_samples > 1 else None})
+    Nn = len(problems)
     return {"label": label, "budget": budget, "n": Nn,
             "accuracy": n_outcome / Nn if Nn else 0.0,
             "eos_rate": n_eos / Nn if Nn else 0.0,
             "budget_stop_rate": (Nn - n_eos) / Nn if Nn else 0.0,
             "avg_reasoning_tokens": rt_sum / Nn if Nn else 0.0,
             "no_answer_rate": n_noans / Nn if Nn else 0.0,
+            "n_samples": n_samples,
             "rows": rows}
 
 
@@ -195,9 +252,11 @@ def main() -> None:
             prompts = base_prompts
         for B in budgets:
             t1 = time.time()
-            params = SamplingParams(temperature=0.0, max_tokens=B)
+            params = SamplingParams(temperature=args.temperature, max_tokens=B,
+                                    n=args.n_samples)
             outs = llm.generate(prompts, sampling_params=params)
-            res = _aggregate_budget(problems, outs, B, label)
+            res = _aggregate_budget(problems, outs, B, label,
+                                    n_samples=args.n_samples)
             res["seconds"] = round(time.time() - t1, 1)
             all_results.append(res)
             rows = res.pop("rows", [])

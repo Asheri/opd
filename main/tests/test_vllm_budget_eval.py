@@ -224,3 +224,60 @@ def test_merge_all_results_corrupted_file(tmp_path):
     assert len(merged) == 1
     assert merged[0]["label"] == "E1"
     assert merged[0]["budget"] == 2048
+
+
+def _out_multi(comps):
+    """多采样 RequestOutput：comps = [(text, toks, fr), ...] → 一个 o.outputs 列表。"""
+    o = _Out.__new__(_Out)
+    o.outputs = [_Out._Comp(*c) for c in comps]
+    return o
+
+
+def test_majority_answer_basic():
+    """众数：2-1 → 多数派答案；3 全不同 → 取先出现；全 None → (None,0)。"""
+    from vllm_budget_eval import _majority_answer
+    assert _majority_answer(["42", "42", "7"]) == ("42", 2)
+    assert _majority_answer(["1", "2", "3"])[1] == 1
+    assert _majority_answer([None, None]) == (None, 0)
+    assert _majority_answer(["42", None, "42"]) == ("42", 2)
+
+
+def test_aggregate_majority_2of3_correct():
+    """3 条采样 2 条相同正确答案 → majority 判定对（accuracy=1），rows 带 majority 标记。"""
+    problems = [("p0", "42")]
+    outs = [_out_multi([
+        ("steps\n\\boxed{42}", [1, 2, 3], "stop"),
+        ("other\n\\boxed{42}", [1, 2, 3], "stop"),
+        ("wrong\n\\boxed{7}", [1, 2, 3], "stop"),
+    ])]
+    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3)
+    assert r["accuracy"] == 1.0
+    assert r["n_samples"] == 3
+    assert r["n"] == 1
+    assert len(r["rows"]) == 3
+    assert r["rows"][0]["majority_answer"] == "42"
+    assert r["rows"][0]["majority_correct"] is True
+
+
+def test_aggregate_majority_no_consensus():
+    """3 条全不同答案 → 无多数派 → 判错。"""
+    problems = [("p0", "42")]
+    outs = [_out_multi([
+        ("a\n\\boxed{1}", [1, 2, 3], "stop"),
+        ("b\n\\boxed{2}", [1, 2, 3], "stop"),
+        ("c\n\\boxed{3}", [1, 2, 3], "stop"),
+    ])]
+    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3)
+    assert r["accuracy"] == 0.0
+
+
+def test_aggregate_n1_backward_compat():
+    """n_samples=1 行为与旧版一致（单条判定，无 majority 字段污染）。"""
+    problems = [("p0", "42"), ("p1", "7")]
+    outs = [_out_multi([("x\n\\boxed{42}", [1, 2, 3], "stop")]),
+            _out_multi([("y", [1, 2], "length")])]
+    r = _aggregate_budget(problems, outs, 512, "Base")
+    assert r["accuracy"] == 0.5
+    assert r["n"] == 2
+    assert r["n_samples"] == 1
+    assert r["rows"][0]["majority_correct"] is None
