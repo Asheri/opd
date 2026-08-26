@@ -117,3 +117,51 @@ python scripts/vllm_budget_eval.py --models 'E1=...' --budgets 2048 \
 - `/root/autodl-tmp/chat_retest/B512/{Base,E1,E2}__MATH500__B512.jsonl` + `all_results.json`
 - `/root/autodl-tmp/chat_retest/smoke/Base__MATH500__B512.jsonl`（首验冒烟 3 行）
 - `/root/autodl-tmp/aime_eval_chat/{Base,E1,E2}/AIME24.jsonl`（进行中）
+
+---
+
+## 7. E 系列判别实验（归因分析 §5，2026-08-26 服务器执行）
+
+> 依据 `docs/reports/2026-08-26-opd-failure-analysis.md`；脚本 commit `81b227e`（E-1b 两处 bug 修复 `99c4d89`）。
+
+### E-0b 导出健全性（export_sanity_check.py）
+- config.json 差异 3 键均为无害字段表示差异（`torch_dtype`↔`dtype` 等价、`layer_types` 架构字段）；generation_config.json 完全一致 → **导出健全，排除损坏**。
+
+### E-0c 拐点扫描（E2 step_120/200 从旧实例拷贝到位后，B2048 chat，500 条）
+| step | acc | no_answer | 判定 |
+|---|---|---|---|
+| Base | 0.424 | 0.0% | 参考 |
+| S120 | 0.392 | 0.6% | ≈Base（差 0.03 < 0.05） |
+| **S200** | **0.406** | 1.0% | ≈Base（序列峰值） |
+| S311 | 0.288 | 1.2% | **显著劣化（-0.136）** |
+
+→ **拐点在 step_200 附近**：120-200 平台 ≈Base、200 后大幅劣化 → **RC3（漂移/过拟合）为主放大器，早停+收紧 KL 可救**；信号非"从头坏"（RC1/RC4 不作为"从头坏"主嫌）。
+
+### E-0d on-policy 占比（onpolicy_share.py，E2 正式训练 metrics.csv）
+- `pool` 列：312 步 base（空标记）+ **12 步 refresh（3.7%）** → **F3 证实：静态 base 重放主导（96.3%）** → RC1（固定 D）结构性偏差成立。
+
+### E-1a 教师对体检（B2048 chat，500 条）
+| 教师 | acc |
+|---|---|
+| JustRL（rl） | 0.358 |
+| **R1Distill（ref）** | **0.492** |
+
+- `rl < ref`（差 0.134）——**按论文反证（R1-Distill-7B 56.7% > JustRL-1.5B 51.3%，Direct-OPD 仍 +6.4）："rl 教师绝对能力低于 ref"是论文标准成功配置，不构成 RC4 证据**（Δ_T 捕捉的是 RL 增量方向而非"模仿更强模型"）；E-1a 原始判据"rl<ref → 方向存疑"据此修正。
+
+### E-1b Δ↔correct 相关性（决定性，200 题 × 4 采样 = 800 条）
+| 指标 | 值 |
+|---|---|
+| **Spearman ρ** | **0.1765** |
+| AUC | 0.6037 |
+| mean_delta | -0.0954 |
+| acc | 0.4075 |
+
+- **判定（写死）：0.05 ≤ ρ < 0.2 → 分支 B2（弱信号 → 信号改造）**。
+- 解读：ρ>0 且 AUC>0.5 → Δ 增量**携带一定正确性语义**（论文路径部分成立，非纯风格 RC4）；但 ρ<0.2 → **强度不足**，单靠当前信号不足以达到论文式提升。
+- 结合全链：E-0c（漂移过拟合）+ E-0d（固定 D 主导）+ E-1b（弱信号）→ **推荐组合修复：B2 信号改造（序列级 Δ + correctness 混合权重 reward=α·correct+β·Δ_seq）+ A1 on-policy 化（refresh 变主食）**，止损线 120 步、下游 100 题子集每 50 步探针。
+
+### 产物
+- `/root/autodl-tmp/delta_corr/{samples,logp_rl,logp_ref}.jsonl`（各 800 行）+ `report.json`
+- `/root/autodl-tmp/chat_retest/E2_steps_B2048/{Base,S120,S200,S311}__MATH500__B2048.jsonl`
+- `/root/autodl-tmp/chat_retest/teacher_B2048/{JustRL,R1Distill}__MATH500__B2048.jsonl`
+- 导出目录：`/root/autodl-tmp/exported/e2_s120`、`e2_s200`（E2 step_120/200 HF 导出）
