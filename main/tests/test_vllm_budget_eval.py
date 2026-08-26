@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from vllm_budget_eval import _aggregate_budget, build_prompts
+from vllm_budget_eval import _aggregate_budget, build_prompts, parse_args
 from fullstack_opd_v2.budget_eval import wrap_chat, format_prompt
 
 
@@ -55,6 +55,37 @@ def test_build_prompts_chat():
     assert msgs == [{"role": "user", "content": bare}]
     assert kw["add_generation_prompt"] is True
     assert kw["tokenize"] is False
+
+
+def test_build_prompts_chat_preserves_order():
+    """多条 problems 逐条包裹、顺序保持，每条 content=format_prompt 结果。"""
+    tok = _FakeTok()
+    problems = [("q0", "a0"), ("q1", "a1"), ("q2", "a2")]
+    got = build_prompts(problems, "boxed", tok=tok)
+    assert len(got) == 3
+    for i, (q, _) in enumerate(problems):
+        bare = format_prompt(q, "boxed")
+        assert got[i] == "<|im_start|>user\n" + bare + "<|im_end|>\n<|im_start|>assistant\n"
+    assert [m[0]["content"] for m, _ in tok.calls] == \
+        [format_prompt(q, "boxed") for q, _ in problems]
+
+
+def test_parse_args_chat_template_default_off():
+    """默认 --chat-template=False、--tokenizer=None（零回归关键：默认裸 prompt）。"""
+    a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x"])
+    assert a.chat_template is False
+    assert a.tokenizer is None
+
+
+def test_parse_args_chat_template_on():
+    a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x", "--chat-template"])
+    assert a.chat_template is True
+
+
+def test_parse_args_tokenizer_explicit():
+    a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x",
+                    "--tokenizer", "/tok/here"])
+    assert a.tokenizer == "/tok/here"
 
 
 class _Out:
@@ -111,6 +142,30 @@ def test_aggregate_sympy_equivalence():
     outs = [_Out("simplify\\n\\\\boxed{0.5}", [7], "stop")]
     r = _aggregate_budget(problems, outs, 256, "E2")
     assert r["accuracy"] == 1.0
+
+
+def test_aggregate_eos_no_answer():
+    """eos 自然停止但未给出 \\boxed 答案：eos_rate=1 但 no_answer=1、accuracy=0。
+    对照 H9：no_answer 与 eos 解耦——训练学生长推理在 B512 截断前 eos=0 才被低估。"""
+    problems = [("p0", "42")]
+    outs = [_Out("reasoning only, no boxed answer", [1, 2, 3], "stop")]
+    r = _aggregate_budget(problems, outs, 256, "E2")
+    assert r["eos_rate"] == 1.0
+    assert r["no_answer_rate"] == 1.0
+    assert r["accuracy"] == 0.0
+    assert r["rows"][0]["status"] == "eos"
+
+
+def test_aggregate_budget_stop_with_answer():
+    """预算截断（length）但已产出 \\boxed 答案：budget_stop 也能得分、no_answer=0。
+    对照 H9：截断 ≠ 无答案——Base 用捷径在截断前给出答案故 B512 不伤，学生被截断于推理中。"""
+    problems = [("p0", "42")]
+    outs = [_Out("short steps\\n\\\\boxed{42} then cut", [1, 2, 3, 4, 5], "length")]
+    r = _aggregate_budget(problems, outs, 256, "E2")
+    assert r["budget_stop_rate"] == 1.0
+    assert r["no_answer_rate"] == 0.0
+    assert r["accuracy"] == 1.0
+    assert r["rows"][0]["status"] == "budget_stop"
 
 
 def test_aggregate_empty():

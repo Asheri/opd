@@ -3,7 +3,7 @@
 > **状态：服务器恢复后执行**（服务器已关闭、SSH 暂缓；本清单为恢复后唯一执行依据，零决策、按序门控）。
 >
 > 前置事实（本地已完成的实现与审计，勿在服务器重做）：
-> - vllm_budget_eval 已加 `--chat-template`/`--tokenizer` + `build_prompts` 纯函数；budget_eval 已加 `wrap_chat`；单测 8 例通过（后扩至 14 例）。
+> - vllm_budget_eval 已加 `--chat-template`/`--tokenizer` + `build_prompts` 纯函数（parse_args 支持 argv 注入）；budget_eval 已加 `wrap_chat`；单测 **14 例通过**（CLI 默认零回归 / tokenizer 覆盖 / chat 顺序 / eos·budget_stop 与 no_answer 解耦对照）。
 > - export_student_ckpt.py 支持任意中间 step 手动导出（纯路径驱动、服务器可直接用），批量导出为可选增强（本清单用三次单步导出即可，不做）。
 > - prepare_skywork_responses.py 500→2000 补生成无需任何代码改动（`--max-samples 1500 --seed S --apply-chat-template` 即可），重建 cache 自动按 jsonl 非空行数走。
 > - 全量回归 532 passed（本地）。

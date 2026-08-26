@@ -28,7 +28,7 @@ from fullstack_opd_v2.budget_eval import BudgetEvaluator
 from fullstack_opd_v2.eval_aime import _grade_answer_sympy
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--device", default="cuda:1")
     p.add_argument("--models", required=True, help="Label=path[,Label2=path2...]")
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tokenizer", default=None,
                    help="chat 模板 tokenizer 路径；默认取各模型自身路径（三模型同族分词器，"
                         "按模型路径加载最稳）")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _load_problems(dataset_ref: str, n_limit: int | None):
