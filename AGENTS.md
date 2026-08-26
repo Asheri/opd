@@ -169,6 +169,23 @@ vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。L2 �
 - 决策顺序：先判断任务是否可分片 → 可分片则**优先并行**；只有任务本身有顺序依赖 / 显存或
   通信瓶颈使并行无收益 / 用户显式指定单卡时，才回退单卡，且应说明原因。
 
+## 训练产物不可再生约束（metrics / 断点 / jsonl）
+
+**训练与评估产出的 metrics.csv、checkpoint、jsonl 是唯一事实来源，一旦丢失无法重建**。
+教训（2026-08-26 诊断报告记录）：E1 训练 metrics.csv 因「resume 重复截断 + 清理失误」
+只保留 step 0-179，step 180-299 共 120 步 eval_reward 永久丢失，只能靠 monitor.sh
+监控记录补救——**永远不许再发生**。
+
+- **resume 续跑前必须备份 metrics**：`run_s2_real.py` 的 `_truncate_metrics_csv` 是
+  破坏性操作（把 metrics.csv 截断到断点前）。**代码已内置自动备份**：`--resume`
+  续跑前自动 `cp metrics.csv → metrics_pre_resume_step<N>.csv`（已存在不覆盖），
+  无需手工备份；任何手工清理仍需先确认备份/监控记录存在，无备份禁止删。
+- **任何清理/覆盖/删除 run-dir、metrics.csv、checkpoint、评估 jsonl 前，先检查目标**：
+  确认已有备份或监控记录可替代才允许删除；不确定就不删，先问。
+- **监控是 metrics 的兜底**：训练期间保持 monitor.sh 抓取 eval_reward 等关键指标
+  （metrics 丢失后唯一可恢复的曲线来源）；监控输出定期归档，不随手清理。
+- **不伪造**：metrics 缺段时如实标注 N/A 与数据来源（监控 or csv），绝不编造数字填补。
+
 ## 全局网络资源约束（HF / GitHub 超时）
 
 **当 HuggingFace / GitHub 等外网连接超时或不可达时，必须考虑使用学术资源加速**：
