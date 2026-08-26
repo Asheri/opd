@@ -167,3 +167,37 @@ python scripts/vllm_budget_eval.py --models 'E1=...' --budgets 2048 \
 - `/root/autodl-tmp/chat_retest/E2_steps_B2048/{Base,S120,S200,S311}__MATH500__B2048.jsonl`
 - `/root/autodl-tmp/chat_retest/teacher_B2048/{JustRL,R1Distill}__MATH500__B2048.jsonl`
 - 导出目录：`/root/autodl-tmp/exported/e2_s120`、`e2_s200`（E2 step_120/200 HF 导出）
+
+---
+
+## 8. B8192@3 终验口径升级（2026-08-27，用户提议 + 教师对验证）
+
+> 用户提议：后续评测全部改 B8192@3（majority vote、T=0.7）。vllm_budget_eval 加 `--n-samples`/`--temperature` + majority 聚合（commit `77203cf`，n=1 零回归）。
+
+### B8192@3 教师对验证（JustRL/R1Distill，500 题，majority vote）
+| 教师 | B2048 n=1 | B4096 n=1 | **B8192@3 majority** | avg_rt | 截断率 |
+|---|---|---|---|---|---|
+| JustRL（rl） | 0.358 | 0.620 | **0.872** | 3905 | 10.2% |
+| R1Distill（ref） | 0.492 | 0.624 | 0.820 | 3962 | 18.2% |
+
+**三大结论**：
+1. **JustRL 反超 R1Distill（0.872 vs 0.820）**——用户观点验证：rl 教师确实更强，B2048"rl<ref"是彻底预算假象；
+2. **预算充分**：截断率 10-18%（avg_rt 3900-3960、eos 82-90%），B8192 基本释放；
+3. **Δ_T 方向正确**：指向更强的 rl 教师 → B2048 域 ρ=0.1765（弱信号）很可能是**截断域假象**，非截断域信号可能大幅增强（待 E-1b' 验证）。
+
+**R2 合并写实战通过**：双进程并写同一 out-dir → all_results.json 含 2 模型。
+
+### AIME24 chat 终验（B4096 n=1，2026-08-27）
+| 模型 | acc（pass@1） | 正确题数 |
+|---|---|---|
+| Base | 0.033 | 1/30 |
+| E1 | 0.000 | 0/30 |
+| E2 | 0.000 | 0/30 |
+
+- 难题场景 pass@1 区分度极低（0-1 题）→ **总验收 #2（E2≥Base）未达成**（greedy 口径）；
+- 支持终验升级 B8192@3（进行中：MATH500 三模型 B8192@3 + AIME24 B8192@3，majority 口径）。
+
+### 进行中
+- MATH500 三模型 B8192@3 终验（`/root/autodl-tmp/chat_retest/final_B8192_3/`）
+- AIME24 三模型 B8192@3 终验（vllm_budget_eval --dataset AIME24，majority 口径）
+- E-1b'（非截断域 Δ 相关性，验证 ρ 是否 >0.2 → 分支 A）
