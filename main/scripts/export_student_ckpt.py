@@ -24,8 +24,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="Qwen__Qwen3-1.7B",
                    help="HF 骨架（与训练同架构/词表）")
     p.add_argument("--device", default="cpu",
-                   help="导出全程设备（默认 cpu：纯权重搬运无需 GPU，"
-                        "避免与并行评估抢卡 OOM；可传 cuda:i 显式占卡）")
+                   help="导出设备（默认 cpu：显式契约，纯权重搬运无需 GPU；可传 cuda:i）")
     return p.parse_args()
 
 
@@ -35,9 +34,9 @@ def main() -> None:
     state = ckpt["state"]
     print(f"加载断点 {args.ckpt}: step={ckpt.get('step')} 权重 {len(state)} 项")
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    # device_map=args.device：默认 cpu——from_pretrained 无 device 时默认落 cuda:0，
-    # 与并行评估（Step 2 第二轮 E1 占 GPU0）同时跑会 OOM；导出仅 load_state_dict+save，
-    # 全程 CPU 最稳（--device cuda:i 可显式占某张空闲卡）。
+    # device_map=args.device：默认 cpu——导出仅 load_state_dict + save_pretrained，
+    # 纯权重搬运无需 GPU；显式 device_map 把设备选择从 transformers 隐式默认
+    # （CPU 加载）变成显式契约，可选 cuda:i 上卡（显存充足时略快，非必需）。
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map=args.device)
     model.load_state_dict(state, strict=True)
