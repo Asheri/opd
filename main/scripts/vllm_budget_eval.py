@@ -12,6 +12,10 @@
 用法（双卡并行，vLLM 用独立卡）：
   python vllm_budget_eval.py --device cuda:1 --models "Base=...,E1=..." \
       --budgets 256,512,1024 --dataset MATH500 --n-limit 50 --out-dir <dir> [--fp8] [--draft ...]
+
+同一 --out-dir 可多次调用/多进程分模型并写：all_results.json 按 (label, budget)
+合并写 + 原子替换（重跑幂等）——E-0c 拐点扫描逐模型调用与 B2048 2+1 分卡
+不再互相覆盖（每 (label,budget) 的 jsonl 仍是唯一事实来源）。
 """
 from __future__ import annotations
 
@@ -123,6 +127,32 @@ def _aggregate_budget(problems, outs, budget: int, label: str) -> dict:
             "rows": rows}
 
 
+def _merge_all_results(out_dir: str, new_results: list[dict]) -> list[dict]:
+    """读已有 all_results.json 按 (label, budget) 合并新结果后返回（合并写，不覆盖）。
+
+    - 同 (label, budget) 旧条目被新结果替换（重跑幂等）；
+    - 其它 label/budget 的旧条目保留：同 out-dir 多次调用（拐点扫描逐模型）与
+      多进程分模型并写（B2048 式 2+1 分卡）都不再互相覆盖；
+    - 已有文件不存在/损坏/非 list -> 视为空（不因旧产物损坏崩评估）。
+    输出按 (label, budget) 排序，保证确定性。
+    """
+    path = os.path.join(out_dir, "all_results.json")
+    merged: dict[tuple, dict] = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = json.load(f)
+            if isinstance(old, list):
+                for r in old:
+                    if isinstance(r, dict) and "label" in r and "budget" in r:
+                        merged[(r["label"], r["budget"])] = r
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            pass                       # 旧产物损坏：视为空，不崩
+    for r in new_results:
+        merged[(r["label"], r["budget"])] = r
+    return [merged[k] for k in sorted(merged)]
+
+
 def main() -> None:
     args = parse_args()
     _apply_cuda_visible(args.device)   # 选卡必须在 import vllm / LLM() 之前生效
@@ -180,8 +210,11 @@ def main() -> None:
         del llm
         import torch
         torch.cuda.empty_cache()
-    with open(os.path.join(args.out_dir, "all_results.json"), "w", encoding="utf-8") as f:
-        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    merged = _merge_all_results(args.out_dir, all_results)
+    tmp = os.path.join(args.out_dir, "all_results.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, os.path.join(args.out_dir, "all_results.json"))  # 原子替换防半写
     print("DONE", flush=True)
 
 
