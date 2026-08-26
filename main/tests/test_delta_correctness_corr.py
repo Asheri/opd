@@ -134,3 +134,29 @@ def test_judge_response_boxed_correct():
 def test_judge_response_no_answer():
     assert judge_response("no answer here", "42") is False
     assert judge_response("", "42") is False
+
+
+def test_spearman_perfect_positive():
+    """单调递增 → ρ=1（手写，不依赖 scipy）。"""
+    from delta_correctness_corr import _spearman
+    rho, _ = _spearman([1, 2, 3, 4, 5], [10, 20, 30, 40, 50])
+    assert abs(rho - 1.0) < 1e-9
+
+
+def test_spearman_perfect_negative():
+    from delta_correctness_corr import _spearman
+    rho, _ = _spearman([1, 2, 3, 4, 5], [50, 40, 30, 20, 10])
+    assert abs(rho + 1.0) < 1e-9
+
+
+def test_spearman_ties_average_rank():
+    """并列取平均秩：手算验证（x=[1,1,2,3], y=[1,2,2,4] → rx=[1.5,1.5,3,4], ry=[1,2.5,2.5,4], ρ=3.75/4.5=0.8333）。"""
+    from delta_correctness_corr import _spearman
+    rho, _ = _spearman([1, 1, 2, 3], [1, 2, 2, 4])
+    assert abs(rho - 0.8333) < 1e-3
+
+
+def test_spearman_no_correlation():
+    from delta_correctness_corr import _spearman
+    rho, _ = _spearman([1, 2, 3, 4, 5, 6], [6, 1, 5, 2, 4, 3])
+    assert abs(rho) < 0.4

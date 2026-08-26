@@ -112,19 +112,56 @@ def _auc_pos_neg(deltas: list[float], corrects: list[bool]) -> float:
     return u / (len(pos) * len(neg))
 
 
+def _spearman(x: list[float], y: list[float]) -> tuple[float, float | None]:
+    """手写 Spearman 秩相关（纯 Python，不依赖 scipy；并列取平均秩）。
+
+    返回 (rho, p)：p 在 scipy 可用时给出，否则 None（判据只用 rho）。
+    2026-08-26 实测：服务器缺 scipy，scipy.spearmanr 抛 ImportError 被旧实现
+    吞成 rho=0.0/p=1.0 的假阴性——故改手写。
+    """
+    n = len(x)
+    if n < 3:
+        return 0.0, None
+
+    def _rank(v: list[float]) -> list[float]:
+        order = sorted(range(n), key=lambda i: v[i])
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and v[order[j + 1]] == v[order[i]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0          # 平均秩（1-based）
+            for k in range(i, j + 1):
+                ranks[order[k]] = avg
+            i = j + 1
+        return ranks
+
+    rx, ry = _rank(x), _rank(y)
+    mx = my = sum(rx) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx = sum((a - mx) ** 2 for a in rx)
+    vy = sum((b - my) ** 2 for b in ry)
+    denom = (vx * vy) ** 0.5
+    rho = cov / denom if denom else 0.0
+    p = None
+    try:
+        from scipy.stats import spearmanr
+        _, p = spearmanr(x, y)
+        p = float(p)
+    except Exception:
+        p = None
+    return rho, p
+
+
 def correlate(deltas: list[float], corrects: list[bool]) -> dict:
     """Spearman ρ + AUC + 基础统计（判据由调用方对照 §5 E-1b 表执行）。"""
     n = len(deltas)
     if n < 3:
-        return {"n": n, "spearman_rho": 0.0, "spearman_p": 1.0,
+        return {"n": n, "spearman_rho": 0.0, "spearman_p": None,
                 "auc": 0.5, "mean_delta": 0.0, "acc": 0.0}
-    try:
-        from scipy.stats import spearmanr
-        rho, p = spearmanr(deltas, corrects)
-        rho, p = float(rho), float(p)
-    except Exception:
-        rho, p = 0.0, 1.0
-    return {"n": n, "spearman_rho": round(rho, 6), "spearman_p": round(p, 6),
+    rho, p = _spearman(deltas, corrects)
+    return {"n": n, "spearman_rho": round(rho, 6), "spearman_p": p,
             "auc": round(_auc_pos_neg(deltas, corrects), 6),
             "mean_delta": round(sum(deltas) / n, 6),
             "acc": round(sum(corrects) / n, 6)}
@@ -240,7 +277,9 @@ def _logp_stage(args) -> None:
     rows: list[dict] = []
     for idx, (sid, s) in enumerate(todo):
         out = llm.generate([s["full_seq"]], sampling_params=sp)[0]
-        pl = _extract_prompt_logprobs(out.outputs[0].prompt_logprobs)
+        # vLLM API：prompt_logprobs 在 RequestOutput 顶层（SamplingParams.prompt_logprobs>0 时
+        # 填充），不在 CompletionOutput 上（后者无此属性——2026-08-26 实测 AttributeError）。
+        pl = _extract_prompt_logprobs(out.prompt_logprobs)
         rows.append({"sample_idx": sid, "problem_id": s["problem_id"], "logps": pl})
         if len(rows) >= args.chunk:
             _append_rows(out_path, rows)
