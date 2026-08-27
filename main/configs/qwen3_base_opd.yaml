@@ -1,0 +1,104 @@
+# Qwen3 Base→Instruct OPD 机制验证配置（论文对齐版，2026-08-27）
+#
+# 依据：docs/directOPD_analysis.md（Direct-OPD 论文）+ docs/reports/2026-08-27-opd-final-report.md
+#       （旧对复现失败定稿）+ docs/plans/2026-08-27-newpair-mechanism-validation.md（审阅修正）。
+#
+# 核心：旧对（JustRL/R1Distill）shift 仅 +0.05 且学生起点≈教师上限；换 Qwen3 Base（学生/ref）
+#       → Instruct（rl 教师）大 shift 对。Δ_T = logπ_instruct − logπ_Base = post-training
+#       偏移 = 能力提升方向（机制验证，非逐字复现）。
+#
+# 论文对齐（Table 3）：KL adaptive（§2.4 Eq.16，默认 [0.5,2.5]/ε=0.01/α0=1.0）、
+#   student top-k=16、lr=1e-6、rollout n=4、max response length=2048（§4.2 短视界最稳）、
+#   on-policy D（学生自身 rollout，materialized 5000 锚点池 + refresh 在线）。
+#
+# 用法（服务器恢复后，Phase 0 双门控通过才训练）：
+#   建缓存：python -m fullstack_opd_v2 cache --config configs/qwen3_base_opd.yaml \
+#             --set stage1.load_cache=false --device cuda:0 --out /root/autodl-tmp/cache_qwen3_base_opd_t16.pt
+#   训练：  python scripts/run_s2_real.py --config configs/qwen3_base_opd.yaml \
+#             --run-dir /root/autodl-tmp/runs_newpair/e1_opd2048 --names S2_E2_opd1024 \
+#             --device cuda:0 --n-steps 120 --eos-id <0b 定档>
+#             --set stage2.rollout_engine=vllm --set l2.rollout.max_new_tokens=2048 \
+#             --set stage2.gradient_checkpointing=true --set l2.rollout.repetition_penalty=1.0
+
+model_kind: hf
+student_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base      # 学生 = Base（预训练）
+teacher_rl_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B       # rl 教师 = Instruct（SFT+RLHF）
+teacher_ref_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base  # ref 教师 = 学生初始（KL 锚点天然重合）
+
+dtype: bf16
+cache_mode: topk
+offload_to_cpu: true
+# Stage 1：统一 K 存储架构。top_k=16 = Direct-OPD 论文 student top-k support（2026-08-27）。
+# 改 K 必须重建磁盘缓存（verify_consistency 校验 metadata.top_k）。
+cache:
+  top_k: 16
+  storage: disk
+
+# ---- 数据：Skywork 50K prompt universe；D = Base 学生 on-policy rollout（5000 锚点池）----
+dataset:
+  type: jsonl
+  path: /root/autodl-tmp/datasets/skywork_50k_base5000.jsonl   # 复制+清空后由 Base 生成
+  prompt_key: prompt
+  response_key: response
+  max_prompt_len: 1024            # 对齐论文 MAX_PROMPT_LENGTH
+  max_response_len: 2048          # 论文短视界（§4.2 最稳；非旧 4096）
+  tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B     # 同族 tokenizer（instruct 模板）
+  prompt_universe_size: 50000
+
+base:
+  materialized_size: 5000         # on-policy 锚点池（用户决策；配 refresh 在线扩充）
+
+stage0:
+  n_rl_steps: 20                  # hf 路径跳过 Stage0 RL，仅占位
+
+stage1:
+  enforce_teacher_consistency: true
+  cache_path: /root/autodl-tmp/cache_qwen3_base_opd_t16.pt
+  load_cache: false               # 首次建缓存 false；训练阶段置 true
+  build_batch_size: 8
+  warmup_M: 0
+  warmup_source: none
+  warmup_temperature: 1.0
+
+stage2:
+  scheduling_mode: fully_async
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 1.0                # adaptive KL 初始值 α0（论文区间 [0.8,2.0] 中值）
+  kl_adaptive: true               # 论文 §2.4 Eq.16：按稠密 reward 符号动态调（默认 false 零回归）
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 1.0e-6                      # 论文（旧 3e-5 快 30 倍）
+  n_steps: 120                    # 止损线（E-0c 教训；可通过后延 300）
+  batch_size: 4
+  distributed: false
+  rollout_engine: toy             # 训练由 run_s2_real --set stage2.rollout_engine=vllm 覆盖
+  renormalize_topk_support: true  # 对齐原始 Direct-OPD 稀疏支撑归一化
+  delta_clip: 2.0
+  dtype: bf16
+  offload_to_cpu: false
+
+l2:
+  rollout:
+    max_new_tokens: 2048          # 论文短视界（覆盖矩阵 1024）
+    n_rollout: 4                  # 论文 rollout n=4（每 prompt 独立采样 4 条，on-policy）
+    temperature: 1.0              # 论文 Table 3
+    repetition_penalty: 1.0
+    loop_detection: true
+    loop_periods: [2, 3, 4]
+    rollout_source: student
+
+run:
+  checkpoint_every: 20            # step20/40/.../120 共 6 断点（拐点扫描）
+
+eval:
+  model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  n_samples: 32                   # 论文主指标 ave@32（辅助口径）
+  temperature: 0.7
+  max_new_tokens: 8192
+  top_p: 0.95
+  metric: ave
+  prompt_style: boxed
+  scoring: sympy
+  chat_template: true
+  attn_implementation: flash_attention_2

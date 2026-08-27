@@ -152,3 +152,31 @@ def expected_reward(dists: torch.Tensor, delta: torch.Tensor,
     if mask is not None:
         rm = rm * mask
     return rm
+
+
+class AdaptiveKLController:
+    """Direct-OPD 论文 §2.4 自适应 KL 控制（Eq.16）。
+
+    α_{m+1} = clip(α_m·(1 + ε·sgn(r̄_m)), α_min, α_max),  sgn(0)=0
+    r̄_m = 该步 batch 内学生加权 Δ 均值（梯度实际优化的稠密 reward 均值）。
+    默认 ε=0.01、[α_min, α_max]=[0.5, 2.5]、α_0=1.0（论文 Table 3 邻近值）。
+    语义：r̄_m>0（教师 RL 平均提升保留 token）→ 增大 α 抑制过放大；
+    r̄_m<0 → 减小 α 削弱锚点，让梯度把概率移离被教师抑制的 token。
+    纯 Python 纯函数语义（不依赖 torch），可单测。
+    """
+
+    def __init__(self, alpha0: float = 1.0, eps: float = 0.01,
+                 alpha_min: float = 0.5, alpha_max: float = 2.5):
+        self.alpha = float(alpha0)
+        self.eps = float(eps)
+        self.alpha_min = float(alpha_min)
+        self.alpha_max = float(alpha_max)
+
+    def step(self, mean_delta: float) -> float:
+        """按该步 batch 的稠密 reward 均值（r̄_m）更新 α，返回新 α。sgn(0)=0 不更新。"""
+        if mean_delta > 0:
+            self.alpha *= (1.0 + self.eps)
+        elif mean_delta < 0:
+            self.alpha *= (1.0 - self.eps)
+        self.alpha = min(self.alpha_max, max(self.alpha_min, self.alpha))
+        return self.alpha

@@ -60,6 +60,9 @@ class Stage2Cfg(_Strict):
     staleness_threshold: int = 4
     queue_size: int = 8
     kl_reg_coef: float = 0.05
+    # Direct-OPD 论文 §2.4 adaptive KL（Eq.16）：true 时 kl_coef 由自适应控制器按稠密
+    # reward 符号动态调整（忽略 kl_reg_coef 固定值）；默认 false 零回归（固定 KL）。
+    kl_adaptive: bool = False
     clip_eps: float = 0.2
     grad_clip: float = 1.0
     lr: float = 1e-3
@@ -180,6 +183,9 @@ class L2RolloutCfg(_Strict):
     rollout_source: Literal["student", "teacher"] = "student"
     pad_id: int = 0                    # 变长 batch 右 pad 值（不参与判定，仅占位）
     token_budget_per_refresh: int | None = None   # §六：每轮刷新全局 rollout token 预算；None=无上限
+    # Direct-OPD 论文 rollout n（Table 3：rollout n=4）：每 prompt 每次 refresh 生成 n 条
+    # on-policy 响应（每条独立算 Δ/status，per-prompt 聚合）；=1 零回归（旧单条行为）。
+    n_rollout: int = 1
 
 
 class L2DisagreementCfg(_Strict):
@@ -336,7 +342,9 @@ class CacheCfg(_Strict):
     """Stage 1 统一 K 存储架构（解决 50K×8192 cache memory wall）。
 
     top_k：统一 K（teacher/student/ref 支撑默认同源）。用户指定实验取值范围
-      K∈{32,64,128,256}（磁盘 mmap 驻留下可选）；0 = dense 模式。
+      K∈{16,32,64,128,256}（磁盘 mmap 驻留下可选）；0 = dense 模式。
+      16 为 Direct-OPD 论文 student top-k support（2026-08-27 论文对齐增加）；
+      改 K 必须重建磁盘缓存（verify_consistency 校验 metadata.top_k）。
     storage：磁盘 mmap 驻留（本阶段目标，§3）——GPU/RAM 只驻当前 batch 行；
       "memory" 显式保留原全量驻留路径（直接构造 TensorTeacherCache 的测试不受影响）。
       dense 模式忽略 storage。
@@ -347,8 +355,8 @@ class CacheCfg(_Strict):
     @field_validator("top_k")
     @classmethod
     def _topk_allowed(cls, v: int) -> int:
-        if v not in (0, 32, 64, 128, 256):
-            raise ValueError(f"cache.top_k 仅允许 0/32/64/128/256（0=dense），收到 {v}")
+        if v not in (0, 16, 32, 64, 128, 256):
+            raise ValueError(f"cache.top_k 仅允许 0/16/32/64/128/256（0=dense），收到 {v}")
         return v
 
 
