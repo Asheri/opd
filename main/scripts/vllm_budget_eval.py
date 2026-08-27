@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fullstack_opd_v2.budget_eval import extract_final_answer, format_prompt, wrap_chat
 from fullstack_opd_v2.budget_eval import BudgetEvaluator
-from fullstack_opd_v2.eval_aime import _grade_answer_sympy
+from fullstack_opd_v2.eval_aime import _grade_answer_sympy, extract_answer
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,8 +49,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--fp8", action="store_true", help="vLLM 用 float8 量化（Blackwell）")
     p.add_argument("--draft", default=None, help="投机解码 draft 小模型路径")
-    p.add_argument("--max-model-len", type=int, default=12288,
-                   help="vLLM max_model_len（默认 12288 覆盖 B8192+prompt；旧 B512/2048 亦兼容）")
+    p.add_argument("--max-model-len", type=int, default=32768,
+                   help="vLLM max_model_len（默认 32768 覆盖论文 AIME 31744+1024 协议；"
+                        "旧 B8192/B2048 亦兼容；96GB 卡 1.7B 无压力）")
+    p.add_argument("--metric", choices=["majority", "ave"], default="majority",
+                   help="聚合口径：majority（默认，多数票全有/全无）/ ave（论文 ave@k："
+                        "每题 n 采样答对比例的平均，部分学分；配 --n-samples 32 即 ave@32）")
+    p.add_argument("--prompt-style", choices=["boxed", "dapo"], default="boxed",
+                   help="prompt 模板与答案提取：boxed（默认，\\boxed{}）/ dapo（论文附录 A "
+                        "Answer: 模板，答案取最后一行 Answer: 数字）")
     p.add_argument("--gpu-mem", type=float, default=0.9)
     p.add_argument("--chat-template", action="store_true",
                    help="用模型 chat template 包裹 prompt（对齐训练 apply_chat_template=true，"
@@ -125,18 +132,23 @@ def _majority_answer(final_answers: list[str | None]) -> tuple[str | None, int]:
 
 
 def _aggregate_budget(problems, outs, budget: int, label: str,
-                      n_samples: int = 1) -> dict:
+                      n_samples: int = 1, metric: str = "majority",
+                      style: str = "boxed") -> dict:
     """纯函数：vLLM RequestOutput 列表 → 聚合结果（可单测，不依赖 vLLM）。
 
     隐含协议（与 budget_eval 一致）：outcome=预算内自然产出正确最终答案；status 按
     finish_reason（stop=eos / length=budget_stop）显式区分；reasoning_tokens=生成 token 数。
 
     n_samples=1（默认）：accuracy = 单条正确率（零回归，等价旧行为）；
-    n_samples>1：每条采样独立判分，accuracy = 多数派（majority vote）答案正确率；
+    n_samples>1 + metric="majority"（默认）：多数派（majority vote）答案正确率；
+    metric="ave"：论文 ave@k——每题 n 采样中答对比例的平均（部分学分，配 n_samples=32 即 ave@32）；
+    style="boxed"（默认）：extract_final_answer；style="dapo"：extract_answer(text, "dapo")
+    （论文附录 A Answer: 模板，答案取最后一行 Answer: 数字）。
     rows 每 (problem, sample) 一行，带 sample_idx 与 majority_answer/majority_correct 标记；
     eos/no_answer/avg_rt 按代表采样（sample 0）口径统计。
     """
     n_outcome = n_noans = n_eos = rt_sum = 0
+    frac_sum = 0.0                     # ave：每题 correct 比例累加
     rows = []
     for (problem, gt), o in zip(problems, outs):
         comps = o.outputs
@@ -145,19 +157,27 @@ def _aggregate_budget(problems, outs, budget: int, label: str,
             text = comp.text
             rt = len(comp.token_ids)
             is_eos = comp.finish_reason == "stop"
-            fa = extract_final_answer(text)
+            if style == "dapo":
+                fa = extract_answer(text, "dapo")
+            else:
+                fa = extract_final_answer(text)
             ok = False
             if fa is not None:
                 ok = _grade_answer_sympy(fa, gt)
             samps.append({"sample_idx": k, "status": "eos" if is_eos else "budget_stop",
                           "reasoning_tokens": rt, "has_final_answer": fa is not None,
                           "final_answer": fa, "outcome_correct": ok, "response": text})
-        if n_samples > 1:
+        if metric == "ave":
+            # 论文 ave@k：每题答对比例（部分学分），全部题目平均。
+            frac = sum(1 for s in samps if s["outcome_correct"]) / max(1, len(samps))
+            frac_sum += frac
+            mode, ok_maj = None, None
+        elif n_samples > 1:
             mode, _n_agree = _majority_answer([s["final_answer"] for s in samps])
             ok_maj = bool(_grade_answer_sympy(mode, gt)) if mode is not None else False
         else:
             mode, ok_maj = None, samps[0]["outcome_correct"]
-        n_outcome += int(ok_maj)
+        n_outcome += int(ok_maj if ok_maj is not None else 0)
         if not samps[0]["has_final_answer"]:
             n_noans += 1
         n_eos += int(samps[0]["status"] == "eos")
@@ -172,15 +192,17 @@ def _aggregate_budget(problems, outs, budget: int, label: str,
                          "outcome_correct": s["outcome_correct"], "ground_truth": gt,
                          "final_answer": s["final_answer"], "response": s["response"],
                          "majority_answer": mode,
-                         "majority_correct": ok_maj if n_samples > 1 else None})
+                         "majority_correct": ok_maj if n_samples > 1 and metric != "ave" else None})
     Nn = len(problems)
+    accuracy = (frac_sum / Nn) if metric == "ave" and Nn else (n_outcome / Nn if Nn else 0.0)
     return {"label": label, "budget": budget, "n": Nn,
-            "accuracy": n_outcome / Nn if Nn else 0.0,
+            "accuracy": accuracy,
             "eos_rate": n_eos / Nn if Nn else 0.0,
             "budget_stop_rate": (Nn - n_eos) / Nn if Nn else 0.0,
             "avg_reasoning_tokens": rt_sum / Nn if Nn else 0.0,
             "no_answer_rate": n_noans / Nn if Nn else 0.0,
             "n_samples": n_samples,
+            "metric": metric,
             "rows": rows}
 
 
@@ -219,7 +241,7 @@ def main() -> None:
     budgets = [int(b) for b in args.budgets.split(",") if b.strip()]
     os.makedirs(args.out_dir, exist_ok=True)
     problems = _load_problems(args.dataset, args.n_limit)
-    base_prompts = build_prompts(problems, "boxed")          # tok=None：裸 prompt（零回归）
+    base_prompts = build_prompts(problems, args.prompt_style)  # tok=None：裸 prompt（零回归）
     print(f"[vllm-budget] dataset={args.dataset} n={len(problems)} budgets={budgets} "
           f"fp8={args.fp8} draft={args.draft} device={args.device} "
           f"chat_template={args.chat_template}", flush=True)
@@ -245,7 +267,7 @@ def main() -> None:
             from transformers import AutoTokenizer
             tok_path = args.tokenizer or path
             tok = AutoTokenizer.from_pretrained(tok_path)
-            prompts = build_prompts(problems, "boxed", tok=tok)
+            prompts = build_prompts(problems, args.prompt_style, tok=tok)
             print(f"[vllm-budget] {label}: chat template 启用（tokenizer={tok_path}），"
                   f"对齐训练 apply_chat_template=true", flush=True)
         else:
@@ -256,7 +278,8 @@ def main() -> None:
                                     n=args.n_samples)
             outs = llm.generate(prompts, sampling_params=params)
             res = _aggregate_budget(problems, outs, B, label,
-                                    n_samples=args.n_samples)
+                                    n_samples=args.n_samples,
+                                    metric=args.metric, style=args.prompt_style)
             res["seconds"] = round(time.time() - t1, 1)
             all_results.append(res)
             rows = res.pop("rows", [])

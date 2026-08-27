@@ -281,3 +281,58 @@ def test_aggregate_n1_backward_compat():
     assert r["n"] == 2
     assert r["n_samples"] == 1
     assert r["rows"][0]["majority_correct"] is None
+
+
+def test_metric_ave_partial_credit():
+    """论文 ave@k：每题 n 采样答对比例平均（2/3 对 → 0.667，部分学分非全有/全无）。"""
+    problems = [("p0", "42")]
+    outs = [_out_multi([
+        ("a\n\\boxed{42}", [1, 2, 3], "stop"),
+        ("b\n\\boxed{42}", [1, 2, 3], "stop"),
+        ("c\n\\boxed{7}", [1, 2, 3], "stop"),
+    ])]
+    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3, metric="ave")
+    assert abs(r["accuracy"] - 2 / 3) < 1e-6
+    assert r["metric"] == "ave"
+
+
+def test_metric_ave_two_problems():
+    """两题：一题 2/3 对、一题 1/3 对 → ave=0.5。"""
+    problems = [("p0", "42"), ("p1", "7")]
+    outs = [_out_multi([
+        ("a\n\\boxed{42}", [1], "stop"), ("b\n\\boxed{42}", [1], "stop"),
+        ("c\n\\boxed{7}", [1], "stop"),
+    ]), _out_multi([
+        ("x\n\\boxed{7}", [1], "stop"), ("y", [1], "stop"),
+        ("z", [1], "stop"),
+    ])]
+    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3, metric="ave")
+    assert abs(r["accuracy"] - 0.5) < 1e-6
+
+
+def test_prompt_style_dapo_extraction():
+    """DAPO 模板答案提取：Answer: 行数字判对（style='dapo'）。"""
+    problems = [("p0", "42")]
+    outs = [_out_multi([("step by step...\nAnswer:\n42", [1, 2], "stop")])]
+    r = _aggregate_budget(problems, outs, 256, "E1", style="dapo")
+    assert r["accuracy"] == 1.0
+
+
+def test_metric_majority_default_backward_compat():
+    """默认 metric=majority、style=boxed（零回归）：3 采样 2 对仍 majority 判定。"""
+    problems = [("p0", "42")]
+    outs = [_out_multi([
+        ("a\n\\boxed{42}", [1], "stop"), ("b\n\\boxed{42}", [1], "stop"),
+        ("c\n\\boxed{7}", [1], "stop"),
+    ])]
+    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3)
+    assert r["accuracy"] == 1.0          # majority 全有/全无
+    assert r["metric"] == "majority"
+
+
+def test_max_model_len_default_32768():
+    """评估侧默认 --max-model-len 32768（论文 AIME 31744+1024 协议）。"""
+    a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x"])
+    assert a.max_model_len == 32768
+    assert a.metric == "majority"
+    assert a.prompt_style == "boxed"
