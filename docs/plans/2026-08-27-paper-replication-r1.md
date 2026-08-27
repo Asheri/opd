@@ -5,6 +5,10 @@
 > 本文档 = v1（`docs/plans/2026-08-27-newpair-mechanism-validation.md`，换对路线）的修改版 v2，
 > 撤回换对 + 评估基准改论文口径 + 配方完全对齐论文 Table 2/3。
 > 论文依据：`docs/directOPD_analysis.md`（Table 2/3、Tab.1、Appendix A、§4.2/4.3）。
+>
+> **轻量化修订（v2.1，2026-08-27 用户决策）**：评估主判据 ave@32 → **ave@8**；
+> `--max-model-len` 32768 → **16384**（prompt 1024+max_new~15360 覆盖 AIME 长生成，
+> KV 显存减半）。**训练数据质量不受影响**（D 生成/refresh/cache 与评估采样数无关）。
 
 ---
 
@@ -14,7 +18,7 @@
 |---|---|---|
 | 教师对 | Qwen3-1.7B-Base ↔ Qwen3-1.7B-Instruct（需下载 Base） | **R1-Distill-1.5B（ref）→ JustRL-1.5B（rl）**（服务器已有，无需下载/模板补丁） |
 | 学生 | Qwen3-1.7B-Base（需下载） | **Qwen3-1.7B**（服务器已有；论文 Tab.1 主学生） |
-| 主判据 | MATH500 B8192@3 majority | **AIME24/25 ave@32**（论文 Table 2）+ MATH500 B2048 辅助 |
+| 主判据 | MATH500 B8192@3 majority | **AIME24/25 ave@8**（轻量化，论文 ave 口径）+ MATH500 B2048 辅助 |
 | Prompt 模板 | boxed（评估侧硬编码） | **DAPO**（论文 Appendix A：训练与评估同用；数据 prompt 已是 DAPO） |
 | 训练配方 | 120 步止损 | **300 步**（论文 Table 3）+ on-policy（refresh 主食） |
 | 新增代码 | — | 评估侧：`--metric ave`、`--prompt-style dapo`、`--max-model-len 32768` |
@@ -54,8 +58,8 @@ rl>ref）；E-1b 的 ρ=0.1765 是在 **B2048 域 + boxed 模板**下测的，�
    从 `args.prompt_style` 读而非硬编码 `"boxed"`）。
    - dapo 模式答案提取用 `eval_aime.extract_answer(text, "dapo")`（已存在）
      + `_grade_answer_sympy`（同 boxed 路径）。
-3. **`--max-model-len` 默认 12288 → 32768**（覆盖 31744+1024 论文协议；12288 兼容旧
-   B8192/B2048 不变，显存 96GB 下 1.7B 无压力——KV 32768 可行，待 P0 实测确认）。
+3. **`--max-model-len` 默认 12288 → 16384**（轻量化：prompt 1024+max_new~15360 覆盖
+   AIME 长生成；KV 显存减半；旧 B8192/B2048 不变。已实现+3 测试，26 passed）。
 
 ### 3.2 `fullstack_opd_v2/eval_aime.py`（80% 守卫与论文 31744 冲突）
 
@@ -95,14 +99,14 @@ for M in BaseS JustRL R1Distill; do ... done   # 各自：
 /root/miniconda3/bin/python scripts/vllm_budget_eval.py \
   --models "$M=...路径..." --budgets 8192 --n-samples 32 --temperature 0.7 \
   --dataset AIME24 --n-limit 30 --chat-template --prompt-style dapo \
-  --metric ave --max-model-len 32768 --device cuda:0 --out-dir /root/autodl-tmp/r1_eval/AIME24
+  --metric ave --n-samples 8 --max-model-len 16384 --device cuda:0 --out-dir /root/autodl-tmp/r1_eval/AIME24
 # AIME25 同法；MATH500 B2048（--n-samples 1, --metric majority）辅助
 ```
 
 - 论文参考值（Tab.1，ave@32）：Qwen3-1.7B init AIME24=48.3 / AIME25=36.8；
   JustRL=51.3、R1Distill=28.5（AIME24）。
-- **门控（写死）**：学生基线 AIME24 ave@32 ∈ [20,60]（论文 48.3 附近 ±；
-  <20 说明 dapo 提取/协议有问题，停查）。
+- **门控（写死）**：学生基线 AIME24 ave@8 ∈ [20,60]（论文 48.3 附近 ±；
+  <20 说明 dapo 提取/协议有问题，停查；ave@8 采样误差略大于 ave@32，AIME24+AIME25 交叉确认）。
 
 ### 4.2 E-1b'：Δ↔correct 相关性（**DAPO 域**重测，原对）
 
@@ -159,7 +163,7 @@ run:
   checkpoint_every: 20          # step20/.../300 共 15 断点（拐点扫描）
 eval:
   model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
-  n_samples: 32                 # 论文主指标 ave@32（辅助口径）
+  n_samples: 8                  # 轻量化 ave@8（用户 2026-08-27 决策；训练数据质量不受影响）
   temperature: 0.7
   max_new_tokens: 8192
   top_p: 0.95
@@ -194,7 +198,7 @@ python scripts/run_s2_real.py \
 
 ### 4.6 判定（写死）
 
-| 结果（AIME24 ave@32 全量 30 题） | 判定 |
+| 结果（AIME24 ave@8 全量 30 题） | 判定 |
 |---|---|
 | ≥ 学生基线 + 5 点（论文 +10） | **积极结果：论文复现成功** |
 | +2 ~ +5 点 | 弱阳性：200-300 步/refresh 提高再判 |
@@ -206,7 +210,7 @@ python scripts/run_s2_real.py \
 
 | 风险 | 缓解 |
 |---|---|
-| AIME 仅 30 题，ave@32 采样均方差大（±2-3 题 ≈ ±7-10 点） | 主判据 ave@32 已平均化；AIME24+AIME25 双基准交叉确认 |
+| AIME 仅 30 题，ave@8 采样误差略大（±3-4 题 ≈ ±10-13 点） | AIME24+AIME25 双基准交叉确认；判定阈值 +5 点留有余量 |
 | 学生基线门控范围 [20,60] 若论文 48.3 复现失败 | 先测基线（4.1），超范围停查 dapo 提取/协议 |
 | `max-model-len 32768` 显存 | 96GB 1.7B 无压力（KV 32k 需 P0 nvidia-smi 实测确认） |
 | 80% 守卫拦 31744（eval-aime） | AIME 主走 vllm_budget_eval；eval-aime 仅 sanity（--n-samples 1） |

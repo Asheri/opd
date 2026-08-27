@@ -100,7 +100,7 @@ run:
 
 eval:
   model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
-  n_samples: 32                   # 论文 Table 2 主指标 ave@32（辅助口径）
+  n_samples: 8                     # 轻量化 ave@8（用户 2026-08-27 决策；训练数据质量不受影响）
   temperature: 0.7
   max_new_tokens: 8192
   top_p: 0.95

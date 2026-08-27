@@ -13,12 +13,13 @@
   python vllm_budget_eval.py --device cuda:1 --models "Base=...,E1=..." \
       --budgets 256,512,1024 --dataset MATH500 --n-limit 50 --out-dir <dir> [--fp8] [--draft ...]
 
-多采样（B8192@3 终验口径，2026-08-26 增加；论文 ave@32 口径，2026-08-27 v2 增加）：
+多采样（B8192@3 终验口径，2026-08-26 增加；论文 ave 口径，2026-08-27 v2 增加）：
   python vllm_budget_eval.py --models "JustRL=...,R1Distill=..." \
-      --budgets 8192 --n-samples 3 --temperature 0.7 --chat-template \
-      --max-model-len 32768 --device cuda:0 --out-dir <dir>
+      --budgets 8192 --n-samples 8 --temperature 0.7 --chat-template \
+      --max-model-len 16384 --device cuda:0 --out-dir <dir>
   # --n-samples>1 时 accuracy 聚合：--metric majority（默认，多数派答案正确，零回归）
-  #   或 --metric ave（论文 ave@32：每题 n 采样答对比例的平均，再全部题目平均）；
+  #   或 --metric ave（论文 ave 口径：每题 n 采样答对比例的平均，再全部题目平均；
+  #   轻量化用 ave@8——n_samples=8，训练数据质量不受评估采样数影响）；
   # --prompt-style dapo（论文 A 附录 DAPO 模板 "Answer:" 末行，评估与训练数据同模板）；
   # jsonl 每 (problem,sample) 一行，带 sample_idx 与 majority_answer/majority_correct 标记；
   # --n-samples=1（默认）保持旧 greedy 口径零回归。
@@ -52,9 +53,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--fp8", action="store_true", help="vLLM 用 float8 量化（Blackwell）")
     p.add_argument("--draft", default=None, help="投机解码 draft 小模型路径")
-    p.add_argument("--max-model-len", type=int, default=32768,
-                   help="vLLM max_model_len（默认 32768 覆盖论文协议 max_new=31744+prompt；"
-                        "旧 B8192/B2048 亦兼容；显存 96GB 下 1.7B 无压力）")
+    p.add_argument("--max-model-len", type=int, default=16384,
+                   help="vLLM max_model_len（默认 16384 轻量化：prompt 1024+max_new~15360 覆盖"
+                        "AIME 长生成；显存 KV 减半；旧 B8192/B2048 亦兼容）")
     p.add_argument("--gpu-mem", type=float, default=0.9)
     p.add_argument("--chat-template", action="store_true",
                    help="用模型 chat template 包裹 prompt（对齐训练 apply_chat_template=true，"

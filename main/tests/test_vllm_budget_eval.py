@@ -322,14 +322,14 @@ def test_aggregate_dapo_answer_extraction():
 
 
 def test_parse_args_prompt_style_and_metric_defaults():
-    """v2：--prompt-style 默认 boxed、--metric 默认 majority、--max-model-len 默认 32768（零回归）。"""
+    """v2：--prompt-style 默认 boxed、--metric 默认 majority、--max-model-len 默认 16384（轻量化零回归）。"""
     a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x"])
     assert a.prompt_style == "boxed"
     assert a.metric == "majority"
-    assert a.max_model_len == 32768
+    assert a.max_model_len == 16384
     b = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x",
                     "--prompt-style", "dapo", "--metric", "ave",
-                    "--max-model-len", "12288"])
+                    "--max-model-len", "32768"])
     assert b.prompt_style == "dapo"
     assert b.metric == "ave"
-    assert b.max_model_len == 12288
+    assert b.max_model_len == 32768
