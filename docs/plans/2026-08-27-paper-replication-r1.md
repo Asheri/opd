@@ -166,6 +166,38 @@ O=/root/autodl-tmp/r1_eval/delta_corr
 - **R-E1**：eos 冒烟——Qwen3-1.7B 是 instruct，`--eos-id 151645`（im_end）；
   冒烟确认后再定（流程保留）。
 
+### 4.35 设计决策记录：训练数据 max_response_len=2048 的依据（2026-08-28 追加）
+
+> 用户疑问："为什么训练数据是 2048 的 max len？不会太少了吗？训练数据的长度对训练是否有影响？"
+> 以下为对照原始论文（`docs/directOPD_analysis.md`）的论证记录——**2048 是论文实验筛选出的
+> 最优短视界值，不是拍脑袋**，且在本方案中照抄论文 Table 3 属于正确选择。
+
+**论文原文依据（`[原文明确]`）**：
+1. Table 3：`Max response length = 2,048（short-horizon；§4.2 证明可泛化到长 rollout）`。
+2. §4.2：**2k response length 在 Qwen3-1.7B 与 R1-Distill-7B 上验证最稳（Fig.7）**；
+   40 步 2k 训练后 actor 在 ~16k 长 rollout 上已朝教师偏移方向移动（Fig.8）——**训练短视界、
+   评估长 rollout 可泛化**；**6k 在晚期不可靠前缀上过驱动、验证反而更差（45.6 vs 2k 的 48.8）**
+   ——**训练长度加长不是单调有利的**。
+
+**为什么短视界训练反而更稳（机制）**：Direct-OPD 的 Δ_T 是 per-token 稠密奖励（Eq.10），
+每个 token 位置都有信号，不需要完整 response 就能学偏移方向。推理"开启方式"在前段决定、
+前段 token 的 Δ 更可靠；6k 训练把"晚期不可靠前缀"也纳入梯度反而过驱动。配合
+Rao-Blackwell 化（Eq.13）+ top-k=16 支撑，短序列每个 token 的学习效率更高。short-horizon
+本身就是泛化性来源（论文 §4.2 核心主张）。
+
+**我们实测对照**：Qwen3-1.7B 在 MATH500 上 B2048 avg_rt=1954（接近满预算）、B8192 avg_rt=4303
+——自然推理长度确实超 2048，训练 D 中会有截断样本。但这正是论文用同款学生验证过的设定
+（Fig.7 的 2k 档同样大量截断仍最稳）：Δ_T 是 per-token 信号，截断的 response 前 2048 token
+依然携带有效梯度。
+
+**v2.2 已为截断质量上了三重保险**：R-E2 门控（no_answer ≤30%、过短 ≤20%）+ R5 loop 检测
+（loop_rate ≤5%）+ R-S2 sample 长度检查（Phase 0 实测）——若 Skywork 题比 MATH500 更长、
+截断率过高，由门控拦下；确实不达标才考虑 D 生成预算升档（`--max-new-tokens 4096`），
+但**不盲提高**（6k 档教训）。
+
+**结论**：照抄论文 2048 是正确且经过验证的选择；真正需监控的是截断导致的 no_answer/loop
+质量，v2.2 门控已覆盖。
+
 ### 4.4 新配置 `configs/qwen3_r1_opd.yaml`（复制 qwen3_base_opd.yaml 改模型路径）
 
 ```yaml
