@@ -692,6 +692,7 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                       cand=None,                   # Stage 3：预选 prompt 索引 (M,)；None→内部 select
                       compute_disagreement=True,  # P1.4：disagreement.enabled 硬 gate
                       dists_chunk: int = 2,       # IMP-1：rollout response_dists 分批大小（降显存峰值）
+                      n_rollout: int = 1,          # Direct-OPD 论文 rollout n：每 prompt 独立采样 n 条
                       dist_engines: dict | None = None):   # IMP-2/P0：vLLM 分布引擎 {s_old,rl,ref,ref_anchor}；None→HF
                                                   # False 时跳过 D 计算（省 student/student_ref
                                                   # chosen-logp 前向），append 用 D=0
@@ -778,12 +779,31 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
         expected = budgets_used
     else:
         p_b = prompts[cand].to(device)
-        out = _gen(p_b, max_new=max_resp_len)
-        responses = out["responses"].to(device)   # vLLM 引擎可能在 rollout_device，回训练 device
-        statuses, lengths = out["statuses"], out["lengths"]
-        eos_pos = out["eos_pos"]
-        expected = m_selected * max_resp_len
-        budgets_used = m_selected * max_resp_len
+        if n_rollout > 1:
+            # Direct-OPD 论文 rollout n：对同一批 prompt 独立采样 n 条（T>0 时各条不同），
+            # 全部展平进入后续流程（每条响应独立 teacher 前向 + 独立 append refresh 池）。
+            # 名义预算/生成量按 n 倍计；statuses/lengths/eos_pos/cand/p_b 同步展平。
+            resp_l: list = []
+            stat_l: list = []
+            len_l: list = []
+            eos_l: list = []
+            for _ in range(int(n_rollout)):
+                out = _gen(p_b, max_new=max_resp_len)
+                resp_l.append(out["responses"].to(device))
+                stat_l.extend(out["statuses"])
+                len_l.extend(out["lengths"])
+                eos_l.extend(out["eos_pos"])
+            responses = torch.cat(resp_l, dim=0)   # (M*n, T)
+            statuses, lengths, eos_pos = stat_l, len_l, eos_l
+            p_b = p_b.repeat_interleave(n_rollout, dim=0)     # 展平：每条响应对应原 prompt
+            cand = cand.repeat_interleave(n_rollout)
+        else:
+            out = _gen(p_b, max_new=max_resp_len)
+            responses = out["responses"].to(device)   # vLLM 引擎可能在 rollout_device，回训练 device
+            statuses, lengths = out["statuses"], out["lengths"]
+            eos_pos = out["eos_pos"]
+        expected = m_selected * n_rollout * max_resp_len
+        budgets_used = m_selected * n_rollout * max_resp_len
     _gen_wall = time.perf_counter() - _t_gen
     # loop/invalid 样本跳过 teacher 前向与 append（需求 4），仍计入 summary
     # 有效样本定义（IMP-1d）：non_empty ∧ ¬loop_detected ∧ token 序列有效。

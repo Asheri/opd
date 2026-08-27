@@ -259,9 +259,9 @@ def test_cache_cfg_storage_via_override():
 
 
 def test_cache_cfg_rejects_bad_topk():
-    """非 0/32/64/128/256 的 K 一律拒绝（固定 K，不做 adaptive K）。"""
+    """非 0/16/32/64/128/256 的 K 一律拒绝（固定 K，不做 adaptive K；16 自 2026-08-27 合法）。"""
     from fullstack_opd_v2.config import load_config
-    for k in (1, 4, 8, 16, 33):
+    for k in (1, 4, 8, 33):
         with pytest.raises(ConfigError):
             load_config(overrides=[f"cache.top_k={k}"])
 
@@ -290,3 +290,28 @@ def test_skywork_yaml_uses_cache_topk():
     assert cfg["cache"]["storage"] == "disk"
     # stage2 不再写死 top_k_student（yaml 已删，回落 0 → scheduler 用 cache.top_k=256）
     assert cfg["stage2"]["top_k_student"] == 0
+
+
+def test_topk_16_allowed_paper_alignment():
+    """Direct-OPD 论文对齐：cache.top_k=16 被 validator 接受（2026-08-27 新增）。"""
+    cfg = load_config(overrides=["cache_mode=topk", "cache.top_k=16"])
+    assert cfg["cache"]["top_k"] == 16
+
+
+def test_topk_8_rejected():
+    """cache.top_k=8 仍被 validator 拒绝（允许集 0/16/32/64/128/256）。"""
+    import pytest
+    with pytest.raises(Exception):
+        load_config(overrides=["cache_mode=topk", "cache.top_k=8"])
+
+
+def test_n_rollout_and_kl_adaptive_fields():
+    """C2/C3 新配置字段：l2.rollout.n_rollout 与 stage2.kl_adaptive 可解析。"""
+    cfg = load_config(overrides=[
+        "l2.rollout.n_rollout=4", "stage2.kl_adaptive=true"])
+    assert cfg["l2"]["rollout"]["n_rollout"] == 4
+    assert cfg["stage2"]["kl_adaptive"] is True
+    # 默认值（零回归）
+    cfg2 = load_config()
+    assert cfg2["l2"]["rollout"].get("n_rollout", 1) == 1
+    assert cfg2["stage2"].get("kl_adaptive", False) is False

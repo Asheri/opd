@@ -23,6 +23,7 @@ import torch
 
 from .buffer import StalenessQueue, WeightStore, _MIN_QUEUE_SIZE
 from .losses import pg_loss, low_var_kl, low_var_kl_support, expected_reward
+from .losses import AdaptiveKLController
 from .model import CausalToyLM, response_dists
 
 # pg_loss 失配屏蔽阈值（log 空间）：s_old < -20 视为支撑外 log0 近似（π_old≈0），贡献=0。
@@ -196,6 +197,10 @@ class AsyncBatchedScheduler:
 
         # 优化器 + 超参提升为实例属性，供 _train_step 在两种调度器间复用
         self.kl_coef = cfg.get("kl_reg_coef", 0.05)
+        # Direct-OPD 论文 §2.4 adaptive KL（Eq.16）：true 时 kl_coef 由控制器按稠密
+        # reward 符号动态调整（α0=kl_reg_coef）；默认 false 零回归（固定 KL）。
+        self._kl_adaptive = bool(cfg.get("kl_adaptive", False))
+        self._kl_ctrl = AdaptiveKLController(alpha0=self.kl_coef) if self._kl_adaptive else None
         self.clip_eps = cfg.get("clip_eps", 0.2)
         self.grad_clip = cfg.get("grad_clip", 1.0)
         self.use_topk = (self.top_k_student > 0) and (cache.mode == "topk")
@@ -550,6 +555,9 @@ class AsyncBatchedScheduler:
         scalars = [loss, loss_pg, loss_kl, adv, reward]
         scalars = [s.float() if s.dtype != torch.float32 else s for s in scalars]
         loss_v, pg_v, kl_v, adv_v, rew_v = torch.stack(scalars).detach().cpu().tolist()
+        # Direct-OPD adaptive KL（Eq.16）：用该步稠密 reward 均值 r̄_m 更新 kl_coef
+        if self._kl_ctrl is not None:
+            self.kl_coef = self._kl_ctrl.step(rew_v)
         return {
             "step": done,
             "version": version,
@@ -661,6 +669,9 @@ class AsyncBatchedScheduler:
         loss_v, pg_v, kl_v, adv_v, rew_v = [
             float(torch.stack(acc[k]).mean()) if acc[k] else 0.0 for k in
             ("loss", "pg", "kl", "adv", "rew")]
+        # Direct-OPD adaptive KL（Eq.16）：refresh 步同样用该步 r̄_m 更新 kl_coef
+        if self._kl_ctrl is not None:
+            self.kl_coef = self._kl_ctrl.step(rew_v)
         return {
             "step": done,
             "version": version,
