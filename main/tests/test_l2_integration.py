@@ -54,6 +54,71 @@ def test_refresh_phase_padding_mask_excludes_pad():
     for l in rb._resp_lens:
         assert 1 <= l <= 6
 
+
+def test_refresh_phase_n_rollout_pairs_correctly():
+    """C2（2026-08-27 审阅修复）：n_rollout>1 时展平行序必须与 torch.cat(resp_l)
+    一致——responses 行 i 与 p_b 行 i 的 prompt 配对正确（此前 repeat_interleave
+    行序错位：每条 response 配到错误 prompt，teacher Δ/训练信号错乱）。
+    用 fake 生成器注入「response 值 = 该行 prompt 行号」，逐行核对配对。"""
+    torch.manual_seed(0)
+    V = 8
+    M, n = 3, 2                     # 3 个 prompt × 2 次采样
+    stu = _make_toy(V)
+    t_rl = _make_toy(V)
+    t_ref = _make_toy(V)
+    s_ref = _make_toy(V)
+    rb = RefreshRingBuffer(capacity=M * n + 4, top_k=3, vocab=V)
+    disag = DisagreementComputer()
+    # 每行首 token = 行号（行号即 prompt 全局索引），供配对核对
+    prompts = torch.arange(M).unsqueeze(1).expand(M, 5).contiguous()
+
+    def fake_gen(pb, max_new, **kw):
+        """fake rollout 生成器：response 值 = 该行 prompt 的首 token（=行号）。"""
+        B = pb.size(0)
+        src = pb[:, :1]                              # (B,1) 每行首 token
+        resp = src.repeat(1, max_new)                # (B,max_new) 全为该行行号
+        return {"responses": resp, "statuses": ["budget_stop"] * B,
+                "lengths": [max_new] * B, "eos_pos": [None] * B}
+
+    summary = run_refresh_phase(
+        stu, t_rl, t_ref, s_ref, None, rb, disag,
+        prompts, step=1, version=1, m_selected=M, max_resp_len=6,
+        top_k=3, device="cpu", rollout_generator=fake_gen, n_rollout=n)
+    assert summary["n_total"] == M * n
+    assert summary["n_appended"] == M * n
+    # 配对断言：rb 中每条 response 的值（=来源 prompt 行号）必须等于其 prompt_idx
+    assert len(rb._prompt_idx) == M * n
+    for k in range(M * n):
+        resp_row = rb._response[k]
+        assert int(resp_row[0].item()) == rb._prompt_idx[k], (
+            f"第 {k} 条 response（值 {resp_row[0].item()}）与 prompt_idx "
+            f"{rb._prompt_idx[k]} 配对错乱——n_rollout 展平行序 bug")
+
+
+def test_pipeline_passes_n_rollout(tmp_path, monkeypatch):
+    """C2（2026-08-27 审阅修复）：pipeline 把 l2.rollout.n_rollout 透传给
+    run_refresh_phase（此前未透传→ yaml n_rollout=4 静默失效）。"""
+    import fullstack_opd_v2.adaptive_cache as ac
+    from fullstack_opd_v2.config import load_config
+    from fullstack_opd_v2.pipeline import FullStackOPDv2
+    got = {"n_rollout": None}
+    orig = ac.run_refresh_phase
+
+    def spy(*a, **k):
+        got["n_rollout"] = k.get("n_rollout")
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ac, "run_refresh_phase", spy)
+    cfg = load_config(overrides=[
+        "l2.enabled=true", "l2.t_train=5", "stage2.n_steps=12",
+        "stage2.batch_size=4", "l2.m_refresh=4",
+        "l2.cache.refresh_size=8", "l2.cache.max_response_length=4",
+        "l2.cache.refresh_min_interval=3", "l2.cache.min_refresh_pool=0",
+        "l2.rollout.n_rollout=4"])
+    opd = FullStackOPDv2(cfg, device="cpu")
+    opd.run(run_dir=str(tmp_path))
+    assert got["n_rollout"] == 4, f"n_rollout 未透传（收到 {got['n_rollout']}）"
+
 # ============================================================================
 # 任务 6.1：pipeline 交替相位循环接入 + 工程检查（§13.7）
 # ============================================================================
