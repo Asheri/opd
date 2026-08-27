@@ -1,0 +1,115 @@
+# Qwen3-1.7B × R1Distill→JustRL 教师对——论文原样复现配置（v2，2026-08-27）
+#
+# 依据：docs/directOPD_analysis.md（Direct-OPD 论文 Table 2/3、Tab.1、Appendix A）
+#       + docs/reports/2026-08-27-opd-final-report.md（旧对复现失败定稿：
+#       失败主因是配方层+评估基准，非教师对/学生）+ 用户 2026-08-27 决策
+#       （严禁更换教师对，仿照原始论文复现；教师对 R1-Distill-1.5B→JustRL-1.5B，
+#       学生 Qwen3-1.7B）。
+#
+# 与 v1（qwen3_base_opd.yaml，换对路线）的核心差异：
+#   - 撤回换对：student=Qwen3-1.7B（论文主学生，无需下载）、
+#     teacher_rl=JustRL-1.5B、teacher_ref=R1-Distill-1.5B（原对，服务器已有）；
+#   - 评估主判据：AIME24/25 ave@32（论文 Table 2，vllm_budget_eval --metric ave
+#     --prompt-style dapo --max-model-len 32768）；MATH500 B2048 辅助；
+#   - 训练：300 步（论文 Table 3）+ on-policy（refresh 主食，refresh_min_interval=1）；
+#   - 模板：DAPO（论文 A 附录：训练与评估同用；数据 prompt 已是 DAPO 文本）。
+#
+# 用法（服务器恢复后，Phase 0 双门控通过才训练）：
+#   建缓存：python -m fullstack_opd_v2 cache --config configs/qwen3_r1_opd.yaml \
+#             --set stage1.load_cache=false --device cuda:0 \
+#             --out /root/autodl-tmp/cache_qwen3_r1_t16.pt
+#   训练：  python scripts/run_s2_real.py --config configs/qwen3_r1_opd.yaml \
+#             --run-dir /root/autodl-tmp/runs_r1/e1_opd2048 --names S2_E2_opd1024 \
+#             --device cuda:0 --n-steps 300 --eos-id 151645 \
+#             --set stage2.rollout_engine=vllm --set stage2.gradient_checkpointing=true \
+#             --set l2.t_train=2 --set l2.cache.refresh_min_interval=1 \
+#             --set l2.m_refresh=8 \
+#             --set l2.rollout.max_new_tokens=2048 --set l2.rollout.n_rollout=4 \
+#             --set l2.rollout.repetition_penalty=1.0
+#   ⚠️ R3（2026-08-27 数据质量审阅）：必须显式 --set l2.t_train=2（默认 100 会让
+#   refresh 相位仅 300/100=3 次 -> on-policy ~2% 重蹈旧失败；t_train=2 时 150 相位
+#   x32 条 = 4800 条 on-policy vs 5000 静态 ≈49%）。
+
+model_kind: hf
+student_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B        # 学生 = 论文主学生（Qwen3-1.7B）
+teacher_rl_path: /root/autodl-tmp/models/JustRL-DeepSeek-1.5B   # rl 教师 = 论文 JustRL-1.5B（post-RL）
+teacher_ref_path: /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-1.5B  # ref 教师 = 论文 R1-Distill-1.5B
+
+dtype: bf16
+cache_mode: topk
+offload_to_cpu: true
+# Stage 1：统一 K 存储架构。top_k=16 = 论文 student top-k support（C1，2026-08-27）。
+# 改 K 必须重建磁盘缓存（verify_consistency 校验 metadata.top_k）。
+cache:
+  top_k: 16
+  storage: disk
+
+# ---- 数据：Skywork-OR1 数学子集（prompt 已是 DAPO 模板文本）；D = 学生 on-policy rollout ----
+dataset:
+  type: jsonl
+  path: /root/autodl-tmp/datasets/skywork_50k_r1.jsonl   # 复制+清空后由 Qwen3-1.7B 生成
+  prompt_key: prompt
+  response_key: response
+  max_prompt_len: 1024            # 论文 Table 3 MAX_PROMPT_LENGTH=1024
+  max_response_len: 2048          # 论文 Table 3（短视界，§4.2 最稳）
+  tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  prompt_universe_size: 50000
+
+base:
+  materialized_size: 5000         # on-policy 锚点池（配 refresh 在线扩充）
+
+stage0:
+  n_rl_steps: 20                  # hf 路径跳过 Stage0 RL，仅占位
+
+stage1:
+  enforce_teacher_consistency: true
+  cache_path: /root/autodl-tmp/cache_qwen3_r1_t16.pt
+  load_cache: false               # 首次建缓存 false；训练阶段置 true
+  build_batch_size: 8
+  warmup_M: 0
+  warmup_source: none
+  warmup_temperature: 1.0
+
+stage2:
+  scheduling_mode: fully_async
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 1.0                # adaptive KL 初始值 α0（论文 Eq.16 区间 [0.5,2.5] 内）
+  kl_adaptive: true               # 论文 §2.4 Eq.16：按稠密 reward 符号动态调（C3，默认 false 零回归）
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 1.0e-6                      # 论文 Table 3（旧 3e-5 快 30 倍）；⚠️ 300 步学习预算小，
+                                  # 60/120 步快评无下游变化时作为自适应决策点
+  n_steps: 300                    # 论文 Table 3（止损线保留 120 步快评决策点）
+  batch_size: 4
+  distributed: false
+  rollout_engine: toy             # 训练由 run_s2_real --set stage2.rollout_engine=vllm 覆盖
+  renormalize_topk_support: true  # 对齐原始 Direct-OPD 稀疏支撑归一化
+  delta_clip: 2.0
+  dtype: bf16
+  offload_to_cpu: false
+
+l2:
+  rollout:
+    max_new_tokens: 2048          # 论文 Table 3（覆盖矩阵 1024）
+    n_rollout: 4                  # 论文 Table 3 rollout n=4（C2，每 prompt 独立采样 4 条）
+    temperature: 1.0              # 论文 Table 3
+    repetition_penalty: 1.0
+    loop_detection: true
+    loop_periods: [2, 3, 4]
+    rollout_source: student
+
+run:
+  checkpoint_every: 20            # step20/.../300 共 15 断点（拐点扫描，E-0c 教训）
+
+eval:
+  model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  n_samples: 8                     # 轻量化 ave@8（用户 2026-08-27 决策；训练数据质量不受影响）
+  temperature: 0.7
+  max_new_tokens: 8192
+  top_p: 0.95
+  metric: ave
+  prompt_style: dapo              # 论文 A 附录 DAPO 模板（对齐训练数据）
+  scoring: sympy
+  chat_template: true
+  attn_implementation: flash_attention_2

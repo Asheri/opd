@@ -160,3 +160,33 @@ def test_spearman_no_correlation():
     from delta_correctness_corr import _spearman
     rho, _ = _spearman([1, 2, 3, 4, 5, 6], [6, 1, 5, 2, 4, 3])
     assert abs(rho) < 0.4
+
+
+def test_sample_stage_dapo_wrapping():
+    """R2（2026-08-27）：--prompt-style dapo 时 prompt 先 format_prompt(dapo) 再包
+    chat template--E-1b' 相关性域与训练/评估 DAPO 模板一致（boxed 默认零回归）。"""
+    from fullstack_opd_v2.budget_eval import format_prompt
+
+    class _FakeTok:
+        def apply_chat_template(self, messages, **kw):
+            return ('<|im_start|>user\n' + messages[0]['content']
+                    + '<|im_end|>\n<|im_start|>assistant\n')
+
+    tok = _FakeTok()
+    p_dapo = format_prompt('What is 2+2?', 'dapo')
+    w_dapo = tok.apply_chat_template([{'role': 'user', 'content': p_dapo}],
+                                     add_generation_prompt=True, tokenize=False)
+    assert 'Answer:' in w_dapo
+    assert w_dapo.startswith('<|im_start|>user\n')
+    w_boxed = tok.apply_chat_template([{'role': 'user', 'content': 'What is 2+2?'}],
+                                      add_generation_prompt=True, tokenize=False)
+    assert 'Answer:' not in w_boxed
+
+
+def test_parse_args_prompt_style_default():
+    """R2：--prompt-style 默认 boxed（零回归）、dapo 可显式指定。"""
+    import delta_correctness_corr as dcc
+    a = dcc.parse_args(['--stage', 'sample', '--out', '/tmp/x'])
+    assert a.prompt_style == 'boxed'
+    b = dcc.parse_args(['--stage', 'sample', '--out', '/tmp/x', '--prompt-style', 'dapo'])
+    assert b.prompt_style == 'dapo'

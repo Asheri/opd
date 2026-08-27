@@ -283,56 +283,53 @@ def test_aggregate_n1_backward_compat():
     assert r["rows"][0]["majority_correct"] is None
 
 
-def test_metric_ave_partial_credit():
-    """论文 ave@k：每题 n 采样答对比例平均（2/3 对 → 0.667，部分学分非全有/全无）。"""
-    problems = [("p0", "42")]
-    outs = [_out_multi([
-        ("a\n\\boxed{42}", [1, 2, 3], "stop"),
-        ("b\n\\boxed{42}", [1, 2, 3], "stop"),
-        ("c\n\\boxed{7}", [1, 2, 3], "stop"),
-    ])]
-    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3, metric="ave")
-    assert abs(r["accuracy"] - 2 / 3) < 1e-6
-    assert r["metric"] == "ave"
-
-
-def test_metric_ave_two_problems():
-    """两题：一题 2/3 对、一题 1/3 对 → ave=0.5。"""
+def test_aggregate_ave_32_paper_protocol():
+    """v2（论文 Table 2）：--metric ave 聚合——每题 n 采样答对比例平均，再全部题平均。"""
     problems = [("p0", "42"), ("p1", "7")]
-    outs = [_out_multi([
-        ("a\n\\boxed{42}", [1], "stop"), ("b\n\\boxed{42}", [1], "stop"),
-        ("c\n\\boxed{7}", [1], "stop"),
-    ]), _out_multi([
-        ("x\n\\boxed{7}", [1], "stop"), ("y", [1], "stop"),
-        ("z", [1], "stop"),
-    ])]
-    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3, metric="ave")
-    assert abs(r["accuracy"] - 0.5) < 1e-6
+    # 题 0：3 采样 2 对 1 错 → 2/3；题 1：3 采样 0 对 → 0；ave = (2/3 + 0)/2 = 1/3
+    outs = [
+        _out_multi([("a\n\\boxed{42}", [1, 2], "stop"),
+                    ("b\n\\boxed{42}", [1, 2], "stop"),
+                    ("c\n\\boxed{7}", [1, 2], "stop")]),
+        _out_multi([("d\n\\boxed{9}", [1, 2], "stop"),
+                    ("e\n\\boxed{8}", [1, 2], "stop"),
+                    ("f\n\\boxed{6}", [1, 2], "stop")]),
+    ]
+    r = _aggregate_budget(problems, outs, 256, "E2", n_samples=3, metric="ave")
+    assert abs(r["accuracy"] - 1 / 3) < 1e-9
+    assert r["metric"] == "ave"
+    assert r["n_samples"] == 3
+    # majority 对照：题 0 多数 42 → 对；题 1 无多数 → 错；accuracy=0.5
+    r2 = _aggregate_budget(problems, outs, 256, "E2", n_samples=3, metric="majority")
+    assert r2["accuracy"] == 0.5
 
 
-def test_prompt_style_dapo_extraction():
-    """DAPO 模板答案提取：Answer: 行数字判对（style='dapo'）。"""
+def test_aggregate_dapo_answer_extraction():
+    """v2（论文 A 附录）：--prompt-style dapo 用 Answer: 行提取答案（AIME 整数答案）。"""
     problems = [("p0", "42")]
-    outs = [_out_multi([("step by step...\nAnswer:\n42", [1, 2], "stop")])]
-    r = _aggregate_budget(problems, outs, 256, "E1", style="dapo")
-    assert r["accuracy"] == 1.0
-
-
-def test_metric_majority_default_backward_compat():
-    """默认 metric=majority、style=boxed（零回归）：3 采样 2 对仍 majority 判定。"""
-    problems = [("p0", "42")]
+    # dapo 模板契约：答案在最后一行 "Answer: ..."（中途草稿 "answer:" 不取；
+    # AIME 答案均为整数，匹配 -?\d[\d,]*）
     outs = [_out_multi([
-        ("a\n\\boxed{42}", [1], "stop"), ("b\n\\boxed{42}", [1], "stop"),
-        ("c\n\\boxed{7}", [1], "stop"),
+        ("思考中 answer: 7 草稿\nAnswer: 42", [1, 2], "stop"),
+        ("Answer: 42", [1, 2], "stop"),
     ])]
-    r = _aggregate_budget(problems, outs, 256, "E1", n_samples=3)
-    assert r["accuracy"] == 1.0          # majority 全有/全无
-    assert r["metric"] == "majority"
+    r = _aggregate_budget(problems, outs, 256, "E2", n_samples=2, metric="ave",
+                          prompt_style="dapo")
+    assert r["accuracy"] == 1.0     # 两采样都提取到 42 → 每题比例 1.0
+    assert r["rows"][0]["final_answer"] == "42"
+    # 中途草稿 "answer: 7" 不得污染提取（取最后一个匹配）
+    assert r["rows"][0]["final_answer"] != "7"
 
 
-def test_max_model_len_default_32768():
-    """评估侧默认 --max-model-len 32768（论文 AIME 31744+1024 协议）。"""
+def test_parse_args_prompt_style_and_metric_defaults():
+    """v2：--prompt-style 默认 boxed、--metric 默认 majority、--max-model-len 默认 16384（轻量化零回归）。"""
     a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x"])
-    assert a.max_model_len == 32768
-    assert a.metric == "majority"
     assert a.prompt_style == "boxed"
+    assert a.metric == "majority"
+    assert a.max_model_len == 16384
+    b = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x",
+                    "--prompt-style", "dapo", "--metric", "ave",
+                    "--max-model-len", "32768"])
+    assert b.prompt_style == "dapo"
+    assert b.metric == "ave"
+    assert b.max_model_len == 32768

@@ -27,9 +27,14 @@ import argparse
 import json
 import os
 import random
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+# 脚本位于 main/scripts/ 下；直接运行时 sys.path[0] 是 scripts/ 而非 repo 根，
+# R5 需要 import fullstack_opd_v2.model.detect_loop -> 显式把 main/ 加入 sys.path。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +45,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=8, help="生成 batch（控显存）")
     p.add_argument("--max-new-tokens", type=int, default=2048, help="生成长度（=论文 MAX_RESP_LENGTH）")
     p.add_argument("--temperature", type=float, default=1.0, help="采样温度（on-policy 初始分布）")
-    p.add_argument("--top-p", type=float, default=0.95, help="top-p 采样")
+    p.add_argument("--top-p", type=float, default=0.95, help="top-p 采样（论文 Table 3 训练采样 top_p=1.0，命令行显式覆盖）")
+    p.add_argument("--max-prompt-len", type=int, default=1024,
+                   help="R1（2026-08-27 数据质量审阅）：prompt 截断长度，默认 1024 对齐"
+                        "训练 loader 的 dataset.max_prompt_len（此前硬编码 2048 与训练侧"
+                        "1024 不一致->长题 response 依赖被截断上下文、训练/teacher 打分错位）")
+    p.add_argument("--loop-check", action="store_true", default=True,
+                   help="R5：生成后对 response 做 detect_loop 尾部周期检测，loop 条目"
+                        "response 置空（不进 D）并在日志统计 loop_rate（R-E2 门控 ≤5%）")
+    p.add_argument("--no-loop-check", dest="loop_check", action="store_false",
+                   help="关闭 R5 loop 检测（不推荐）")
     p.add_argument("--apply-chat-template", action="store_true",
                    help="C3（2026-08-18）：生成前用模型自身 apply_chat_template 把 "
                         "prompt 包成 user 角色（Qwen3 chat 格式），否则裸数学题生成乱码+loop")
@@ -200,6 +214,10 @@ def main() -> None:
     all_lens: list[int] = []      # 本 shard 已生成的长度（累积）
     total_tok = 0
     total_wall = 0.0
+    n_loop = 0                    # R5：loop 检测命中数（累积，loop 条目 response 置空）
+    n_done = 0                    # 本 shard 已判定条数（含 loop）
+    if args.loop_check:
+        from fullstack_opd_v2.model import detect_loop   # R5：复用 Stage2 尾部周期检测
     with open(tmp_path, "a", encoding="utf-8") as f:
         for start in range(0, len(remaining), bs):
             batch_idx = remaining[start:start + bs]
@@ -211,11 +229,11 @@ def main() -> None:
                     [{"role": "user", "content": p}], tokenize=False,
                     add_generation_prompt=True) for p in batch_prompts]
                 enc = tok(batch_prompts, return_tensors="pt", padding=True,
-                          truncation=True, max_length=2048,
+                          truncation=True, max_length=args.max_prompt_len,   # R1：对齐训练 loader P
                           add_special_tokens=False).to(args.device)
             else:
                 enc = tok(batch_prompts, return_tensors="pt", padding=True,
-                          truncation=True, max_length=2048).to(args.device)
+                          truncation=True, max_length=args.max_prompt_len).to(args.device)
             seq_len = enc["input_ids"].size(1)
             t0 = time.time()
             with torch.no_grad():
@@ -229,32 +247,48 @@ def main() -> None:
             total_wall += dt
             # 逐题写回（带 _idx 供 resume）
             for j, idx in enumerate(batch_idx):
-                resp = tok.decode(out[j][seq_len:], skip_special_tokens=True)
+                gen_ids = out[j][seq_len:]
+                resp = tok.decode(gen_ids, skip_special_tokens=True)
+                # R5：loop 检测（尾部周期重复）--命中的条目 response 置空（不进 D，
+                # 下次 resume 会重生成该条），避免 loop 响应污染训练数据。
+                looped = False
+                if args.loop_check:
+                    looped = detect_loop(gen_ids.detach().cpu(),
+                                         periods=(2, 3, 4), min_len=8)
+                if looped:
+                    resp = ""
+                    n_loop += 1
                 rows[idx]["response"] = resp
                 all_lens.append(gen_tokens)
+                n_done += 1
                 # tmp 行：带 _idx 标记 + 完整 row（去 _idx 后即最终行）
                 row_with_idx = dict(rows[idx])
                 row_with_idx["_idx"] = idx
                 f.write(json.dumps(row_with_idx, ensure_ascii=False) + "\n")
             f.flush()
             done_now = len(done) + start + len(batch_idx)
-            # 累积统计：E[L]/P(L>2048)/tok/s（供 Stage 0 规模决策，仅日志）
+            # 累积统计：E[L]/P(L>2048)/loop_rate/tok/s（供 Stage 0 规模决策与 R-E2 门控，仅日志）
             e_l = total_tok / len(all_lens) if all_lens else 0.0
             p_gt2048 = sum(1 for L in all_lens if L > 2048) / len(all_lens) if all_lens else 0.0
+            loop_rate = n_loop / n_done if n_done else 0.0
             tok_s = total_tok / total_wall if total_wall > 0 else 0.0
             print(f"[{time.strftime('%H:%M:%S')}] {done_now}/{len(todo)} 完成 "
                   f"(本批 {gen_tokens} tok / {dt:.1f}s = {gen_tokens/dt:.0f} tok/s) | "
-                  f"累计 E[L]={e_l:.0f} P(L>2048)={p_gt2048:.2f} {tok_s:.0f} tok/s", flush=True)
+                  f"累计 E[L]={e_l:.0f} P(L>2048)={p_gt2048:.2f} loop_rate={loop_rate:.2%} "
+                  f"{tok_s:.0f} tok/s", flush=True)
 
     # 全部完成：本 shard 合并进主 jsonl（flock 串行化防并行 race），清理本 shard tmp
     merge_shard_into_main(args.jsonl, tmp_path, rows)
     tmp_path.unlink(missing_ok=True)
 
-    # 校验（reload 主 jsonl 看全局空行）
+    # 校验（reload 主 jsonl 看全局空行）+ R5 loop 总率（R-E2 门控 ≤5%）
     final_rows = load_rows(args.jsonl)
     empty = sum(1 for r in final_rows if not r.get("response"))
     print(f"[OK] 完成：{len(final_rows)} 行，response 非空 {len(final_rows)-empty}，"
           f"仍空 {empty}", flush=True)
+    if n_loop:
+        print(f"[R5] 本 shard loop 检测命中 {n_loop}/{n_done}（loop_rate="
+              f"{n_loop/n_done:.2%}，已置空不进 D；R-E2 门控 ≤5%）", flush=True)
     if empty:
         print(f"[WARN] {empty} 行 response 仍空，可重跑本脚本 resume 补齐", flush=True)
 
