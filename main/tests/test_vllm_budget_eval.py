@@ -281,3 +281,55 @@ def test_aggregate_n1_backward_compat():
     assert r["n"] == 2
     assert r["n_samples"] == 1
     assert r["rows"][0]["majority_correct"] is None
+
+
+def test_aggregate_ave_32_paper_protocol():
+    """v2（论文 Table 2）：--metric ave 聚合——每题 n 采样答对比例平均，再全部题平均。"""
+    problems = [("p0", "42"), ("p1", "7")]
+    # 题 0：3 采样 2 对 1 错 → 2/3；题 1：3 采样 0 对 → 0；ave = (2/3 + 0)/2 = 1/3
+    outs = [
+        _out_multi([("a\n\\boxed{42}", [1, 2], "stop"),
+                    ("b\n\\boxed{42}", [1, 2], "stop"),
+                    ("c\n\\boxed{7}", [1, 2], "stop")]),
+        _out_multi([("d\n\\boxed{9}", [1, 2], "stop"),
+                    ("e\n\\boxed{8}", [1, 2], "stop"),
+                    ("f\n\\boxed{6}", [1, 2], "stop")]),
+    ]
+    r = _aggregate_budget(problems, outs, 256, "E2", n_samples=3, metric="ave")
+    assert abs(r["accuracy"] - 1 / 3) < 1e-9
+    assert r["metric"] == "ave"
+    assert r["n_samples"] == 3
+    # majority 对照：题 0 多数 42 → 对；题 1 无多数 → 错；accuracy=0.5
+    r2 = _aggregate_budget(problems, outs, 256, "E2", n_samples=3, metric="majority")
+    assert r2["accuracy"] == 0.5
+
+
+def test_aggregate_dapo_answer_extraction():
+    """v2（论文 A 附录）：--prompt-style dapo 用 Answer: 行提取答案（AIME 整数答案）。"""
+    problems = [("p0", "42")]
+    # dapo 模板契约：答案在最后一行 "Answer: ..."（中途草稿 "answer:" 不取；
+    # AIME 答案均为整数，匹配 -?\d[\d,]*）
+    outs = [_out_multi([
+        ("思考中 answer: 7 草稿\nAnswer: 42", [1, 2], "stop"),
+        ("Answer: 42", [1, 2], "stop"),
+    ])]
+    r = _aggregate_budget(problems, outs, 256, "E2", n_samples=2, metric="ave",
+                          prompt_style="dapo")
+    assert r["accuracy"] == 1.0     # 两采样都提取到 42 → 每题比例 1.0
+    assert r["rows"][0]["final_answer"] == "42"
+    # 中途草稿 "answer: 7" 不得污染提取（取最后一个匹配）
+    assert r["rows"][0]["final_answer"] != "7"
+
+
+def test_parse_args_prompt_style_and_metric_defaults():
+    """v2：--prompt-style 默认 boxed、--metric 默认 majority、--max-model-len 默认 32768（零回归）。"""
+    a = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x"])
+    assert a.prompt_style == "boxed"
+    assert a.metric == "majority"
+    assert a.max_model_len == 32768
+    b = parse_args(["--models", "Base=/x", "--out-dir", "/tmp/x",
+                    "--prompt-style", "dapo", "--metric", "ave",
+                    "--max-model-len", "12288"])
+    assert b.prompt_style == "dapo"
+    assert b.metric == "ave"
+    assert b.max_model_len == 12288
