@@ -795,8 +795,12 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                 eos_l.extend(out["eos_pos"])
             responses = torch.cat(resp_l, dim=0)   # (M*n, T)
             statuses, lengths, eos_pos = stat_l, len_l, eos_l
-            p_b = p_b.repeat_interleave(n_rollout, dim=0)     # 展平：每条响应对应原 prompt
-            cand = cand.repeat_interleave(n_rollout)
+            # ⚠️ 展平行序必须与 torch.cat(resp_l) 一致：resp_l 按【iteration 外层、prompt
+            # 内层】拼接（第 0 次采样的全部 M 条在前）→ 用 repeat（整批重复 n 次）而非
+            # repeat_interleave（单 prompt 连续 n 次，会与 responses 行序错位、配对到错误
+            # prompt——2026-08-27 C2 审阅修复）。
+            p_b = p_b.repeat(n_rollout, 1, 1).reshape(-1, p_b.size(1))  # (M*n, P)
+            cand = cand.repeat(n_rollout)                               # (M*n,)
         else:
             out = _gen(p_b, max_new=max_resp_len)
             responses = out["responses"].to(device)   # vLLM 引擎可能在 rollout_device，回训练 device

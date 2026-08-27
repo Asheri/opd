@@ -1133,7 +1133,7 @@ class FullStackOPDv2:
                                         (l2_cfg.get("disagreement") or {}).get("enabled", True)),
                                     cand=indices, budgets=budgets, budget_t=budget_t,
                                     dists_chunk=int(rollcfg.get("response_dists_chunk", 2)),
-                                    n_rollout=n_rollout,
+                                    n_rollout=int(rollcfg.get("n_rollout", 1)),   # C2：论文 rollout n 透传
                                     dist_engines=dist_engines)
                                 # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
                                 roll_metrics = None

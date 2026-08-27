@@ -64,11 +64,12 @@ stage2:
   scheduling_mode: fully_async
   staleness_threshold: 4
   queue_size: 8
-  kl_reg_coef: 1.0                # adaptive KL 初始值 α0（论文区间 [0.8,2.0] 中值）
+  kl_reg_coef: 1.0                # adaptive KL 初始值 α0（任务 C3：默认 [0.5,2.5] 中值=1.0）
   kl_adaptive: true               # 论文 §2.4 Eq.16：按稠密 reward 符号动态调（默认 false 零回归）
   clip_eps: 0.2
   grad_clip: 1.0
-  lr: 1.0e-6                      # 论文（旧 3e-5 快 30 倍）
+  lr: 1.0e-6                      # 论文（旧 3e-5 快 30 倍）；⚠️ 风险：×120 步学习预算小，
+                                  # E-1b' 通过后若 60 步快评无下游变化，作为自适应决策点
   n_steps: 120                    # 止损线（E-0c 教训；可通过后延 300）
   batch_size: 4
   distributed: false

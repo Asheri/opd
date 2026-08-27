@@ -44,7 +44,7 @@
 |---|---|---|---|
 | **学生**（= ref 教师） | Qwen3-1.7B-**Base**（预训练） | `/root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base` | **待下载**（~3.4GB） |
 | **rl 教师** | Qwen3-1.7B（instruct，SFT+RLHF） | `/root/autodl-tmp/models/Qwen__Qwen3-1.7B` | 已在（现学生） |
-| D（训练数据） | **学生自身 rollout**（1000 条，chat 模板，T=4096，T=1.0，seed 43） | `skywork_50k_base1000.jsonl`（复制+清空后生成） | 待生成 |
+| D（训练数据） | **学生自身 rollout**（1000 条，chat 模板，T=4096，T=1.0，seed 43） | `skywork_50k_base5000.jsonl`（复制+清空后生成） | 待生成 |
 
 - **Δ_T = logπ_instruct − logπ_Base**：同一模型的 post-training 偏移（诚实标注：
   instruct = SFT+RLHF 复合，非纯 RL--**机制等价**于论文 Δ_T，叙事为"机制验证"非逐字复现）。
@@ -175,10 +175,10 @@ import statistics; print('Base 响应平均长度(tokens 近似):', round(statis
 ### 4.1 jsonl 复制 + 清空 response（V7 修正；原文件不动）
 
 ```bash
-cp /root/autodl-tmp/datasets/skywork_50k.jsonl /root/autodl-tmp/datasets/skywork_50k_base1000.jsonl
+cp /root/autodl-tmp/datasets/skywork_50k.jsonl /root/autodl-tmp/datasets/skywork_50k_base5000.jsonl
 python - <<'EOF'
 import json
-p = "/root/autodl-tmp/datasets/skywork_50k_base1000.jsonl"
+p = "/root/autodl-tmp/datasets/skywork_50k_base5000.jsonl"
 rows = [json.loads(l) for l in open(p, encoding="utf-8")]
 n = 0
 for r in rows:
@@ -193,27 +193,27 @@ EOF
 
 ```bash
 /root/miniconda3/bin/python scripts/prepare_skywork_responses.py \
-  --jsonl /root/autodl-tmp/datasets/skywork_50k_base1000.jsonl \
+  --jsonl /root/autodl-tmp/datasets/skywork_50k_base5000.jsonl \
   --model /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base \
-  --apply-chat-template --max-samples 1000 --seed 43 \
-  --max-new-tokens 4096 --temperature 1.0 \
+  --apply-chat-template --max-samples 5000 --seed 43 \
+  --max-new-tokens 2048 --temperature 1.0 \
   --device cuda:0 --batch-size 8 --shard-rank 0 --num-shards 2 --resume &
 /root/miniconda3/bin/python scripts/prepare_skywork_responses.py \
-  --jsonl /root/autodl-tmp/datasets/skywork_50k_base1000.jsonl \
+  --jsonl /root/autodl-tmp/datasets/skywork_50k_base5000.jsonl \
   --model /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base \
-  --apply-chat-template --max-samples 1000 --seed 43 \
-  --max-new-tokens 4096 --temperature 1.0 \
+  --apply-chat-template --max-samples 5000 --seed 43 \
+  --max-new-tokens 2048 --temperature 1.0 \
   --device cuda:1 --batch-size 8 --shard-rank 1 --num-shards 2 --resume &
 wait
 # 判据（R-E2 加强）：jsonl 非空 response 行 = 1000 + 质量统计门控
 python - <<'EOF'
 import json, re
-rows=[json.loads(l) for l in open("/root/autodl-tmp/datasets/skywork_50k_base1000.jsonl", encoding="utf-8")]
+rows=[json.loads(l) for l in open("/root/autodl-tmp/datasets/skywork_50k_base5000.jsonl", encoding="utf-8")]
 rs=[r["response"] for r in rows if r.get("response")]
 n=len(rs)
 noans=sum(1 for r in rs if "\\boxed{" not in r and "answer" not in r.lower())
 short=sum(1 for r in rs if len(r)<100)
-print(f"非空={n}/1000 无答案≈{noans/n:.2%} 过短(<100字符)={short/n:.2%} 平均长度={sum(len(r) for r in rs)//max(n,1)}")
+print(f"非空={n}/5000 无答案≈{noans/n:.2%} 过短(<100字符)={short/n:.2%} 平均长度={sum(len(r) for r in rs)//max(n,1)}")
 EOF
 # 门控（写死）：无答案率 ≤30% 且 过短率 ≤20% 才继续；超限 → 停，重评 D 生成策略
 # 抽 3 条 decode 无乱码无 loop（保留原判据）
@@ -226,18 +226,19 @@ student_path:     /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base
 teacher_rl_path:  /root/autodl-tmp/models/Qwen__Qwen3-1.7B        # instruct = rl 教师
 teacher_ref_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base   # = 学生初始
 dataset:
-  path: /root/autodl-tmp/datasets/skywork_50k_base1000.jsonl
+  path: /root/autodl-tmp/datasets/skywork_50k_base5000.jsonl
   apply_chat_template: true
-  max_response_len: 4096        # D 长度对齐（C2 守卫）
+  max_response_len: 2048        # C4 短视界（论文 §4.2 最稳）
 stage1:
-  cache_path: /root/autodl-tmp/cache_qwen3_base_opd.pt
+  cache_path: /root/autodl-tmp/cache_qwen3_base_opd_t16.pt
   build_batch_size: 4           # T 翻倍 -> batch 减半
 base:
-  materialized_size: 1000
+  materialized_size: 5000         # C4 定案（on-policy 锚点池）
 stage2:
   n_steps: 120                  # E-0c 教训：120 步门控，不盲跑 300
-  kl_reg_coef: 0.1              # RC2 教训：0.02 作废；0.1 中档信任域
-  batch_size: 2                 # T=4096 激活减半
+  kl_reg_coef: 1.0              # C4：adaptive KL 初始值 α0（论文区间 [0.5,2.5] 中值）
+  kl_adaptive: true             # C3：论文 §2.4 Eq.16 自适应（按稠密 reward 符号）
+  batch_size: 4                 # T=2048 下 batch4（旧 E2 同口径）
 run:
   checkpoint_every: 20          # 6 断点供拐点扫描
 ```
@@ -247,7 +248,7 @@ run:
 ```bash
 /root/miniconda3/bin/python -m fullstack_opd_v2 cache \
   --config configs/qwen3_base_opd.yaml --set stage1.load_cache=false \
-  --device cuda:0 --out /root/autodl-tmp/cache_qwen3_base_opd.pt
+  --device cuda:0 --out /root/autodl-tmp/cache_qwen3_base_opd_t16.pt
 # 判据：metadata prompt_format=chat、T=4096、num_samples=1000；verify_consistency 过
 ```
 
@@ -267,7 +268,7 @@ run:
 # 回退：vLLM refresh 权重同步异常时去掉 rollout_engine=vllm（退 toy 引擎，慢但稳）
 ```
 
-（矩阵名 S2_E2_opd1024 只为启用 L2 refresh；`--set l2.rollout.max_new_tokens=4096`
+（矩阵名 S2_E2_opd1024 只为启用 L2 refresh；`--set l2.rollout.max_new_tokens=2048`
 后到覆盖矩阵的 1024。**eos 档 = R-E1 冒烟验证结果**：Base 不产 im_end → 151643（默认，
 上文已改）；若冒烟证明 Base 产 im_end，可改回 151645——两档均需与 D 的 response
 （Base 生成）的停止 token 一致，否则 refresh 无 eos 样本。）
