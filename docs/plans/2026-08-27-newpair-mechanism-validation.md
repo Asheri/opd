@@ -2,6 +2,13 @@
 
 > **性质：执行计划（待批准）**。服务器恢复后执行；总计 ~6-7h 墙钟 / ~10 GPU·h。
 > 依据：`2026-08-27-opd-final-report.md`（复现失败定稿）+ 本轮逐项代码核对（§1）。
+>
+> **审阅修正（2026-08-27，主会话审阅意见落地）**：
+> - R-E1（必须）：训练 eos 用 Base 原生 `151643`（非 instruct `151645`）——Base 权重未学 `im_end` 语义，补丁不改权重；§3.1 冒烟加 im_end 生成验证后定档。
+> - R-E2（必须）：D 生成后加质量统计门控（no_answer_rate ≤30%），替代"抽 3 条"弱判据。
+> - R-S1：Base 下载后词表/tokenizer 校验（V9 + 下载完整性）。
+> - R-S2：E-1b' sample 后检查 Base 响应长度（过短则提预算）。
+> - R-S3：Phase 2 快评（100 题）与全量（500）一致性核对，防噪声选错步。
 > 核心思路：旧失败主因是**赔率结构**（教师对 shift 仅 +0.05、学生起点 0.816 已≈教师上限）。
 > 换大 shift 同族对（Base↔Instruct，理论迁移空间 = 0.816 − Base 实测值），回到论文
 > on-policy 语义（D = 学生自身 rollout），全部基建零改动复用。
@@ -63,7 +70,16 @@ PYTHONIOENCODING=utf-8 /root/miniconda3/bin/python -m pytest main/tests/test_vll
 # 下载 Base（AutoDL 加速）
 source /etc/network_turbo
 huggingface-cli download Qwen/Qwen3-1.7B-Base --local-dir /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base
-```
+
+# R-S1：下载后词表/tokenizer 校验（V9 一致性 + 下载完整性，防后半程崩）
+python -c "
+from transformers import AutoTokenizer
+a=AutoTokenizer.from_pretrained('/root/autodl-tmp/models/Qwen__Qwen3-1.7B')
+b=AutoTokenizer.from_pretrained('/root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base')
+assert a.vocab_size==b.vocab_size==151936, (a.vocab_size,b.vocab_size)
+print('词表一致 151936 ✅；Base eos_token_id=', b.eos_token_id)
+"
+# 判据：词表一致；记录 Base 原生 eos_token_id（预期 151643 endoftext）
 
 ### 3.1 chat 模板补丁（V6 修正，~2min，必做）
 
@@ -81,6 +97,26 @@ json.dump(b, open(dst, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 EOF
 # 冒烟判据（写死）：输出含 <|im_start|>user 与 <|im_end|>，无异常
 python -c "from transformers import AutoTokenizer as T; print(T.from_pretrained('/root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base').apply_chat_template([{'role':'user','content':'1+1='}], add_generation_prompt=True, tokenize=False))"
+
+# R-E1：im_end 生成验证——决定训练 eos 档（Base 权重未学 im_end 语义，模板补丁不改权重）
+python - <<'EOF'
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+tok = AutoTokenizer.from_pretrained('/root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base')
+model = AutoModelForCausalLM.from_pretrained(
+    '/root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base', torch_dtype=torch.bfloat16, device_map="cuda:0")
+msgs = tok.apply_chat_template([{"role": "user", "content": "Solve for x: 2x+3=7."}],
+                               add_generation_prompt=True, tokenize=False)
+ids = tok(msgs, return_tensors="pt").input_ids.cuda()
+out = model.generate(ids, max_new_tokens=200, do_sample=True, temperature=1.0)
+text = tok.decode(out[0])
+has_im_end = tok.eos_token_id in out[0].tolist()  # Base 原生 endoftext
+print("生成含 im_end token(151645):", 151645 in out[0].tolist(), "| eos 触发(151643):", has_im_end)
+print("样本:", text[:200].replace("\n", " | "))
+EOF
+# 判据：输出正常文本 + 记录 eos 行为——refresh 训练 eos 档据此定：
+#   Base 能产出 im_end → 训练 --eos-id 151645（与 instruct 模板一致）
+#   Base 不产 im_end → 训练 --eos-id 151643（Base 原生 endoftext；推荐默认）
 ```
 
 ### 3.2 学生基线测量（GPU0，~50min）
@@ -113,6 +149,14 @@ O=/root/autodl-tmp/newpair/delta_corr
   --teacher-ref /root/autodl-tmp/models/Qwen__Qwen3-1.7B-Base \
   --teacher ref --device cuda:1 --out $O
 /root/miniconda3/bin/python scripts/delta_correctness_corr.py --stage correlate --out $O
+# R-S2：sample 后检查 Base 响应长度（B4096 下预训练续写可能过短 → Δ 域太小）
+python -c "
+import json
+rows=[json.loads(l) for l in open('$O/samples.jsonl')]
+rt=[len(r['response'].split()) for r in rows]
+import statistics; print('Base 响应平均长度(tokens 近似):', round(statistics.mean(rt),1), '中位:', statistics.median(rt))
+"
+# 判据：平均长度 < 200 → 提高 sample --budget 或接受（on-policy 本来语义）；记录于报告
 ```
 
 ### 3.4 Phase 0 门控（写死）
@@ -161,7 +205,18 @@ EOF
   --max-new-tokens 4096 --temperature 1.0 \
   --device cuda:1 --batch-size 8 --shard-rank 1 --num-shards 2 --resume &
 wait
-# 判据：jsonl 非空 response 行 = 1000；抽 3 条 decode 无乱码无 loop
+# 判据（R-E2 加强）：jsonl 非空 response 行 = 1000 + 质量统计门控
+python - <<'EOF'
+import json, re
+rows=[json.loads(l) for l in open("/root/autodl-tmp/datasets/skywork_50k_base1000.jsonl", encoding="utf-8")]
+rs=[r["response"] for r in rows if r.get("response")]
+n=len(rs)
+noans=sum(1 for r in rs if "\\boxed{" not in r and "answer" not in r.lower())
+short=sum(1 for r in rs if len(r)<100)
+print(f"非空={n}/1000 无答案≈{noans/n:.2%} 过短(<100字符)={short/n:.2%} 平均长度={sum(len(r) for r in rs)//max(n,1)}")
+EOF
+# 门控（写死）：无答案率 ≤30% 且 过短率 ≤20% 才继续；超限 → 停，重评 D 生成策略
+# 抽 3 条 decode 无乱码无 loop（保留原判据）
 ```
 
 ### 4.3 新配置 `configs/qwen3_base_opd.yaml`（复制 skywork_17b.yaml 改 9 处）
@@ -203,7 +258,7 @@ run:
   --config configs/qwen3_base_opd.yaml \
   --run-dir /root/autodl-tmp/runs_newpair/e1_opd4096 \
   --names S2_E2_opd1024 --device cuda:0 --n-steps 120 \
-  --eos-id 151645 \
+  --eos-id 151643 \
   --set stage2.rollout_engine=vllm \
   --set l2.rollout.max_new_tokens=4096 \
   --set stage2.gradient_checkpointing=true \
@@ -213,7 +268,9 @@ run:
 ```
 
 （矩阵名 S2_E2_opd1024 只为启用 L2 refresh；`--set l2.rollout.max_new_tokens=4096`
-后到覆盖矩阵的 1024。）
+后到覆盖矩阵的 1024。**eos 档 = R-E1 冒烟验证结果**：Base 不产 im_end → 151643（默认，
+上文已改）；若冒烟证明 Base 产 im_end，可改回 151645——两档均需与 D 的 response
+（Base 生成）的停止 token 一致，否则 refresh 无 eos 样本。）
 
 ### 4.6 Phase 1 止损门控（训练中）
 
@@ -245,6 +302,10 @@ done
 
 最优 step（快评最高者）跑全量 MATH500 B8192@3（双卡可用两进程分半：`--n-limit` 不支持
 分半，改一进程 500 题 ~50min，另一卡并行跑 AIME24 同口径）。
+
+**R-S3 快评→全量一致性**：快评（100 题）选步后，全量前先核对 100 题子集在快评与全量中的
+acc 是否一致（同 100 题的重跑比对）——若不一致（噪声大）说明 100 题区分度不足，改为
+200 题快评或取快评 top-2 步全量对比，防噪声选错步。
 
 ### 5.3 判定表（写死）
 
