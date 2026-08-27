@@ -1019,6 +1019,9 @@ class FullStackOPDv2:
                             loop_min_len = int(rollcfg.get("loop_min_len", 8))
                             # IMP-1c：rollout 来源（默认 student=主路径；teacher=仅诊断/上界）。
                             rollout_source = str(rollcfg.get("rollout_source", "student"))
+                            # Direct-OPD 论文 rollout n：每 prompt 每次 refresh 独立采样 n 条
+                            # （默认 1 零回归；n>1 全部进入 refresh 池，多采样降方差）。
+                            n_rollout = int(rollcfg.get("n_rollout", 1))
                             if rollout_source == "teacher":
                                 logger.warning(
                                     "[L2] rollout_source=teacher 是诊断/上界实验专用（y~pi_teacher_rl），"
@@ -1130,6 +1133,7 @@ class FullStackOPDv2:
                                         (l2_cfg.get("disagreement") or {}).get("enabled", True)),
                                     cand=indices, budgets=budgets, budget_t=budget_t,
                                     dists_chunk=int(rollcfg.get("response_dists_chunk", 2)),
+                                    n_rollout=n_rollout,
                                     dist_engines=dist_engines)
                                 # Stage 2：status 指标落盘（rollout/n_total/n_appended/n_eos/...）
                                 roll_metrics = None
