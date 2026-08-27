@@ -22,9 +22,13 @@
 #             --run-dir /root/autodl-tmp/runs_r1/e1_opd2048 --names S2_E2_opd1024 \
 #             --device cuda:0 --n-steps 300 --eos-id 151645 \
 #             --set stage2.rollout_engine=vllm --set stage2.gradient_checkpointing=true \
-#             --set l2.cache.refresh_min_interval=1 --set l2.m_refresh=8 \
+#             --set l2.t_train=2 --set l2.cache.refresh_min_interval=1 \
+#             --set l2.m_refresh=8 \
 #             --set l2.rollout.max_new_tokens=2048 --set l2.rollout.n_rollout=4 \
 #             --set l2.rollout.repetition_penalty=1.0
+#   ⚠️ R3（2026-08-27 数据质量审阅）：必须显式 --set l2.t_train=2（默认 100 会让
+#   refresh 相位仅 300/100=3 次 -> on-policy ~2% 重蹈旧失败；t_train=2 时 150 相位
+#   x32 条 = 4800 条 on-policy vs 5000 静态 ≈49%）。
 
 model_kind: hf
 student_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B        # 学生 = 论文主学生（Qwen3-1.7B）

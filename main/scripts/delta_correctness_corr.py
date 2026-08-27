@@ -50,7 +50,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fullstack_opd_v2.budget_eval import BudgetEvaluator, extract_final_answer  # noqa: E402
+from fullstack_opd_v2.budget_eval import BudgetEvaluator, extract_final_answer, format_prompt  # noqa: E402
 from fullstack_opd_v2.eval_aime import _grade_answer_sympy  # noqa: E402
 
 DEFAULT_STUDENT = "/root/autodl-tmp/models/Qwen__Qwen3-1.7B"
@@ -221,6 +221,10 @@ def _sample_stage(args) -> None:
     os.makedirs(args.out, exist_ok=True)
     problems = _load_problems(args.dataset, args.n_problems)
     tok = AutoTokenizer.from_pretrained(args.student)
+    # R2：dapo 模板先 format_prompt 再包 chat（对齐训练/评估的 DAPO 协议）；
+    # boxed（默认零回归）保持旧行为：problem 原文直接包 chat。
+    if args.prompt_style == "dapo":
+        problems = [(format_prompt(p, "dapo"), gt) for p, gt in problems]
     wrapped = [tok.apply_chat_template([{"role": "user", "content": p}],
                                        add_generation_prompt=True, tokenize=False)
                for p, _ in problems]
@@ -350,6 +354,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--chat-template", action="store_true",
                    help="用 student chat template 包裹（对齐训练 apply_chat_template=true）")
+    p.add_argument("--prompt-style", choices=["boxed", "dapo"], default="boxed",
+                   help="R2（2026-08-27 数据质量审阅）：sample 阶段 prompt 模板，dapo 时"
+                        "先 format_prompt(p, 'dapo') 再包 chat template--使 E-1b' 相关性"
+                        "域与训练/评估 DAPO 模板一致（默认 boxed 零回归）")
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--chunk", type=int, default=20, help="每批题数（sample）/ 每批条数（logp）")
     # logp 参数

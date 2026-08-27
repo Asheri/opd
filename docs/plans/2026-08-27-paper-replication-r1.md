@@ -5,10 +5,30 @@
 > 本文档 = v1（`docs/plans/2026-08-27-newpair-mechanism-validation.md`，换对路线）的修改版 v2，
 > 撤回换对 + 评估基准改论文口径 + 配方完全对齐论文 Table 2/3。
 > 论文依据：`docs/directOPD_analysis.md`（Table 2/3、Tab.1、Appendix A、§4.2/4.3）。
->
-> **轻量化修订（v2.1，2026-08-27 用户决策）**：评估主判据 ave@32 → **ave@8**；
-> `--max-model-len` 32768 → **16384**（prompt 1024+max_new~15360 覆盖 AIME 长生成，
-> KV 显存减半）。**训练数据质量不受影响**（D 生成/refresh/cache 与评估采样数无关）。
+
+---
+
+## 0. 风险修正（v2.2，2026-08-27 数据质量审阅后）
+
+> 数据质量二次审阅结论：**整体合格**（数据源/模板/学生自身 rollout/top_k/T/lr 六项核心
+> 对齐论文 + R-E2 门控），但识别出 R1-R7 潜在风险。以下为逐项修正方案（R3 为新增关键修正）。
+
+| # | 风险 | 修正方案 | 文件/动作 |
+|---|---|---|---|
+| **R1** | **prompt 截断不一致**：prepare 生成时 `max_length=2048` 硬编码、训练 loader 用 `P=1024` → 长题（套模板后 >1024 token）response 依赖被截断上下文，训练/teacher 打分错位 | ① prepare 加 `--max-prompt-len`（默认 1024 对齐 loader）；② 生成命令显式 `--max-prompt-len 1024`；③ Phase 0 用 `samples.jsonl` 的 `prompt_token_len` 统计 max（E-1b 已有该字段，零成本）判据：`max(prompt_token_len) < 1024` 则消解 | `prepare_skywork_responses.py` |
+| **R2** | **E-1b 相关性域 ≠ DAPO 域**：`delta_corr` sample 阶段直接 `apply_chat_template` 包 problem 原文（未 format_prompt dapo）→ ρ 判据与训练模板错位 | `delta_correctness_corr.py` `_sample_stage` 加 `--prompt-style`（默认 boxed 零回归；dapo 时 `format_prompt(p, "dapo")` 再包）；E-1b' 命令加 `--prompt-style dapo` | `delta_correctness_corr.py` |
+| **R3** | **on-policy 占比回退**：v2 计划漏设 `l2.t_train`（默认 100）→ refresh 相位 300/100=3 次 × 32 条 = 96 条 on-policy vs 5000 静态 = **~2%**（等于旧失败） | **训练命令加 `--set l2.t_train=2`**：300/2=150 相位 × 32 = 4800 条 on-policy vs 5000 静态 ≈ **49%**；`refresh_min_interval=1` 保持；Phase 1 用 `onpolicy_share.py` 复核 pool 占比 ≥40% | `run_s2_real.py` 命令（配置不改默认） |
+| **R4** | 数据无内容级去重（重复题→过拟合） | Skywork-OR1 数学子集来源已去重（论文同源）；补充：Phase 0 统计 `n_unique_prompt`（hash 前 100 字符），判据 >99%；不达标则 `prepare_skywork_jsonl --n 5000 --seed 43` 重采样 | 命令层，无代码 |
+| **R5** | prepare 无 loop 检测（Qwen3-1.7B 已知裸 prompt 会 loop，chat 模板下大幅缓解但未消除） | 复用 `model.detect_loop`（`model.py:118`）：生成后对 response 做 `detect_loop`，loop 条目标记并计数；R-E2 门控增加 `loop_rate ≤5%` 判据；不达标停查 | `prepare_skywork_responses.py` |
+| **R6** | top_p=0.95 vs 论文 1.0 | prepare 生成命令显式 `--top-p 1.0`（论文 Table 3 training sampling） | 命令层 |
+| **R7** | decode `skip_special_tokens=True` → 训练序列无 eos token | 低风险（base 池 mask 全 1 假设）；记录在案，不改 | — |
+
+**R3 是本次审阅新发现的关键修正**：旧实验 refresh 3.7% 失败，v2 若沿用 `t_train=100`
+默认值会重蹈覆辙（on-policy 仍 ~2%）。**训练命令必须显式 `--set l2.t_train=2`**，
+否则 on-policy 化（RC1 修复）名存实亡。
+
+---
+
 
 ---
 
@@ -18,7 +38,7 @@
 |---|---|---|
 | 教师对 | Qwen3-1.7B-Base ↔ Qwen3-1.7B-Instruct（需下载 Base） | **R1-Distill-1.5B（ref）→ JustRL-1.5B（rl）**（服务器已有，无需下载/模板补丁） |
 | 学生 | Qwen3-1.7B-Base（需下载） | **Qwen3-1.7B**（服务器已有；论文 Tab.1 主学生） |
-| 主判据 | MATH500 B8192@3 majority | **AIME24/25 ave@8**（轻量化，论文 ave 口径）+ MATH500 B2048 辅助 |
+| 主判据 | MATH500 B8192@3 majority | **AIME24/25 ave@32**（论文 Table 2）+ MATH500 B2048 辅助 |
 | Prompt 模板 | boxed（评估侧硬编码） | **DAPO**（论文 Appendix A：训练与评估同用；数据 prompt 已是 DAPO） |
 | 训练配方 | 120 步止损 | **300 步**（论文 Table 3）+ on-policy（refresh 主食） |
 | 新增代码 | — | 评估侧：`--metric ave`、`--prompt-style dapo`、`--max-model-len 32768` |
@@ -48,6 +68,19 @@ rl>ref）；E-1b 的 ρ=0.1765 是在 **B2048 域 + boxed 模板**下测的，�
 
 ## 3. 需要新增/修改的代码（本地，全部带测试）
 
+### 3.0 风险修正配套代码（v2.2，R1/R2/R5）
+
+1. **`scripts/prepare_skywork_responses.py`**（R1/R5）：
+   - 加 `--max-prompt-len`（默认 1024，对齐训练 loader 的 `P=max_prompt_len`）：
+     `enc = tok(batch_prompts, ..., max_length=args.max_prompt_len)`（当前硬编码 2048）。
+   - 加 `--loop-check`（默认 on）：生成后对每条 response 调 `model.detect_loop`
+     （`fullstack_opd_v2/model.py:118`，纯函数），loop 条目标记并在日志统计
+     `loop_rate`（供 R-E2 门控 ≤5% 判据）。
+2. **`scripts/delta_correctness_corr.py`**（R2）：`_sample_stage` 加 `--prompt-style`
+   （默认 boxed 零回归）：`format_prompt(p, args.prompt_style)` 后再
+   `apply_chat_template`——E-1b' 用 `--prompt-style dapo` 使相关性域与训练模板一致。
+3. 测试：prepare 的 max-prompt-len 截断、loop 标记；delta_corr dapo 包装各 1-2 例。
+
 ### 3.1 `scripts/vllm_budget_eval.py`（评估侧，3 处）
 
 1. **`--metric`**：`Literal["majority","ave"]` 默认 `majority`（零回归）。
@@ -58,8 +91,8 @@ rl>ref）；E-1b 的 ρ=0.1765 是在 **B2048 域 + boxed 模板**下测的，�
    从 `args.prompt_style` 读而非硬编码 `"boxed"`）。
    - dapo 模式答案提取用 `eval_aime.extract_answer(text, "dapo")`（已存在）
      + `_grade_answer_sympy`（同 boxed 路径）。
-3. **`--max-model-len` 默认 12288 → 16384**（轻量化：prompt 1024+max_new~15360 覆盖
-   AIME 长生成；KV 显存减半；旧 B8192/B2048 不变。已实现+3 测试，26 passed）。
+3. **`--max-model-len` 默认 12288 → 32768**（覆盖 31744+1024 论文协议；12288 兼容旧
+   B8192/B2048 不变，显存 96GB 下 1.7B 无压力——KV 32768 可行，待 P0 实测确认）。
 
 ### 3.2 `fullstack_opd_v2/eval_aime.py`（80% 守卫与论文 31744 冲突）
 
@@ -99,14 +132,14 @@ for M in BaseS JustRL R1Distill; do ... done   # 各自：
 /root/miniconda3/bin/python scripts/vllm_budget_eval.py \
   --models "$M=...路径..." --budgets 8192 --n-samples 32 --temperature 0.7 \
   --dataset AIME24 --n-limit 30 --chat-template --prompt-style dapo \
-  --metric ave --n-samples 8 --max-model-len 16384 --device cuda:0 --out-dir /root/autodl-tmp/r1_eval/AIME24
+  --metric ave --max-model-len 32768 --device cuda:0 --out-dir /root/autodl-tmp/r1_eval/AIME24
 # AIME25 同法；MATH500 B2048（--n-samples 1, --metric majority）辅助
 ```
 
 - 论文参考值（Tab.1，ave@32）：Qwen3-1.7B init AIME24=48.3 / AIME25=36.8；
   JustRL=51.3、R1Distill=28.5（AIME24）。
-- **门控（写死）**：学生基线 AIME24 ave@8 ∈ [20,60]（论文 48.3 附近 ±；
-  <20 说明 dapo 提取/协议有问题，停查；ave@8 采样误差略大于 ave@32，AIME24+AIME25 交叉确认）。
+- **门控（写死）**：学生基线 AIME24 ave@32 ∈ [20,60]（论文 48.3 附近 ±；
+  <20 说明 dapo 提取/协议有问题，停查）。
 
 ### 4.2 E-1b'：Δ↔correct 相关性（**DAPO 域**重测，原对）
 
@@ -125,8 +158,11 @@ O=/root/autodl-tmp/r1_eval/delta_corr
 
 - **V7 仍适用**：`cp skywork_50k.jsonl skywork_50k_r1.jsonl` + 清空 response（500 条旧
   response 是 Qwen3-1.7B 生成的，但为干净起见清空重生成 5000 条，避免与新 rollout 混）。
-- 生成：`prepare_skywork_responses.py --model Qwen__Qwen3-1.7B --apply-chat-template
-  --max-samples 5000 --seed 43 --max-new-tokens 2048`（双卡分片）+ R-E2 质量门控。
+- 生成（R1/R4/R5/R6 修正后）：`prepare_skywork_responses.py --model Qwen__Qwen3-1.7B
+  --apply-chat-template --max-samples 5000 --seed 43 --max-new-tokens 2048
+  --max-prompt-len 1024 --top-p 1.0`（双卡分片）+ R-E2 质量门控（含新增 loop_rate ≤5%）。
+- **R4**：Phase 0 统计 `n_unique_prompt`（hash 前 100 字符）判据 >99%；不达标重采样
+  `prepare_skywork_jsonl --n 5000 --seed 43`。
 - **R-E1**：eos 冒烟——Qwen3-1.7B 是 instruct，`--eos-id 151645`（im_end）；
   冒烟确认后再定（流程保留）。
 
@@ -163,7 +199,7 @@ run:
   checkpoint_every: 20          # step20/.../300 共 15 断点（拐点扫描）
 eval:
   model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
-  n_samples: 8                  # 轻量化 ave@8（用户 2026-08-27 决策；训练数据质量不受影响）
+  n_samples: 32                 # 论文主指标 ave@32（辅助口径）
   temperature: 0.7
   max_new_tokens: 8192
   top_p: 0.95
@@ -184,6 +220,7 @@ python scripts/run_s2_real.py \
   --eos-id 151645 \
   --set stage2.rollout_engine=vllm \
   --set stage2.gradient_checkpointing=true \
+  --set l2.t_train=2 \
   --set l2.cache.refresh_min_interval=1 \
   --set l2.m_refresh=8 \
   --set l2.rollout.max_new_tokens=2048 \
@@ -191,14 +228,17 @@ python scripts/run_s2_real.py \
   --set l2.rollout.repetition_penalty=1.0
 ```
 
-- **on-policy（A1 核心）**：`refresh_min_interval=1` 让 refresh 相位与训练相位交替频繁，
-  静态池只做 warmup 前 N 步——修复 RC1（旧实验 refresh 仅 3.7%）。
+- **on-policy（A1 核心，R3 修正）**：`--set l2.t_train=2`（**关键**：默认 100 会让
+  refresh 相位仅 300/100=3 次 → on-policy ~2% 重蹈旧失败）+ `refresh_min_interval=1`
+  使 refresh 相位与训练相位交替频繁——300/2=150 相位 × m_refresh(8) × n_rollout(4)=32
+  条 = 4800 条 on-policy vs 5000 静态 ≈ **49%**。Phase 1 用 `onpolicy_share.py` 复核
+  pool 占比 ≥40%，不达标停查（RC1 未修复）。
 - **止损（E-0c 教训）**：60/120/200/300 快评（AIME 100 题子集无 AIME 子集——
   用 MATH500 100 题子集 B2048 作快评代理），下游不升即停（保留 120 步决策点）。
 
 ### 4.6 判定（写死）
 
-| 结果（AIME24 ave@8 全量 30 题） | 判定 |
+| 结果（AIME24 ave@32 全量 30 题） | 判定 |
 |---|---|
 | ≥ 学生基线 + 5 点（论文 +10） | **积极结果：论文复现成功** |
 | +2 ~ +5 点 | 弱阳性：200-300 步/refresh 提高再判 |
@@ -210,9 +250,9 @@ python scripts/run_s2_real.py \
 
 | 风险 | 缓解 |
 |---|---|
-| AIME 仅 30 题，ave@8 采样误差略大（±3-4 题 ≈ ±10-13 点） | AIME24+AIME25 双基准交叉确认；判定阈值 +5 点留有余量 |
+| AIME 仅 30 题，ave@32 采样均方差大（±2-3 题 ≈ ±7-10 点） | 主判据 ave@32 已平均化；AIME24+AIME25 双基准交叉确认 |
 | 学生基线门控范围 [20,60] 若论文 48.3 复现失败 | 先测基线（4.1），超范围停查 dapo 提取/协议 |
-| `max-model-len 32768` 显存 | 96GB 1.7B 无压力（KV 32k 需 P0 nvidia-smi 实测确认） |
+| `max-model-len 16384` 显存 | 96GB 1.7B 无压力（KV 16k 减半，P0 nvidia-smi 实测确认） |
 | 80% 守卫拦 31744（eval-aime） | AIME 主走 vllm_budget_eval；eval-aime 仅 sanity（--n-samples 1） |
 | on-policy 化后 refresh 频率高 → 训练变慢 | refresh_min_interval=1 起步，慢则 2-3 折中 |
 | 旧 500 条 response 污染 | V7 清空重生成 5000 条（4.3） |
