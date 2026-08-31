@@ -13,7 +13,11 @@ def _write_cfg(tmp_path, n_steps=3):
         "n_prompts: 8\n"
         "stage0:\n  n_rl_steps: 2\n"
         "stage2:\n  n_steps: 3\n  batch_size: 4\n"
-        f"stage1:\n  cache_path: {tmp_path / 'c.pt'}\n",
+        # P-OPD（2026-08-31）：base 池已删，CLI train 走纯 on-policy
+        f"stage1:\n  cache_path: {tmp_path / 'c.pt'}\n  skip: true\n"
+        "l2:\n  enabled: true\n  pure_refresh: true\n  t_train: 2\n  m_refresh: 4\n"
+        "  cache:\n    refresh_size: 8\n    max_response_length: 4\n"
+        "    min_refresh_pool: 0\n",
         encoding="utf-8")
     return cfg
 

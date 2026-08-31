@@ -610,8 +610,46 @@ def _response_dists_topk(model, prompts, responses, K, chunk: int = 2):
     return torch.cat(ids_l, 0), torch.cat(logp_l, 0)
 
 
+def _rl_ref_delta_only_stu(s_old_ids: torch.Tensor,
+                           rl_logp_dist: torch.Tensor,
+                           ref_logp_dist: torch.Tensor) -> torch.Tensor:
+    """only_stu 口径（论文）：教师对【学生 top-K 完整支撑】的 logp 差，无交集稀释。
+
+    s_old_ids: (B,T,Ks) 行为学生 top-K id（rollout 时学生自身支撑）；
+    rl_logp_dist / ref_logp_dist: (B,T,V) 教师 rl/ref 的【已归一 log-softmax 分布】
+    （response_dists 输出；论文 logits/temperature 后的 log_softmax 等价——温度已在
+    模型侧处理，temperature=1.0 恒等）。
+
+    返回 delta (B,T,Ks) = rl_logp@ids − ref_logp@ids。
+
+    与官方 `_compute_teacher_top_k_log_probs`（only_stu）数学一致：
+    官方 = gather(raw_logits, ids) − logsumexp(raw_logits)（logsumexp 与 token 无关），
+    本式 = gather(log_softmax(logits), ids) = gather(logits, ids) − logsumexp。同值。
+
+    ⚠️ 关键语义：Δ 定义在【学生完整 top-K 支撑】上，而非教师自身 top-K——
+    每个学生高概率 token 都有完整 Δ（论文 Eq.13 加权的基础），无 top-K 交集稀释
+    （对比旧 `_rl_ref_delta_k`：教师 rl 自身 top-K + ref gather → 交集才有效）。
+
+    跨词表（F2）：学生 vocab > 教师 vocab 时（如 Qwen3 151936 vs DeepSeek 系教师），
+    学生 top-K id 超出教师词表 → gather 越界。这里 clamp + mask：超界位置（教师无该
+    token）Δ 置 0（语义 = 该 token 教师偏移不可知，按 0 贡献）。
+    """
+    if s_old_ids.device != rl_logp_dist.device:       # F4：跨设备（vLLM s_old vs HF 教师）
+        s_old_ids = s_old_ids.to(rl_logp_dist.device)
+    V = rl_logp_dist.size(-1)
+    if s_old_ids.numel() and int(s_old_ids.max()) >= V:
+        valid = s_old_ids < V
+        ids = s_old_ids.clamp(max=V - 1)
+        delta = rl_logp_dist.gather(-1, ids) - ref_logp_dist.gather(-1, ids)
+        return delta.masked_fill(~valid, 0.0)
+    return rl_logp_dist.gather(-1, s_old_ids) - ref_logp_dist.gather(-1, s_old_ids)
+
+
 def _rl_ref_delta_k(model_rl, model_ref, prompts, responses, top_k, chunk: int = 2):
     """per-chunk 联合算 rl top-k（ids_k, rl_k）与 ref 在该 top-k 支撑的 delta_k。
+
+    ⚠️ 旧口径（教师自身 top-K 支撑，交集稀释）——仅保留向后兼容（旧测试/诊断）；
+    on-policy 训练请用 only_stu（`_rl_ref_delta_only_stu`）。
 
     rl/ref 同 chunk 计算完即 del，避免两份完整 (M,T,V) fp32 同时驻留。返回
     (ids_k, rl_k, delta_k)，均 (M,T,K)。top_k 需 < 词表（调用方保证）。
@@ -759,7 +797,10 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
                                            budget_set, exploration_fraction)
         p_b = prompts[cand].to(device)
         groups = group_by_budget(cand, budgets)          # {budget: [global_prompt_idx,...]}
-        max_b = int(budgets.max().item())
+        # P-OPD 修复（2026-08-31）：预算模式下 T 必须恒定——ring buffer 槽位按首相位 T
+        # 分配，后续相位 budgets.max() 变化（冷启动 v 全等→全中档，后续分位数展开→更大）
+        # 会 append shape 崩。用 budget_set 最大值保证各相位响应同宽。
+        max_b = int(max(budget_set)) if budget_set else int(budgets.max().item())
         resp_all = torch.full((M, max_b), pad_id, dtype=torch.long, device=device)
         statuses = [None] * M; lengths = [0] * M; eos_pos = [None] * M
         budgets_used = int(budgets.sum().item())
@@ -855,26 +896,38 @@ def run_refresh_phase(student, teacher_rl, teacher_ref, student_ref,
     # 训练后 expandable_segments 碎片缓存（实测 reserved 61GB/峰值 74GB，2026-08-17 GPU）
     # 下全量驻留会 OOM。D 计算（=True）仍需完整 rl_dist/ref_dist，保留原路径。
     Ks = ring_buffer.student_top_k
-    if compute_disagreement:
-        with torch.no_grad():
-            s_full = _response_dists_batched(student, p_b_v, resp_v, dists_chunk)   # (M,T,V)
-        s_old_ids = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).indices
-        s_old_logp = s_full.topk(min(Ks, s_full.size(-1)), dim=-1).values
-        del s_full
-        rl_dist = _response_dists_batched(teacher_rl, p_b_v, resp_v, dists_chunk)   # (M,T,V)
-        tk = rl_dist.topk(top_k, dim=-1)
-        ids_k, rl_k = tk.indices, tk.values
-        ref_dist = _response_dists_batched(teacher_ref, p_b_v, resp_v, dists_chunk)
-        delta_k = rl_k - ref_dist.gather(-1, tk.indices)
-    else:
-        with torch.no_grad():
-            s_old_ids, s_old_logp = _dist_topk_cached(
-                dist_engines.get("s_old") if dist_engines else None,
-                student, p_b_v, resp_v, Ks, dists_chunk)
-            ids_k, rl_k, delta_k = _dist_rl_ref_delta(
-                dist_engines.get("rl") if dist_engines else None,
-                dist_engines.get("ref") if dist_engines else None,
-                teacher_rl, teacher_ref, p_b_v, resp_v, top_k, dists_chunk)
+    # F1：only_stu 下 ring buffer 的 ids 槽位宽 = top_k、Δ 写宽 = Ks（学生 top-K）。
+    # 两者必须一致，否则 append 时 shape 广播崩（student_top_k != top_k 实测 RuntimeError）。
+    # 默认 cache.top_k == student_top_k == 16 被掩盖，此处显式断言。
+    if Ks != ring_buffer.top_k:
+        raise ValueError(
+            f"only_stu 口径要求 student_top_k({Ks}) == ring_buffer.top_k({ring_buffer.top_k})；"
+            "only_stu Δ 定义在学生 top-K 支撑、写入 top_k 宽槽位，必须同宽。"
+            "请统一 stage2.top_k_student 与 cache.top_k。")
+    with torch.no_grad():
+        s_old_ids, s_old_logp = _dist_topk_cached(
+            dist_engines.get("s_old") if dist_engines else None,
+            student, p_b_v, resp_v, Ks, dists_chunk)
+    # only_stu Δ：教师对【学生 top-K 完整支撑】的 logp 差（论文口径，无交集稀释，
+    # 官方重算证明此口径信号强 Eq.13 +0.539/+0.596）。vLLM prompt_logprobs 只返回教师
+    # 自身 top-K、无法取任意 ids logp → 教师前向一律 HF。per-chunk 前向 + gather，
+    # 不驻留完整 (M,T,V)（IMP-1 显存修复）。disagreement 分支需完整 rl/ref 分布取
+    # chosen-token logp（下方），保留 _response_dists_batched。
+    with torch.no_grad():
+        if compute_disagreement:
+            rl_dist = _response_dists_batched(teacher_rl, p_b_v, resp_v, dists_chunk)
+            ref_dist = _response_dists_batched(teacher_ref, p_b_v, resp_v, dists_chunk)
+            delta_k = _rl_ref_delta_only_stu(s_old_ids, rl_dist, ref_dist)
+        else:
+            delta_l = []
+            for i in range(0, p_b_v.size(0), dists_chunk):
+                sl = slice(i, min(i + dists_chunk, p_b_v.size(0)))
+                rl_d = response_dists(teacher_rl, p_b_v[sl], resp_v[sl])
+                ref_d = response_dists(teacher_ref, p_b_v[sl], resp_v[sl])
+                delta_l.append(_rl_ref_delta_only_stu(s_old_ids[sl], rl_d, ref_d))
+                del rl_d, ref_d
+            delta_k = torch.cat(delta_l, 0)
+    ids_k = s_old_ids
     # Stage 2：长度式 mask（真实 EOS 后 padding=0；非 pad 扫描）。先于 D 计算（compute 用）。
     mask = build_length_mask(resp_v, [lengths[i] for i in valid],
                              [eos_pos[i] for i in valid])

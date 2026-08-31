@@ -50,6 +50,10 @@ class Stage1Cfg(_Strict):
     # （stage1_build_cache：cache_mode/top_k_teacher），其余为死槽位不设。
     cache_mode: Literal["dense", "topk"] = "dense"
     top_k_teacher: int = 0
+    # P-OPD（2026-08-31）：true → 跳过预计算教师得分（不建 stage1 Δ_T），训练走纯 on-policy
+    # 交替相位（须配套 l2.enabled=true + l2.pure_refresh=true）。pipeline 建占位 cache
+    # （仅 top_k/vocab，无 Δ 数据）供 scheduler/rb 构造读取。
+    skip: bool = False
 
 
 class Stage2Cfg(_Strict):
@@ -152,6 +156,9 @@ class L2CacheCfg(_Strict):
     # IMP-1d：refresh pool 冷启动门槛——池样本数 < 此值时跳过 refresh 训练（不调
     # _train_step_refresh），rollout metrics 照常、ring buffer 样本不丢，记录 skip reason。
     min_refresh_pool: int = 8
+    # P-OPD（2026-08-31）：纯 on-policy 下连续空训练相位上限——冷启动/池长期不足/rollout
+    # 全无效导致 0 真实训练步时，超过此数明确失败（防死循环 + 静默空跑无断点）。
+    max_empty_phases: int = 8
     delta_slope_eps: float = 0.001
 
 
@@ -252,6 +259,9 @@ class L2Cfg(_Strict):
     enabled: bool = False            # 总开关：false 退回 L0/L1
     t_train: int = 100               # 每轮训练步数
     m_refresh: int = 1000            # 每轮刷新量（= M_selected）
+    # P-OPD（2026-08-31）：true → 纯 on-policy 交替相位——无 base 池（scheduler.run 不调用），
+    # 每相位 run_refresh_phase ↔ train_refresh_phase，α 冻结 1.0（训练 100% on-policy）。
+    pure_refresh: bool = False
     cache: L2CacheCfg = Field(default_factory=L2CacheCfg)
     rollout: L2RolloutCfg = Field(default_factory=L2RolloutCfg)   # Stage 2 短 rollout
     disagreement: L2DisagreementCfg = Field(default_factory=L2DisagreementCfg)

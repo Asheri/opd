@@ -73,17 +73,21 @@ def test_override_bad_value_rejected():
 
 
 def test_loaded_config_runs_end_to_end(tmp_path):
-    """加载后的配置可直接喂给 FullStackOPDv2 跑通（集成校验）。"""
+    """加载后的配置可直接喂给 FullStackOPDv2 跑通（集成校验）。P-OPD 走纯 on-policy。"""
     cfg = load_config(overrides=[
         "n_prompts=8",
         "stage0.n_rl_steps=3",
         "stage2.n_steps=4",
         "stage2.batch_size=4",
         f"stage1.cache_path={tmp_path / 'c.pt'}",
+        # P-OPD：base 池已删，走纯 on-policy
+        "stage1.skip=true", "l2.enabled=true", "l2.pure_refresh=true",
+        "l2.t_train=2", "l2.m_refresh=4", "l2.cache.refresh_size=8",
+        "l2.cache.max_response_length=4", "l2.cache.min_refresh_pool=0",
     ])
     out = FullStackOPDv2(cfg, device="cpu").run()
-    assert len(out["metrics"]) == 4
-
+    train_rows = [m for m in out["metrics"] if isinstance(m, dict) and "pool" in m]
+    assert len(train_rows) == 4
 
 def test_new_sections_defaults():
     """T9：新增 run/logging/metrics/dataset/model_kind 段有默认值。"""

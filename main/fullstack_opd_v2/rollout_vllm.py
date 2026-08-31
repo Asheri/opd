@@ -311,15 +311,32 @@ class VLLMRolloutEngine:
                 _params = []
             if _params and _params[0].name == "request":
                 # vLLM >= 0.16：request-style WeightTransferEngine API。
-                # 逃生舱：rollout_weight_sync=off 时回落旧行为（warn 一次 + 返回 False）。
+                # P-OPD（2026-08-31）：rollout_weight_sync=off 改【apply_model load_weights 直拷】
+                # ——vLLM 0.16 NCCL weight transfer 在当前安装（Blackwell sm_120 与 Ada sm_89）
+                # 均报 `Expected a torch.device with a specified index...got:cuda`（init_weight_
+                # transfer_engine worker 侧，engine poisoned），无法用。off 模式引擎不设
+                # weight_transfer_config（不触发 NCCL），经 LLM.apply_model（collective_rpc 到
+                # EngineCore worker，对 get_model() 执行 fn）把学生权重直拷进 vLLM 推理模型，
+                # 保 on-policy 且不依赖 NCCL。vLLM 0.16 的 LLMEngine 无 model_executor 公开属性。
                 if str(getattr(self, "_wt_sync_mode", "auto")).lower() == "off":
-                    if not getattr(self, "_wt_warned", False):
-                        self._wt_warned = True
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "vLLM>=0.16 权重同步被 rollout_weight_sync=off 关闭；"
-                            "rollout 将用引擎现有权重（初始策略）。正式训练请开启 NCCL 同步。")
-                    return False
+                    # TP>1 时 apply_model 只作用于 driver shard，不跨 TP 分发 → 强制 TP=1
+                    if int(getattr(self, "tp_size", 1)) != 1:
+                        raise RuntimeError(
+                            "rollout_weight_sync=off 逃生舱仅支持 tp_size=1"
+                            "（apply_model load_weights 只写 driver shard、不跨 TP 分发）；"
+                            "TP>1 请修复 vLLM NCCL weight transfer 或改回 auto。")
+                    try:
+                        results = self.llm.apply_model(
+                            lambda model: model.load_weights(state_dict.items()))
+                        if not results or any(r is False for r in results):
+                            raise RuntimeError(
+                                f"vLLM apply_model load_weights 未成功（results={results}）")
+                        return True
+                    except RuntimeError:
+                        raise
+                    except Exception as e:      # noqa: BLE001 —— 直拷失败显式抛（不静默 off-policy）
+                        raise RuntimeError(
+                            f"vLLM load_weights 直拷失败（rollout_weight_sync=off 逃生舱）：{e}") from e
                 return self._weight_transfer_update_16(state_dict)
             try:
                 self.llm.update_weights(state_dict)

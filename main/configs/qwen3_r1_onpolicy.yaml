@@ -1,0 +1,115 @@
+# Qwen3-1.7B × R1Distill→JustRL 教师对——纯 on-policy 交替相位训练（P-OPD v2，2026-08-31）
+#
+# 在 v2 实验成功基线（d81b8c0）上重建：删除教师预计算（stage1 缓存）+ 固定数据集 D（base 池），
+# 训练 = 纯 on-policy 交替相位——每相位当前学生 rollout → 教师 rl/ref 实时 only_stu 前向算 Δ
+# （学生 top-K 完整支撑，无交集稀释，官方重算信号强 Eq.13 +0.539/+0.596）→ ring buffer →
+# 从 ring buffer 训练（α 冻结 1.0，100% on-policy）。
+#
+# 动机：RC1（固定 D off-policy 主嫌）+ 官方代码重算（only_stu 强信号）。
+#
+# 用法（服务器 2×RTX PRO 6000 Blackwell，vLLM 0.16 用 off 逃生舱——NCCL weight transfer
+# 在当前安装的 Blackwell/Ada 均报 `got:cuda` 无法用，见 training-errors.md E18）：
+#   python -m fullstack_opd_v2 train --config configs/qwen3_r1_onpolicy.yaml \
+#     --run-dir /root/autodl-tmp/runs_r1p/full --set stage2.n_steps=300 \
+#     --set stage2.rollout_engine=vllm --set stage2.gradient_checkpointing=true \
+#     --set stage2.rollout_gpu_mem=0.55 --set stage2.rollout_max_model_len=4096 \
+#     --set stage2.teacher_offload=true --set l2.rollout.eos_token_id=151645
+
+model_kind: hf
+student_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B        # 学生 = 论文主学生（Qwen3-1.7B）
+teacher_rl_path: /root/autodl-tmp/models/JustRL-DeepSeek-1.5B   # rl 教师 = 论文 JustRL-1.5B（post-RL）
+teacher_ref_path: /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-1.5B  # ref 教师 = 论文 R1-Distill-1.5B
+
+dtype: bf16
+cache_mode: topk
+offload_to_cpu: true
+cache:
+  top_k: 16                         # 学生 top-16 支撑（only_stu；占位 cache 仅用 top_k/vocab）
+  storage: disk
+
+# ---- 数据：Skywork-OR1 数学子集 50K（静态 prompt 集——论文口径：静态的是 prompt 不是 D）----
+dataset:
+  type: jsonl
+  path: /root/autodl-tmp/datasets/skywork_50k.jsonl
+  prompt_key: prompt
+  response_key: response
+  max_prompt_len: 1024            # 论文 Table 3 MAX_PROMPT_LENGTH=1024
+  max_response_len: 2048          # 论文 Table 3（短视界）
+  tokenizer_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  prompt_universe_size: 50000
+
+base:
+  materialized_size: 5000         # 保留（P-OPD 无 base 池训练，此键不被消费）
+
+stage0:
+  n_rl_steps: 20                  # hf 路径跳过 Stage0 RL，仅占位
+
+stage1:
+  skip: true                      # P-OPD：不建预计算教师得分缓存（占位 cache）
+  enforce_teacher_consistency: true
+  cache_path: /root/autodl-tmp/cache_qwen3_r1_t16.pt
+  load_cache: false
+  build_batch_size: 8
+  warmup_M: 0
+  warmup_source: none
+  warmup_temperature: 1.0
+
+stage2:
+  scheduling_mode: fully_async
+  staleness_threshold: 4
+  queue_size: 8
+  kl_reg_coef: 1.0                # adaptive KL 初始值 α0（论文 Eq.16 区间 [0.5,2.5] 内）
+  kl_adaptive: true               # 论文 §2.4 Eq.16：按稠密 reward 符号动态调
+  clip_eps: 0.2
+  grad_clip: 1.0
+  lr: 1.0e-6                      # 论文 Table 3
+  n_steps: 300                    # 论文 Table 3
+  batch_size: 4
+  distributed: false
+  rollout_engine: toy             # 训练由命令行 --set stage2.rollout_engine=vllm 覆盖
+  # P-OPD：vLLM 0.16 NCCL weight transfer 在 Blackwell/Ada 均报 `got:cuda`（E18）→ off 逃生舱
+  # （apply_model load_weights 直拷，保 on-policy）。vLLM 修复后可改回 "auto"。
+  rollout_weight_sync: "off"
+  top_k_student: 16               # 学生 top-16 支撑（only_stu；须 == cache.top_k）
+  renormalize_topk_support: true  # 对齐原始 Direct-OPD 稀疏支撑归一化
+  delta_clip: 2.0
+  dtype: bf16
+  offload_to_cpu: false
+  teacher_offload: true           # 教师只在 refresh 相位搬回 GPU（省显存）
+
+l2:
+  enabled: true
+  pure_refresh: true              # P-OPD：纯 on-policy 交替相位（无 base 池/固定 D）
+  t_train: 2                      # 每相位训练步（rollout ↔ 训练 1:1；300 步 → 150 相位）
+  m_refresh: 32                   # 每相位 rollout 条数（150 相位 × 32 = 4800 条 on-policy）
+  cache:
+    refresh_size: 5000            # ring buffer capacity
+    min_refresh_pool: 8           # 冷启动门槛（m_refresh=32 一次 rollout 即达标）
+    max_empty_phases: 8           # 连续空训练相位上限（防死循环/静默空跑）
+  rollout:
+    max_new_tokens: 2048          # 论文 Table 3（短视界）
+    n_rollout: 4                  # 论文 Table 3 rollout n=4（每 prompt 独立采样 4 条）
+    temperature: 1.0              # 论文 Table 3
+    repetition_penalty: 1.0
+    loop_detection: true
+    loop_periods: [2, 3, 4]
+    rollout_source: student
+  refresh_ratio:
+    mode: fixed                   # P-OPD 下 α 冻结 1.0（不经 controller）
+  disagreement:
+    enabled: true
+
+run:
+  checkpoint_every: 20            # step20/.../300 共 15 断点（防服务器关机 + 拐点扫描）
+
+eval:
+  model_path: /root/autodl-tmp/models/Qwen__Qwen3-1.7B
+  n_samples: 8                     # 轻量化 ave@8（训练中快评）
+  temperature: 0.7
+  max_new_tokens: 8192
+  top_p: 0.95
+  metric: ave
+  prompt_style: dapo
+  scoring: sympy
+  chat_template: true
+  attn_implementation: flash_attention_2

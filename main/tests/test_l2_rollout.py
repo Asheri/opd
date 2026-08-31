@@ -839,30 +839,17 @@ def test_l2_cache_min_refresh_pool_config():
 
 
 def test_pipeline_cold_start_skips_refresh_training(tmp_path):
-    """IMP-1d：池 < min_refresh_pool 时跳过 refresh 训练（不调 _train_step_refresh），
-    仍记录 rollout metrics + refresh_train/skipped + refresh_pool/size；样本不丢。"""
+    """P-OPD（2026-08-31）：纯 on-policy 下池长期 < min_refresh_pool → 连续空相位超限
+    （max_empty_phases）明确失败——base 池已删，冷启动无法训练即报错（防死循环/静默空跑）。"""
     cfg = load_config(overrides=[
         "l2.enabled=true", "l2.t_train=3", "stage2.n_steps=9",
         "stage2.batch_size=4", "l2.m_refresh=4",
         "l2.cache.refresh_size=8", "l2.cache.max_response_length=4",
-        "l2.cache.refresh_min_interval=3",
-        "l2.cache.min_refresh_pool=1000"])   # 门槛远大于容量 → 永不达标，全部跳过
-    out = FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
-    rollout_rows = [m for m in out["metrics"]
-                    if isinstance(m, dict) and m.get("phase") == "rollout"]
-    assert rollout_rows, "refresh 相位未跑"
-    for r in rollout_rows:
-        assert r.get("refresh_train/skipped") is True
-        assert r["refresh_train/skip_reason"] == "cold_start_pool_too_small"
-        assert 0 <= r["refresh_pool/size"] <= 8     # 池有样本、受容量限制
-        assert "rollout/n_appended" in r             # rollout metrics 仍记录
-    # 池大小单调不减（样本未丢）
-    sizes = [r["refresh_pool/size"] for r in rollout_rows]
-    assert sizes == sorted(sizes), "池大小应单调不减（样本未丢）"
-    # 跳过轮不产生 pool="refresh" 训练行 → _train_step_refresh 未被调用
-    assert not any(isinstance(m, dict) and m.get("pool") == "refresh"
-                   for m in out["metrics"]), "冷启动轮不应调 _train_step_refresh"
-
+        "l2.cache.min_refresh_pool=1000",   # 门槛远大于容量 → 永不达标，全部 skip
+        "l2.cache.max_empty_phases=3"])      # 连续 3 个空相位即失败
+    from fullstack_opd_v2.pipeline import FullStackOPDv2
+    with pytest.raises(RuntimeError, match="无真实训练步"):
+        FullStackOPDv2(cfg, device="cpu").run(run_dir=str(tmp_path))
 
 def test_pipeline_cold_start_trains_after_pool_ready(tmp_path):
     """IMP-1d：池 ≥ min_refresh_pool（size=8 边界）后正常训练。loop_detection 关 →

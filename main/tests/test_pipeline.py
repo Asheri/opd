@@ -12,52 +12,40 @@ def _cfg(tmp_path, **stage1_over):
     s1 = dict(DEFAULT_CONFIG_V2["stage1"])
     s1["cache_path"] = str(tmp_path / "c.pt")
     s1.update(stage1_over)
+    s1["skip"] = True   # P-OPD（2026-08-31）：无预计算教师得分（占位 cache，base 池已删）
     return {
         "n_prompts": 12,
         "stage0": {**DEFAULT_CONFIG_V2["stage0"], "n_rl_steps": 5},
         "stage1": s1,
         "stage2": {**DEFAULT_CONFIG_V2["stage2"], "n_steps": 10, "batch_size": 4},
+        # P-OPD：默认走纯 on-policy 交替相位（base 池训练已删除，唯一训练路径）
+        "l2": {"enabled": True, "pure_refresh": True, "t_train": 2, "m_refresh": 4,
+               "cache": {"refresh_size": 8, "max_response_length": 4,
+                         "min_refresh_pool": 0, "max_empty_phases": 8}},
     }
 
 
 def test_end_to_end_smoke(tmp_path):
     out = FullStackOPDv2(_cfg(tmp_path), device="cpu").run()
     metrics = out["metrics"]
-    assert len(metrics) == 10
-    assert "reward" in metrics[-1]
-    assert out["cache"].delta.shape[0] == 12 * 5    # L1 默认：n_prompts×(1+warmup_M=4)
+    # P-OPD：metrics 含训练步（pool=refresh）+ rollout 相位行；n_steps=10 训练步
+    train_rows = [m for m in metrics if isinstance(m, dict) and "pool" in m]
+    assert len(train_rows) == 10
+    assert "reward" in train_rows[-1]
+    # P-OPD：占位 cache 无预计算 delta（base 池已删）；训练全 on-policy refresh
+    assert out["cache"].mode == "topk"
 
 
-def test_warmup_off_backward_compatible(tmp_path):
-    out = FullStackOPDv2(_cfg(tmp_path, warmup_M=0, warmup_source="none"),
-                         device="cpu").run()
-    assert out["cache"].delta.shape[0] == 12        # 不胖
-
-
-def test_warmup_student_init_fat_count(tmp_path):
-    out = FullStackOPDv2(_cfg(tmp_path, warmup_M=4, warmup_source="student_init"),
-                         device="cpu").run()
-    assert out["cache"].delta.shape[0] == 12 * 5    # 1 + 4
-
-
-def test_warmup_mix_fat_count(tmp_path):
-    out = FullStackOPDv2(_cfg(tmp_path, warmup_M=4, warmup_source="mix"),
-                         device="cpu").run()
-    assert out["cache"].delta.shape[0] == 12 * 9    # 1 + 4(student) + 4(teacher)
-
-
-def test_warmup_invalid_source_raises(tmp_path):
-    with pytest.raises(DataError):
-        FullStackOPDv2(_cfg(tmp_path, warmup_M=4, warmup_source="bogus"),
-                       device="cpu").run()
-
+# P-OPD（2026-08-31）：warmup 胖 D / stage1 预计算测试已移除（功能删除，纯 on-policy）。
 
 def test_reward_trends_up(tmp_path):
     """E[Δ_T]（Direct-OPD 密集奖励）应随训练上升（学习信号正确）。"""
     cfg = _cfg(tmp_path)
     cfg["stage2"]["n_steps"] = 25
     out = FullStackOPDv2(cfg, device="cpu").run()
-    r = [m["reward"] for m in out["metrics"]]
+    # P-OPD：只取训练步（pool=refresh，有 reward 键；rollout 相位行无 reward）
+    train = [m for m in out["metrics"] if isinstance(m, dict) and "pool" in m]
+    r = [m["reward"] for m in train]
     first = sum(r[:3]) / 3
     last = sum(r[-3:]) / 3
     assert last > first, f"E[Δ_T] 未上升: first3={first:.3f} last3={last:.3f}"
@@ -154,7 +142,8 @@ def test_async_on_step_still_records(tmp_path):
         cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 2}
         FullStackOPDv2(cfg, device="cpu").run()
         rows = list(csv.reader(open(os.path.join(td, "r", "metrics.csv"), encoding="utf-8")))
-        assert len(rows) == 6 + 1   # 表头 + 6 行（异步队列 join 后完整）
+        # P-OPD：表头 + 训练步（≥6）+ rollout 相位行（异步队列 join 后完整）
+        assert len(rows) > 6   # 至少 6 训练步都落盘
 
 
 def test_resume_restores_kl_anchor_and_continues(tmp_path):
@@ -205,92 +194,6 @@ def test_resume_keeps_kl_anchor_invariant():
         assert torch.allclose(ck2["ref"]["ref_dists"], ck["ref"]["ref_dists"])
 
 
-def test_train_loads_prebuilt_cache(tmp_path):
-    """模块2：load_cache=true 时训练跳过 Stage 0/1，载入预建缓存（fat 上下文 + Δ_T）训练。
-
-    多学生并发（GPU_MEMORY_AND_PARALLEL_PLAN §7）的复用机制：`opd cache` 预建一次，
-    多个 train 各自 load_cache=true 载入、跳过教师 RL 与 cache build。
-    """
-    import os
-    import torch
-    from fullstack_opd_v2.cache import TensorTeacherCache
-    from fullstack_opd_v2.model import CausalToyLM
-    from fullstack_opd_v2.pipeline import FullStackOPDv2, stage1_build_cache
-
-    cache_path = os.path.join(str(tmp_path), "prebuilt.pt")
-    # 1) 预建缓存（默认 L1 student_init，含 fat 上下文）
-    cfg = _cfg(tmp_path)
-    opd = FullStackOPDv2(cfg, device="cpu")
-    teacher_rl, teacher_ref = opd._stage0_teachers()
-    warmup_student = CausalToyLM(vocab=DEFAULT_CONFIG_V2["vocab_size"],
-                                 d_model=DEFAULT_CONFIG_V2["d_model"],
-                                 n_layers=DEFAULT_CONFIG_V2["n_layers"])
-    s1 = dict(cfg["stage1"])
-    s1["cache_path"] = cache_path
-    cache0, _, _ = stage1_build_cache(
-        opd.prompts, opd.responses, teacher_rl, teacher_ref, s1,
-        warmup_student=warmup_student)
-    n0 = cache0.delta.shape[0]
-
-    # 2) load_cache=true 训练：_stage0_teachers 不应被调用（跳过 Stage 0）
-    cfg2 = _cfg(tmp_path)
-    cfg2["stage1"]["cache_path"] = cache_path
-    cfg2["stage1"]["load_cache"] = True
-    cfg2["stage2"]["n_steps"] = 6
-    cfg2["run"] = {"run_dir": os.path.join(str(tmp_path), "r"), "checkpoint_every": 3}
-    opd2 = FullStackOPDv2(cfg2, device="cpu")
-    opd2._stage0_teachers = lambda: (_ for _ in ()).throw(
-        AssertionError("load_cache 路径不应调用 _stage0_teachers"))
-    out = opd2.run()
-
-    # 载入的缓存与原一致（fat N 相同、delta 逐位一致）；Stage 0/1 计时为 0/载入耗时
-    assert torch.equal(out["cache"].delta, cache0.delta)
-    assert out["cache"].delta.shape[0] == n0
-    assert out["timings"]["stage0_rl"] == 0.0
-    assert len(out["metrics"]) == 6
-    assert os.path.isfile(os.path.join(str(tmp_path), "r", "metrics.csv"))
-
-
-def test_train_loads_prebuilt_cache_moves_to_device(tmp_path, monkeypatch):
-    """P1-A（二次审查）：load_cache 分支必须把载入缓存搬到 self.device（GPU 路径防设备不匹配）。
-
-    cache.load 用 map_location="cpu"；build 路径的 fat_* 是 device 张量，只有 load 路径
-    需要显式 .to(device)。spy TensorTeacherCache.to 断言 load 分支确实调用（CPU 本地只
-    验证调用发生与 device 参数正确，GPU 上的实际迁移由此保证）。
-    """
-    import os
-    import fullstack_opd_v2.pipeline as PL
-    from fullstack_opd_v2.model import CausalToyLM
-    from fullstack_opd_v2.pipeline import FullStackOPDv2, stage1_build_cache
-
-    cache_path = os.path.join(str(tmp_path), "prebuilt.pt")
-    cfg = _cfg(tmp_path)
-    opd = FullStackOPDv2(cfg, device="cpu")
-    tr, tref = opd._stage0_teachers()
-    s1 = dict(cfg["stage1"])
-    s1["cache_path"] = cache_path
-    stage1_build_cache(opd.prompts, opd.responses, tr, tref, s1,
-                       warmup_student=CausalToyLM(
-                           vocab=DEFAULT_CONFIG_V2["vocab_size"],
-                           d_model=DEFAULT_CONFIG_V2["d_model"],
-                           n_layers=DEFAULT_CONFIG_V2["n_layers"]))
-
-    called = []
-    orig_to = PL.TensorTeacherCache.to
-    def spy_to(self, device):
-        called.append(device)
-        return orig_to(self, device)
-    monkeypatch.setattr(PL.TensorTeacherCache, "to", spy_to)
-
-    cfg2 = _cfg(tmp_path)
-    cfg2["stage1"]["cache_path"] = cache_path
-    cfg2["stage1"]["load_cache"] = True
-    cfg2["stage2"]["n_steps"] = 3
-    cfg2["run"] = {"run_dir": os.path.join(str(tmp_path), "r2"), "checkpoint_every": 2}
-    FullStackOPDv2(cfg2, device="cpu").run()
-    assert called, "load_cache 分支必须调用 cache.to(self.device)（P1-A 回归）"
-
-
 def test_hf_with_toy_data_raises():
     """P2（二次审查）：model_kind=hf + 默认 toy 随机数据 → DataError（拒绝在噪声上训练）。"""
     from fullstack_opd_v2.pipeline import FullStackOPDv2
@@ -299,31 +202,6 @@ def test_hf_with_toy_data_raises():
     cfg["student_path"] = "S"
     with pytest.raises(DataError):
         FullStackOPDv2(cfg, device="cpu")
-
-
-def test_train_load_cache_old_format_raises(tmp_path):
-    """模块2：load_cache=true 但缓存缺 fat 上下文（旧格式）→ 显式 DataError（不静默错训）。"""
-    import os
-    import torch
-    from fullstack_opd_v2.cache import TensorTeacherCache
-    from fullstack_opd_v2.pipeline import FullStackOPDv2
-    from fullstack_opd_v2.model import CausalToyLM
-    from fullstack_opd_v2.exceptions import DataError, ModelError
-
-    cache_path = os.path.join(str(tmp_path), "old.pt")
-    N, P, T, V = 6, 4, 5, 24
-    prompts = torch.randint(0, V, (N, P))
-    responses = torch.randint(0, V, (N, T))
-    rl = CausalToyLM(vocab=V, d_model=16, n_layers=1)
-    ref = CausalToyLM(vocab=V, d_model=16, n_layers=1)
-    # 旧格式：build 后 save 不传 fat 上下文
-    TensorTeacherCache(True, 0).build(prompts, responses, rl, ref).save(cache_path)
-
-    cfg = _cfg(tmp_path)
-    cfg["stage1"]["cache_path"] = cache_path
-    cfg["stage1"]["load_cache"] = True
-    with pytest.raises(DataError):
-        FullStackOPDv2(cfg, device="cpu").run()
 
 
 def test_stage0_teachers_hf_skips_rl(tmp_path, monkeypatch):
@@ -376,45 +254,6 @@ def test_stage0_teachers_hf_missing_ref_raises(monkeypatch):
         opd._stage0_teachers()
 
 
-def test_resume_warmup_uses_fresh_initial_student(tmp_path, monkeypatch):
-    """P1-4：resume 时 warmup_student 是独立初始 student（非续跑学生权重）。
-
-    run() 开头 torch.manual_seed(seed) → 两次 run 的 RNG 同流；warmup_student 在
-    resume load_state_dict 之前创建 → 首跑与 resume 的 warmup 权重逐元素相等。
-    且 resume 的 warmup 权重 ≠ 断点学生权重（未被续跑分布污染，否则曝光偏差不变式破）。
-    """
-    import os, tempfile, torch
-    import fullstack_opd_v2.pipeline as PL
-    from fullstack_opd_v2.checkpoint import CheckpointManager
-
-    captured = []
-    real = PL.stage1_build_cache
-    def spy(*args, **kwargs):
-        captured.append(kwargs.get("warmup_student"))
-        return real(*args, **kwargs)
-    monkeypatch.setattr(PL, "stage1_build_cache", spy)
-
-    with tempfile.TemporaryDirectory() as td:
-        tmp = type("T", (), {"__truediv__": lambda self, o: os.path.join(td, o)})()
-        cfg = _cfg(tmp)
-        cfg["stage2"]["n_steps"] = 4
-        cfg["run"] = {"run_dir": os.path.join(td, "r"), "checkpoint_every": 2}
-        FullStackOPDv2(cfg, device="cpu").run()
-        ck = CheckpointManager(os.path.join(td, "r")).resume()
-        assert ck is not None
-        FullStackOPDv2(cfg, device="cpu").run(run_dir=os.path.join(td, "r"), resume=ck)
-
-    w_first, w_resume = captured[0], captured[1]
-    assert w_first is not None and w_resume is not None
-    # 1) warmup 分布跨 resume 不变（同一初始 student 源）
-    for k in w_first.state_dict():
-        assert torch.allclose(w_first.state_dict()[k], w_resume.state_dict()[k]), k
-    # 2) resume 的 warmup ≠ 断点学生权重（未被续跑分布污染）
-    diffs = [k for k in ck["state"]
-             if not torch.allclose(w_resume.state_dict()[k], ck["state"][k])]
-    assert diffs, "warmup 权重与断点学生权重逐项相等——warmup 被续跑分布污染（P1-4 回归）"
-
-
 def test_cloud_config_l1_and_seepage():
     """L2P3：CLOUD_CONFIG 结构性 L1 默认 + 顶层部署键下渗后 schema 合法。
 
@@ -441,61 +280,6 @@ def test_cloud_config_l1_and_seepage():
     # ref_topk 保持纯顶层（不下渗、stage 无槽位）
     assert seeped["ref_topk"] == CLOUD_CONFIG["ref_topk"]
     assert "ref_topk" not in seeped["stage1"] and "ref_topk" not in seeped["stage2"]
-
-
-def test_warmup_requires_student_raises_dataerror():
-    """B1 收尾：warmup_source=student_init 但未传 warmup_student 时抛 DataError（非裸 ValueError）。"""
-    import pytest
-    from fullstack_opd_v2.exceptions import DataError, ModelError
-    from fullstack_opd_v2.pipeline import stage1_build_cache
-    import torch
-    p = torch.zeros(4, 3, dtype=torch.long)
-    r = torch.zeros(4, 2, dtype=torch.long)
-    tr = CausalToyLM(vocab=16, d_model=8, n_layers=1)
-    t = CausalToyLM(vocab=16, d_model=8, n_layers=1)
-    cfg = {"cache_mode": "dense", "top_k_teacher": 0, "warmup_M": 2,
-           "warmup_source": "student_init", "warmup_temperature": 1.0,
-           "enforce_teacher_consistency": True,
-           "cache_path": "x.pt", "build_batch_size": 4}
-    with pytest.raises(DataError):
-        stage1_build_cache(p, r, tr, t, cfg, warmup_student=None)
-
-
-def test_l2_load_cache_loads_teachers_for_refresh(tmp_path):
-    """回归：L2 启用 + load_cache=true 时，教师对必须补加载供刷新相位（否则 NoneType 崩溃）。
-
-    load_cache 路径原本跳过 Stage 0、teacher_rl/ref=None；L2 刷新相位需要教师算
-    disagreement（4 chosen logp），本测试验证补丁：跑通且有 rollout 相位行。
-    """
-    import os
-    from fullstack_opd_v2.cache import TensorTeacherCache
-    from fullstack_opd_v2.model import CausalToyLM
-    from fullstack_opd_v2.pipeline import FullStackOPDv2, stage1_build_cache
-
-    cache_path = os.path.join(str(tmp_path), "prebuilt.pt")
-    cfg = _cfg(tmp_path)
-    opd = FullStackOPDv2(cfg, device="cpu")
-    teacher_rl, teacher_ref = opd._stage0_teachers()
-    warmup_student = CausalToyLM(vocab=DEFAULT_CONFIG_V2["vocab_size"],
-                                 d_model=DEFAULT_CONFIG_V2["d_model"],
-                                 n_layers=DEFAULT_CONFIG_V2["n_layers"])
-    s1 = dict(cfg["stage1"])
-    s1["cache_path"] = cache_path
-    stage1_build_cache(opd.prompts, opd.responses, teacher_rl, teacher_ref, s1,
-                       warmup_student=warmup_student)
-
-    cfg2 = _cfg(tmp_path)
-    cfg2["stage1"]["cache_path"] = cache_path
-    cfg2["stage1"]["load_cache"] = True
-    cfg2["stage2"]["n_steps"] = 6
-    cfg2["l2"] = {"enabled": True, "t_train": 3, "m_refresh": 4,
-                  "cache": {"refresh_size": 8, "max_response_length": 4,
-                            "refresh_min_interval": 2, "refresh_max_interval": 9}}
-    out = FullStackOPDv2(cfg2, device="cpu").run()
-    rollout_rows = [m for m in out["metrics"]
-                    if isinstance(m, dict) and m.get("phase") == "rollout"]
-    assert rollout_rows, "L2+load_cache 刷新相位未执行（教师未加载 / 门控仍误跳）"
-    assert all(r.get("rollout/n_appended", 0) > 0 for r in rollout_rows)
 
 
 def test_same_card_normalization():

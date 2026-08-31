@@ -156,27 +156,13 @@ def test_alternating_phase_loop(tmp_path, monkeypatch):
 
 
 def test_l2_disabled_regression(tmp_path):
-    """l2.enabled=false 行为与原 L0/L1 完全一致（回归，§13.7）。"""
+    """P-OPD（2026-08-31）：base 池已删除——l2.enabled=false 必须明确报错（纯 on-policy 唯一路径）。"""
     from fullstack_opd_v2.config import load_config
     from fullstack_opd_v2.pipeline import FullStackOPDv2
-    base_cfg = load_config(overrides=["stage2.n_steps=5", "stage2.batch_size=4"])
-    out_base = FullStackOPDv2(base_cfg, device="cpu").run(run_dir=str(tmp_path / "base"))
     off_cfg = load_config(overrides=["stage2.n_steps=5", "stage2.batch_size=4",
                                      "l2.enabled=false"])
-    out_off = FullStackOPDv2(off_cfg, device="cpu").run(run_dir=str(tmp_path / "off"))
-    assert len(out_base["metrics"]) == len(out_off["metrics"]) == 5
-    # 同 seed 确定性：l2 关闭时完全走原路径。⚠️ 不逐位断言——异步调度器 4 线程并发消费
-    # torch 全局 RNG，PromptFeeder 的 torch.randint 与 learner 前向交错顺序因线程调度而异，
-    # 两次独立 run 的随机批次序天然不同（实测同代码 1/3 概率逐位通过）。改为结构等价 +
-    # 统计近似：指标结构一致、loss 有限、均值量级近似（真回归会是 NaN/结构变化/量级爆炸）。
-    import math
-    for a, b in zip(out_base["metrics"], out_off["metrics"]):
-        assert set(a) == set(b)
-        for k in ("loss", "pg_loss", "kl_loss"):
-            assert math.isfinite(a[k]) and math.isfinite(b[k])
-    base_mean = sum(m["loss"] for m in out_base["metrics"]) / len(out_base["metrics"])
-    off_mean = sum(m["loss"] for m in out_off["metrics"]) / len(out_off["metrics"])
-    assert base_mean == pytest.approx(off_mean, rel=0.2)
+    with pytest.raises(RuntimeError, match="base 池训练已删除"):
+        FullStackOPDv2(off_cfg, device="cpu").run(run_dir=str(tmp_path / "off"))
 
 
 def test_no_teacher_forward_in_train_step():

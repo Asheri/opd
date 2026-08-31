@@ -493,121 +493,32 @@ class FullStackOPDv2:
         n_layers = self.cfg["n_layers"]
         timings: dict = {}
 
-        # 模块2：多学生复用的「载入预建缓存」分支——`opd cache` 预建后（含 fat 上下文），
-        # 训练跳过 Stage 0/1（教师 RL + cache build），直接载入。默认 load_cache=false
-        # 走原重建路径。共享的只有教师权重；默认 student_init 下每学生缓存各建（§7.0）。
+        # P-OPD（2026-08-31）：纯 on-policy——删除 stage1 预计算教师得分与固定数据集 D。
+        # 占位 cache 仅提供 top_k/vocab（scheduler 构造读取），不含 Δ 数据；base 池训练
+        # 被纯 refresh 交替相位取代，不消费缓存。
         s1cfg = dict(self.cfg["stage1"])
-        cache_path = s1cfg.get("cache_path")
-        # Stage 1：storage=disk 的缓存是「前缀」多文件（<prefix>.metadata.json 等），
-        # 存在性按 metadata.json 判断；memory 按单个 .pt 判断。
         cache_block = self.cfg.get("cache") or {}
-        storage = cache_block.get("storage", "memory")
-        # dense 模式忽略 storage（磁盘只存 top-K 支撑）；dense 一律走内存 .pt 路径，
-        # 避免 cache.storage 默认 disk 把默认 dense 配置错误导向磁盘。
-        if self.cfg.get("cache_mode", "dense") != "topk":
-            storage = "memory"
-        # P-回归修复：stage1_build_cache 收到的是 s1cfg（stage1 子字典），读不到顶层
-        # cache 块的 top_k（S1-4 统一 K 后参数改为 cache:{top_k,storage} 块，old 下渗槽位
-        # top_k_teacher 恒为 0），导致 top_k 恒解析为 0 → 恒走 dense build → 真实词表下
-        # 累积完整 (N,T,V) 两个列表（rl_full/ref_full）→ 80GB OOM。
-        # 把顶层 cache.top_k 注入 s1cfg["top_k_teacher"]（stage1_build_cache 的回落槽位）。
-        if self.cfg.get("cache_mode", "dense") == "topk":
-            s1cfg["top_k_teacher"] = int(
-                cache_block.get("top_k") or s1cfg.get("top_k_teacher") or 0)
-        if storage == "disk":
-            prebuilt_exists = bool(cache_path and os.path.isfile(f"{cache_path}.metadata.json"))
-        else:
-            prebuilt_exists = bool(cache_path and os.path.isfile(cache_path))
-        use_prebuilt = bool(s1cfg.get("load_cache", False)) and prebuilt_exists
-
-        # L1：把 student 提前创建，使「离线 warmup 采样」与「Stage 2 KL 锚点」共享同一份
-        # 初始分布（两者都用初始 student 的分布，曝光偏差缓解才自洽）。
         student = build_model(self.cfg, self.device, role="student")
-        # P1-4：warmup 专用独立初始 student——resume 会把断点权重 load 进 student，
-        # 若 warmup 复用 student 则采样分布变成「续跑后的学生」，与 KL 锚点（初始
-        # 分布，resume 从断点 ref 恢复）不同源，曝光偏差不变式被打破。此实例永不
-        # 被 load_state_dict 覆盖，始终代表初始分布。
-        # ⚠️ 多学生显存（部署实测）：build 路径还建 worker（旧快照），HF 下 student+
-        # warmup_student+worker = 3 份模型——7B 档 + 教师对 + 优化器 > 96GB 必 OOM。
-        # 故 warmup_student 仅在 warmup_M>0（真需要采样胖 D）时才建；L0（warmup_M=0）
-        # 或载入预建缓存时都不建。
-        warmup_student = (build_model(self.cfg, self.device, role="student")
-                          if (not use_prebuilt
-                              and int(s1cfg.get("warmup_M", 0) or 0) > 0) else None)
 
         teacher_rl = teacher_ref = None
-        if use_prebuilt:
-            logger.info(f"[Stage 0/1] 跳过：载入预建缓存 {cache_path}")
-            t = time.perf_counter()
-            if storage == "disk":
-                # Stage 1：磁盘 mmap 缓存。先校验 metadata 一致性（tokenizer/教师/ref/
-                # top_k/长度/checksum，不匹配 fail fast），再 batch-local mmap 加载。
-                meta = load_cache_metadata(cache_path)
-                hashes_now = hash_models_from_cfg(self.cfg)
-                verify_consistency(meta, self.cfg, hashes_now)
-                cache = DiskTeacherCache(cache_path, device=self.device,
-                                         top_k=int(meta["top_k"]),
-                                         vocab=int(meta["vocab"]))
-                # 磁盘缓存不持久化 prompts/responses（最小 sufficient statistics）——
-                # fat 上下文即当前数据集行（磁盘场景 warmup_M=0，无胖 D 扩展）。校验缓存
-                # 行数与数据集一致，防止缓存与数据不同源时 scheduler 越界/错位。
-                fat_prompts, fat_responses = self.prompts, self.responses
-                if int(meta["num_samples"]) != fat_prompts.size(0):
-                    raise DataError(
-                        f"磁盘缓存 num_samples={meta['num_samples']} 与当前数据集行数 "
-                        f"{fat_prompts.size(0)} 不一致；磁盘缓存只持久化 Δ_T，必须与数据集同源"
-                        "（磁盘场景不支持 warmup 胖 D 扩展）")
-            else:
-                cache = TensorTeacherCache.load(cache_path)
-                # P1-A（二次审查）：load() 用 map_location="cpu" 把缓存钉在 CPU——GPU 训练
-                # 路径若不管搬设备，KL 锚点（CUDA 模型吃 CPU 输入）与 scheduler 索引
-                # （CUDA idxs 索引 CPU 张量）必崩。build 路径的 fat_* 本就 device 张量，
-                # 只有 load 路径需要显式搬（对称 resume 分支对 ref 张量的 .to(self.device)）。
-                cache.to(self.device)
-                # P3（二次审查）：load_cache 跳过 build，teacher 一致性校验（TensorTeacherCache
-                # .build 开头）不再触发——此处补词表一致性把关：缓存词表 ≠ 当前模型词表时，
-                # dense 路径 shape 崩溃、稀疏路径 scatter 越界/静默错位。
-                sv = getattr(student, "vocab", None)
-                if cache.vocab and sv and cache.vocab != sv:
-                    raise DataError(
-                        f"预建缓存词表 {cache.vocab} 与当前模型词表 {sv} 不匹配；"
-                        "缓存与模型必须同词表（teacher 一致性语义）")
-                fat_prompts, fat_responses = cache.prompts, cache.responses
-                if fat_prompts is None or fat_responses is None:
-                    raise DataError(
-                        f"预建缓存 {cache_path} 未含 fat prompts/responses（旧格式）；"
-                        "请用新版 `opd cache` 子命令重建（stage1_build_cache 已把 fat 上下文落盘）")
-            timings["stage0_rl"] = 0.0
-            timings["stage1_cache"] = time.perf_counter() - t
-            # L2（任务 6.1）load_cache 补丁：load_cache 路径原本跳过 Stage 0、不加载教师对
-            # （teacher_rl/ref 保持 None）——但 L2 的 rollout 刷新相位需要教师算 disagreement
-            # （4 chosen logp），缺了会 NoneType 崩溃。L2 启用时在此补加载预下载教师对
-            # （hf 路径 _stage0_teachers 跳过 RL 直接加载两档；toy 路径重建）。
-            if bool((self.cfg.get("l2") or {}).get("enabled", False)):
-                teacher_rl, teacher_ref = self._stage0_teachers()
-        else:
-            logger.info("[Stage 0] 小模型 RL（批量 REINFORCE）→ post-RL weak teacher")
-            t = time.perf_counter()
-            teacher_rl, teacher_ref = self._stage0_teachers()
-            timings["stage0_rl"] = time.perf_counter() - t
+        # P-OPD：加载教师对（跳过 Stage 0 RL；纯 on-policy 每相位实时打分）。
+        logger.info("[Stage 0] 加载教师对（跳过 RL；纯 on-policy 实时打分）")
+        t = time.perf_counter()
+        teacher_rl, teacher_ref = self._stage0_teachers()
+        timings["stage0_rl"] = time.perf_counter() - t
 
-            logger.info("[Stage 1] Lightning-OPD 离线缓存教师对 Δ_T（批量预计算，无 live teacher）")
-            t = time.perf_counter()
-            # 部署键下渗已在 load_config 完成（config.py 校验前），cfg["stage1"] 天然含
-            # cache_mode/top_k_teacher（顶层 CLOUD_CONFIG 风格也生效）；这里直接取用。
-            # L1：warmup_M>0 时额外 rollout 采样拼成「胖 D」，返回 (cache, fat_p, fat_r)。
-            _prl, _pref = _teacher_format_prompts(
-                self.cfg, self.raw_prompt_texts, self.prompts.size(1), self.device,
-                teacher_rl=teacher_rl, teacher_ref=teacher_ref)
-            cache, fat_prompts, fat_responses = stage1_build_cache(
-                self.prompts, self.responses, teacher_rl, teacher_ref, s1cfg,
-                warmup_student=warmup_student,
-                storage=storage, hashes=hash_models_from_cfg(self.cfg),
-                pad_id=int((self.cfg.get("dataset") or {}).get("pad_id", 0)),
-                prompt_format=("chat" if bool((self.cfg.get("dataset") or {}).get(
-                    "apply_chat_template", False)) else "raw"),
-                prompts_rl=_prl, prompts_ref=_pref)
-            timings["stage1_cache"] = time.perf_counter() - t
+        # 占位 cache（无预计算 Δ）：仅提供 top_k/vocab 供 scheduler/rb 构造读取；
+        # base 池训练被纯 refresh 交替相位取代，不消费缓存数据。
+        logger.info("[Stage 1] 跳过：P-OPD 纯 on-policy（无预计算教师得分 / 固定 D）")
+        t = time.perf_counter()
+        K = int(cache_block.get("top_k") or s1cfg.get("top_k_teacher") or 16)
+        cache = TensorTeacherCache(enforce_consistency=False, top_k=K)
+        cache.mode = "topk"
+        cache.vocab = int(getattr(student, "vocab", 0) or 0)
+        if cache.vocab:
+            cache.top_k = min(cache.top_k, cache.vocab)   # toy 小词表 clamp
+        fat_prompts, fat_responses = self.prompts, self.responses
+        timings["stage1_cache"] = 0.0
 
         # P2（二次审查）：教师对与 warmup_student 在 Stage 1 后不再需要。HF 路径下它们是
         # 独立加载的完整模型（2×teacher 1.5B + 1×student 副本，7B 档 ≈21GB），不释放会
@@ -618,8 +529,9 @@ class FullStackOPDv2:
         # 非 L2 仍释放（原行为不变，L0/L1 静态路径零开销）。
         l2_cfg = self.cfg.get("l2", {})
         l2_enabled = bool(l2_cfg.get("enabled", False))
+        # P-OPD：warmup_student 已删（无预计算/预热）；非 L2 时教师对释放（P2 语义不变）。
         if not l2_enabled:
-            del teacher_rl, teacher_ref, warmup_student
+            del teacher_rl, teacher_ref
             teacher_rl = teacher_ref = None
 
         # resume（T11）：加载断点学生权重 + 恢复版本号，Stage 2 从该版本续跑
@@ -827,10 +739,10 @@ class FullStackOPDv2:
                     _l2roll = (self.cfg.get("l2") or {}).get("rollout") or {}
                     if _l2roll.get("dist_engines", False):
                         dist_engines = {}
+                        # P-OPD：rl/ref 教师前向一律 HF（only_stu 需任意 ids logp，vLLM 无法
+                        # 胜任）→ 不建 rl/ref vLLM 引擎（死重 OOM）。只 s_old/ref_anchor。
                         _de_specs = [
                             ("s_old", s2cfg.get("rollout_model") or self.cfg.get("student_path")),
-                            ("rl", self.cfg.get("teacher_rl_path")),
-                            ("ref", self.cfg.get("teacher_ref_path")),
                             ("ref_anchor", self.cfg.get("student_path")),
                         ]
                         for _k, _mp in _de_specs:
@@ -846,33 +758,19 @@ class FullStackOPDv2:
                                     weight_sync_mode=s2cfg.get("rollout_weight_sync", "auto"),
                                     device=rollout_device,
                                     learner_device=self.device)
-                # D1（2026-08-25）：固定评估集 + 周期评估（OPD 信号诊断，默认全关零回归）。
-                # eval_holdout_size>0 且 eval_every>0：从训练数据末尾划出 holdout 条不参与训练，
-                # 每 eval_every 步在固定集上评估当前策略 E[Δ_T]（scheduler._eval_holdout）。
-                # cache / ref 锚点 / fat_prompts 同步切片到训练子集；holdout 子集单独给 scheduler。
+                # D1（2026-08-25）固定评估集：P-OPD 下禁用——占位 cache 无预计算 Δ，无法做
+                # E[Δ_T] holdout 评估（cache.slice 对 None 崩）。on-policy 信号用 rollout 相位
+                # 的 E[Δ_T]（reward 指标）替代。
                 _eval_holdout = int(s2cfg.get("eval_holdout_size", 0))
                 _eval_every = int(s2cfg.get("eval_every", 0))
                 _eval_cache = None
                 _eval_prompts = None
                 _eval_responses = None
                 if _eval_holdout > 0 and _eval_every > 0:
-                    _n_all = fat_prompts.size(0)
-                    if _eval_holdout >= _n_all:
-                        raise ValueError(f"eval_holdout_size={_eval_holdout} 需 < 训练数据行数 {_n_all}")
-                    _train_n = _n_all - _eval_holdout
-                    _eval_cache = cache.slice(_train_n)
-                    _eval_prompts = fat_prompts[_train_n:].to(self.device)
-                    _eval_responses = fat_responses[_train_n:].to(self.device)
-                    cache = cache.slice(0, _train_n)
-                    fat_prompts = fat_prompts[:_train_n]
-                    fat_responses = fat_responses[:_train_n]
-                    if ref_dists is not None:
-                        ref_dists = ref_dists[:_train_n]
-                    if ref_ids is not None:
-                        ref_ids = ref_ids[:_train_n]
-                    if ref_logp is not None:
-                        ref_logp = ref_logp[:_train_n]
-                    logger.info(f"[D1] 固定评估集：holdout={_eval_holdout} 条（末尾），训练 {_train_n} 条；每 {_eval_every} 步评估 eval_reward")
+                    logger.warning(
+                        "[D1] eval_holdout 在 P-OPD（无预计算 Δ）下不可用 → 已禁用；"
+                        "on-policy 信号用 rollout 相位 E[Δ_T]（reward 指标）替代。")
+                    _eval_holdout = 0
                 scheduler = AsyncBatchedScheduler(
                     student, cache, fat_prompts, fat_responses,
                     ref_dists, ref_ids, ref_logp, s2cfg, self.device,
@@ -958,48 +856,33 @@ class FullStackOPDv2:
                     # G5（§2 Q4）：base 池跳过陈旧度截断（base s_old 恒新），
                     # 仅 refresh 池受截断。
                     scheduler.staleness_drop_base = False
-                    # §3 初始 student（student_ref）：warmup_student 即 P1-4 独立实例；
-                    # warmup_M=0 时未建，则新建一份初始 student 副本。
-                    student_ref = warmup_student if warmup_student is not None else \
-                        build_model(self.cfg, self.device, role="student")
-                    # P3（2026-08-19）：cache 预建（load_cache）时 teacher_rl/teacher_ref 在
-                    # base 训练完全不用（Δ_T 从缓存读，KL 锚点是 student_ref），offload 到
-                    # CPU 省 ~6.8GB 基线（train_step 起点 ~29GB → ~22GB）。student_ref 必须
-                    # 常驻（每步 ref_dists[idxs]）。刷新相位前 reload、完成后 finally 搬回。
+                    # §3 初始 student（student_ref）：初始 student 副本（KL 锚点，P1-4 独立实例）。
+                    student_ref = build_model(self.cfg, self.device, role="student")
+                    # P3（2026-08-19）：teacher_rl/teacher_ref 只在 refresh 相位算 Δ_T 时用，
+                    # offload 到 CPU 省显存；刷新相位前 reload、完成后 finally 搬回。student_ref
+                    # 必须常驻（每步 ref_anchor 计算）。
                     _teacher_offload = bool(s2cfg.get("teacher_offload", False))
                     _p3_teacher_move(
                         teacher_rl, teacher_ref, "cpu",
                         enabled=_teacher_offload, device=self.device, logger=logger,
-                        message="[P3] teacher offload: base 训练阶段（省 ~6.8GB）")
+                        message="[P3] teacher offload: 训练相位（省显存）")
 
                     metrics = []
                     n_total = int(s2cfg.get("n_steps", 30))
                     t_train = int(l2_cfg.get("t_train", 100))
-                    # G4：refresh 触发时机由 min/max_interval 约束（§2 Q1），非无条件每相位。
-                    # 初始 last_refresh 置负，保证首个相位必触发一次 refresh（冷启动）。
-                    refresh_min = max(1, int(l2c.get("refresh_min_interval", 50)))
-                    refresh_max = max(refresh_min, int(l2c.get("refresh_max_interval", 150)))
-                    last_refresh = -refresh_min
-                    # base_done 只计 base 训练步（=n_total 口径）；step_done 全局单调（含 refresh
-                    # 补充步），供 step 编号与 checkpoint 文件名递增不冲突。
-                    base_done = _resume_start   # resume：从断点 step 续跑（不重训已完成的步）
-                    step_done = _resume_start
-                    while base_done < n_total:
-                        # 训练相位：跑 n_phase 步（_train_step teacher-free 不动）。
-                        # ⚠️ scheduler.run 每次会 set self.stop 且 metrics 跨相位累计——
-                        # 相位边界必须重置 stop 事件与 metrics，否则后续相位线程立即退出。
-                        scheduler.stop.clear()
-                        scheduler.metrics = []
-                        n_phase = min(t_train, n_total - base_done)
-                        metrics.extend(scheduler.run(n_phase, on_step=_on_step,
-                                                     start_step=step_done))
-                        step_done += n_phase
-                        base_done += n_phase
-                        # rollout 刷新相位：teacher 前向在此（不在 _train_step）。
-                        # G4：距上次刷新 >= min_interval 才触发（max_interval 强制），
-                        # 否则本相位纯训练、跳过 refresh 与 α 更新。
-                        elapsed = base_done - last_refresh
-                        if elapsed >= refresh_min or elapsed >= refresh_max:
+                    # P-OPD（2026-08-31）：纯 on-policy 交替相位——无 base 池（scheduler.run 不
+                    # 调用），每相位 rollout（run_refresh_phase）↔ 训练（train_refresh_phase）交替，
+                    # α 冻结 1.0。while 用 step_done（真实训练步）驱动；连续空训练相位（冷启动/
+                    # 池空/rollout 全无效）超限明确失败（防死循环 + 静默空跑无断点）。
+                    _pr_empty = 0
+                    step_done = _resume_start   # resume：从断点 step 续跑（不重训已完成的步）
+                    base_done = _resume_start
+                    while step_done < n_total:
+                        # 本相位目标训练步数（rollout 相位后由 train_refresh_phase 完成）
+                        n_phase = min(t_train, n_total - step_done)
+                        # rollout 刷新相位：teacher 前向在此（不在 _train_step），无条件每相位
+                        # （100% on-policy）。
+                        if True:
                             # IMP-1 显存修复：训练相位（scheduler.run）后 PyTorch 仍保留
                             # 大量未用缓存块（实测 alloc 44GB / reserved 78GB，~34GB 可释放）。
                             # rollout 的生成 + response_dists (M,P+T,V) 前向需要额外显存，
@@ -1132,6 +1015,11 @@ class FullStackOPDv2:
                                     compute_disagreement=bool(
                                         (l2_cfg.get("disagreement") or {}).get("enabled", True)),
                                     cand=indices, budgets=budgets, budget_t=budget_t,
+                                    # P-OPD 修复：预算模式下 T 恒定需 budget_set 传入
+                                    # run_refresh_phase（否则内部默认 2048 与 select 档位不一致，
+                                    # 且各相位 budgets.max() 变化致 ring buffer 槽位 shape 崩）。
+                                    budget_set=(sc.get("budget_set")
+                                                or (256, 512, 1024, 2048)),
                                     dists_chunk=int(rollcfg.get("response_dists_chunk", 2)),
                                     n_rollout=int(rollcfg.get("n_rollout", 1)),   # C2：论文 rollout n 透传
                                     dist_engines=dist_engines)
@@ -1168,23 +1056,10 @@ class FullStackOPDv2:
                                     refresh_age_p95=0, reuse_p95=0, max_length_ratio=0,
                                     **(roll_metrics or {}))
                                 mr.record(hm_metrics)
-                                # Dynamic Ratio 调 α（consume metrics，非 Monitor 闭环）。
-                                # 任务 6：传 rollout_efficiency（expected/actual tokens，§五）。
-                                # >1 省 token → 放宽 α；<1 超用 → 收紧（方向修正，此前写反）。
-                                _eff = (rollout_summary.get("expected_rollout_tokens") / max(
-                                    1, rollout_summary.get("rollout_tokens", 1))
-                                    if isinstance(rollout_summary, dict) else None)
-                                alpha = drc.update(
-                                    base_age=hm_metrics.get("age/mean", 0),
-                                    policy_drift=0,
-                                    refresh_quality=rb.mean_disagreement(),
-                                    rollout_efficiency=_eff)
-                                # G3：α 真实应用——refresh 训练步数 = α/(1-α)·n_base（双池 feeder）。
-                                # cold start：refresh 池不足时 α_actual 收缩（§5.5）。
-                                alpha_act = drc.cold_start_adjust(
-                                    alpha, rb.size, max(1, n_phase * scheduler.batch))
-                                n_refresh = int(round(alpha_act / max(1e-6, 1 - alpha_act) * n_phase))
-                                n_refresh = max(0, min(n_refresh, n_phase))  # 不超 base 步数
+                                # P-OPD（2026-08-31）：α 冻结 1.0——训练全 on-policy（无 base anchor）。
+                                alpha = 1.0
+                                alpha_act = 1.0
+                                n_refresh = n_phase
                                 if n_refresh > 0:
                                     # IMP-1d：refresh pool 冷启动保护——池 < min_refresh_pool 时跳过
                                     # refresh 训练（不调 _train_step_refresh）；rollout metrics 照常、
@@ -1206,6 +1081,15 @@ class FullStackOPDv2:
                                         logger.info(
                                             f"[L2] refresh 训练跳过（冷启动：池 {rb.size} < "
                                             f"min_refresh_pool={min_refresh_pool}）")
+                                        # P-OPD 空相位：不推进 step_done（真实训练步），计数；
+                                        # 超限明确失败（防死循环 + 静默空跑无断点）。下相位继续填池。
+                                        _pr_empty += 1
+                                        if _pr_empty > int(l2c.get("max_empty_phases", 8)):
+                                            raise RuntimeError(
+                                                f"[L2] 纯 on-policy 连续 {_pr_empty} 个相位无真实"
+                                                "训练步（ring buffer 未达 min_refresh_pool 或 "
+                                                "rollout 全无效）；请调低 min_refresh_pool/加大 "
+                                                "m_refresh/检查 rollout 质量。")
                                     else:
                                         # 2026-08-19 OOM 修复：rollout 相位（生成 + 教师前向
                                         # response_dists (M,P+T,V)）后 PyTorch 缓存分配器仍保留大量
@@ -1220,6 +1104,17 @@ class FullStackOPDv2:
                                             rb, alpha_act, n_refresh, step_done, _on_step)
                                         metrics.extend(scheduler.metrics)
                                         step_done += done
+                                        if done == 0:
+                                            # 池空（n_appended=0）且 min_refresh_pool=0：无训练步
+                                            # → 计空相位（防死循环）。
+                                            _pr_empty += 1
+                                            if _pr_empty > int(l2c.get("max_empty_phases", 8)):
+                                                raise RuntimeError(
+                                                    f"[L2] 纯 on-policy 连续 {_pr_empty} 个相位"
+                                                    "无真实训练步（rollout 全无效，池为空）；"
+                                                    "请检查 rollout 质量/预算。")
+                                        else:
+                                            _pr_empty = 0   # 真实训练步发生 → 清零
                                         logger.info(
                                             f"[L2] α={alpha:.3f}→实际{alpha_act:.3f}，"
                                             f"refresh 训练 {done} 步（池 {rb.size}）")
@@ -1231,13 +1126,11 @@ class FullStackOPDv2:
                                     logger=logger,
                                     message="[P3] teacher offload: refresh 完成（回 CPU + empty_cache）")
                 else:
-                    if _resume_start > 0:
-                        # resume：从断点 step 续跑剩余步（scheduler.run 的 start_step）
-                        metrics = scheduler.run(
-                            s2cfg.get("n_steps", 30) - _resume_start,
-                            on_step=_on_step, start_step=_resume_start)
-                    else:
-                        metrics = scheduler.run(s2cfg.get("n_steps", 30), on_step=_on_step)
+                    # P-OPD（2026-08-31）：base 池训练（scheduler.run）已删除——所有训练必须
+                    # 走 l2.enabled=true 纯 on-policy 交替相位（无预计算教师得分/固定 D）。
+                    raise RuntimeError(
+                        "base 池训练已删除（纯 on-policy，无预计算教师得分/固定 D）。"
+                        "请设 l2.enabled=true（用 configs/qwen3_r1_onpolicy.yaml）。")
         finally:
             # C1：drain 后台队列（成功/异常都执行），确保 metrics/checkpoint 全部落盘
             try:

@@ -38,9 +38,10 @@ from .config import load_config
 # 512/1024/2048。真实 512/1024/2048 是 GPU 上真实模型的事；toy/CPU 实验经
 # build_config 尾端覆盖把 max_new_tokens 压到小值验证协议抽象（不跑真实长预算）。
 STAGE2_ROLLOUT_MATRIX: dict[str, dict] = {
-    # S2_E0 静态基线：L2 完全关闭（独立命名，同 E0_base_only）
+    # S2_E0 静态基线：P-OPD（2026-08-31）base 池已删除——E0 改为纯 on-policy 对照
+    # （l2.enabled=true 即纯 refresh 交替相位；无预计算教师得分/固定 D）。
     "S2_E0_static": {
-        "l2.enabled": "false",
+        "l2.enabled": "true",
     },
     # S2_E1 OPD + 短 rollout 512
     "S2_E1_opd512": {
