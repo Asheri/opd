@@ -1,3 +1,5 @@
+> ⚠️ **2026-08-31 标注**：本报告的 E-1b' 信号判负结论已被后续官方代码重算修正（only_stu + sum 口径信号强）；已转向纯 on-policy 训练。
+
 # 2026-08-28：v2 论文复现 Phase 0 执行结果（单卡 96GB）
 
 > 方案：`docs/plans/2026-08-27-paper-replication-r1.md`（v2 论文原样复现：原教师对 + Qwen3-1.7B + AIME ave@8）。

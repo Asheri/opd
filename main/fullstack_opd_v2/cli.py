@@ -65,49 +65,6 @@ def _cmd_train(args) -> int:
     return 0
 
 
-def _cmd_cache(args) -> int:
-    from .cache_store import hash_models_from_cfg
-    from .model_factory import build_model
-    from .pipeline import FullStackOPDv2, _teacher_format_prompts, stage1_build_cache
-
-    device = _device_arg(args)
-    cfg = _load_cfg(args.config, args.set)
-    opd = FullStackOPDv2(cfg, device=device)     # 加载数据 + Stage 0 教师
-    teacher_rl, teacher_ref = opd._stage0_teachers()
-    s1cfg = dict(cfg["stage1"])     # 部署键下渗已在 load_config 完成（config.py 校验前）
-    if args.out:
-        s1cfg["cache_path"] = args.out
-    # P-回归修复（2026-08-18 GPU 实测，与 TrainPipeline 同逻辑）：stage1_build_cache
-    # 收到的 cfg 是 stage1 子字典，读不到顶层 cache 块的 top_k → top_k_teacher 恒 0 →
-    # 真实词表下走 dense 累积完整 (N,T,V) → 80GB OOM。需把顶层 cache.top_k 注入 s1cfg。
-    if cfg.get("cache_mode", "dense") == "topk":
-        s1cfg["top_k_teacher"] = int(
-            (cfg.get("cache") or {}).get("top_k") or s1cfg.get("top_k_teacher") or 0)
-    # 与 TrainPipeline 对齐的 storage 解析：topk 尊重 cache.storage；dense 一律 memory。
-    cache_block = cfg.get("cache") or {}
-    storage = cache_block.get("storage", "memory")
-    if cfg.get("cache_mode", "dense") != "topk":
-        storage = "memory"
-    # L1：warmup 需要初始 student（student_init 采样）；toy 下即初始 CausalToyLM
-    warmup_student = build_model(cfg, device, role="student")
-    _prl, _pref = _teacher_format_prompts(
-        cfg, opd.raw_prompt_texts, opd.prompts.size(1), device,
-        teacher_rl=teacher_rl, teacher_ref=teacher_ref)
-    cache, _, _ = stage1_build_cache(
-        opd.prompts, opd.responses, teacher_rl, teacher_ref, s1cfg,
-        warmup_student=warmup_student,
-        storage=storage,
-        hashes=hash_models_from_cfg(cfg),
-        pad_id=int((cfg.get("dataset") or {}).get("pad_id", 0)),
-        prompt_format=("chat" if bool((cfg.get("dataset") or {}).get(
-            "apply_chat_template", False)) else "raw"),
-        prompts_rl=_prl, prompts_ref=_pref)
-    print(f"[cache] Δ_T 缓存已构建: {s1cfg['cache_path']} "
-          f"mode={cfg['cache_mode']} top_k={s1cfg.get('top_k_teacher')} "
-          f"storage={storage}")
-    return 0
-
-
 def _cmd_eval(args) -> int:
     import torch
     from .checkpoint import CheckpointManager
@@ -141,12 +98,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None)
     p.add_argument("--run-dir", default=None, help="run 目录（默认自动时间戳）")
     p.add_argument("--resume", action="store_true", help="从 run-dir 最新断点续跑")
-    p.add_argument("--set", action="append", default=[])
-    p.add_argument("--device", default=None)
-
-    p = sub.add_parser("cache", help="只建 Lightning 离线缓存（Stage 1）")
-    p.add_argument("--config", default=None)
-    p.add_argument("--out", default=None, help="缓存输出路径")
     p.add_argument("--set", action="append", default=[])
     p.add_argument("--device", default=None)
 
@@ -218,8 +169,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "train":
             return _cmd_train(args)
-        if args.command == "cache":
-            return _cmd_cache(args)
         if args.command == "eval":
             return _cmd_eval(args)
         if args.command == "info":

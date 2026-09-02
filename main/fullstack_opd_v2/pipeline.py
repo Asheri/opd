@@ -30,9 +30,6 @@ def _mem_point(tag: str) -> None:
               f"reserved={torch.cuda.memory_reserved()/2**30:.1f}GiB", flush=True)
 
 from .cache import TensorTeacherCache
-from .cache_store import (DiskTeacherCache, hash_models_from_cfg,
-                          load_cache_metadata, verify_consistency,
-                          write_cache_disk)
 from .model import CausalToyLM, generate_batch, token_logprobs, response_dists
 from .scheduler import AsyncBatchedScheduler, launch_distributed_scheduler
 from .data import build_data_loader
@@ -199,129 +196,6 @@ def stage0_small_rl(prompts, reward_fn, cfg: dict, device,
         opt.step()
     weak.eval()
     return weak, ref
-
-
-# ----------------------------- Stage 1 -----------------------------
-def _teacher_format_prompts(cfg: dict, raw_texts, P: int, device: str,
-                             teacher_rl=None, teacher_ref=None):
-    """C3：apply_chat_template 开启时构建教师各自模板格式的 prompt 张量对。
-
-    返回 (prompts_rl, prompts_ref)：teacher_rl/teacher_ref 分别用各自 tokenizer 的
-    原生 chat template 编码 raw_texts；未开启或 raw_texts 不可用时返回 (None, None)。
-    vocab 守卫用已加载教师实例的词表（跨词表 id = 垃圾上下文）。
-    """
-    from .data import build_teacher_prompts
-    if not raw_texts or not bool((cfg.get("dataset") or {}).get(
-            "apply_chat_template", False)):
-        return None, None
-    rl_path = cfg.get("teacher_rl_path")
-    ref_path = cfg.get("teacher_ref_path")
-    if not rl_path or not ref_path:
-        raise DataError(
-            "apply_chat_template=true 且需重建 Δ_T 时必须有 teacher_rl_path/"
-            "teacher_ref_path（教师各自模板重编码 prompt）")
-    prl = build_teacher_prompts(
-        raw_texts, rl_path, P, device=device,
-        vocab_size=getattr(teacher_rl, "vocab", None))
-    pref = build_teacher_prompts(
-        raw_texts, ref_path, P, device=device,
-        vocab_size=getattr(teacher_ref, "vocab", None))
-    return prl, pref
-
-
-def stage1_build_cache(prompts, responses, teacher_rl, teacher_ref,
-                       cfg: dict, warmup_student=None,
-                       storage: str = "memory", hashes: dict | None = None,
-                       pad_id: int = 0,
-                       prompt_format: str = "raw",
-                       prompts_rl=None, prompts_ref=None):
-    """Lightning-OPD：批量预计算教师对并预计算 Δ_T，训练期不再启 teacher server。
-
-    cache_mode="topk"（且 top_k_teacher>0）时走 L4 稀疏缓存：每位置只存 teacher top-K，
-    体积从 (N,T,V) 降到 (N,T,K)；真实词表 V=128k 下才存得下。
-
-    **L1（离线 rollout 暖缓存，缓解曝光偏差）**：若 `cfg["warmup_M"]>0` 且
-    `warmup_source≠"none"`，在 build 前用 student / teacher 分布对每个 prompt 额外
-    采样 M 条响应，拼成「胖 D」`(N·(1+K),T)`（K=额外条数），使缓存覆盖学生/教师分布
-    支撑。返回的 `fat_prompts/fat_responses` 供 Stage 2 入口的 KL 锚点与调度器使用。
-    warmup 关闭时退化为原行为：`fat_* = 原 (prompts, responses)`。
-
-    返回 `(cache, fat_prompts, fat_responses)`。
-    """
-    # Stage 1 统一 K：新口径以 cache.top_k 为准；兼容旧 top_k_teacher（下渗后仍在顶层）。
-    cache_block = cfg.get("cache") or {}
-    top_k = (cache_block.get("top_k")
-             if cfg.get("cache_mode", "dense") == "topk"
-             else 0) or cfg.get("top_k_teacher", 0) or 0
-    cache = TensorTeacherCache(cfg.get("enforce_teacher_consistency", True), top_k=top_k)
-
-    warmup_M = int(cfg.get("warmup_M", 0) or 0)
-    source = cfg.get("warmup_source", "none")
-    temp = float(cfg.get("warmup_temperature", 1.0))
-    T = responses.size(1)
-
-    _VALID_SOURCES = ("student_init", "teacher_perturbed", "mix")
-    fat_prompts, fat_responses = prompts, responses
-    if warmup_M > 0 and source not in (None, "none"):
-        if source not in _VALID_SOURCES:
-            raise DataError(
-                f"stage1 warmup_source 必须是 {_VALID_SOURCES} 之一，收到 {source!r}")
-        extra_p, extra_r = [], []
-        # 注：采样只消耗 RNG、不改权重；warmup_student 即 Stage 2 的同一初始 student，
-        # 因此「warmup 上下文分布」与「KL 锚点分布」同源，曝光偏差缓解自洽。
-        if source in ("student_init", "mix"):
-            if warmup_student is None:
-                raise DataError(
-                    "stage1 warmup_source='student_init'/'mix' 需要 warmup_student "
-                    "(请在上游把初始 student 传入 stage1_build_cache)。")
-            for _ in range(warmup_M):
-                rp = generate_batch(warmup_student, prompts, max_new=T,
-                                    temperature=temp)        # (B,T) 学生初始分布采样
-                extra_p.append(prompts)
-                extra_r.append(rp)
-        if source in ("teacher_perturbed", "mix"):
-            for _ in range(warmup_M):
-                rt = generate_batch(teacher_rl, prompts, max_new=T,
-                                    temperature=temp)        # (B,T) 教师扰动分布采样
-                extra_p.append(prompts)
-                extra_r.append(rt)
-        if extra_p:
-            fat_prompts = torch.cat([prompts, *extra_p], dim=0)
-            fat_responses = torch.cat([responses, *extra_r], dim=0)
-
-    # C3：教师各自模板格式的 prompt（fat 行 = 基行 + warmup_M 次重复基行）。
-    # 传入时按行对齐 cat；未传则两教师共用 fat_prompts（原行为）。
-    _fat_prl = fat_prompts
-    _fat_pref = fat_prompts
-    if prompts_rl is not None or prompts_ref is not None:
-        if prompts_rl is None or prompts_ref is None:
-            raise DataError(
-                "prompts_rl/prompts_ref 必须成对传入（教师各自模板格式的 prompt）")
-        _cnt = fat_prompts.size(0) // prompts_rl.size(0)
-        if _cnt * prompts_rl.size(0) != fat_prompts.size(0):
-            raise DataError("prompts_rl 行数不能整除 fat_prompts 行数（warmup 对齐失败）")
-        _fat_prl = torch.cat([prompts_rl] * _cnt, dim=0)
-        _fat_pref = torch.cat([prompts_ref] * _cnt, dim=0)
-    cache.build(fat_prompts, fat_responses, teacher_rl, teacher_ref,
-                cfg.get("build_batch_size", 16),
-                prompts_rl=_fat_prl, prompts_ref=_fat_pref)
-    # 落盘（Stage 1）：storage="disk" → 磁盘 mmap（最小 sufficient statistics + metadata +
-    # checksum + 一致性哈希，解决 50K×8192 显存墙）；否则原 torch.save 全量缓存 +
-    # fat 上下文（模块2：`opd train --set stage1.load_cache=true` 载入后跳过 Stage 0/1）。
-    cache_path = cfg.get("cache_path", "fullstack_opd_cache_v2.pt")
-    if storage == "disk":
-        # 2026-08-18 C2：prompt_format 随 cache 落盘（verify_consistency 据此防
-        # apply_chat_template 与裸 prompt cache 静默错位）。⚠️ 本函数 cfg 是 stage1 块，
-        # dataset.apply_chat_template 需由调用方用完整 cfg 计算后经 prompt_format 传入。
-        write_cache_disk(cache, cache_path, responses=fat_responses, pad_id=pad_id,
-                         hashes=hashes, max_response_len=fat_responses.size(1),
-                         max_prompt_len=fat_prompts.size(1),
-                         dtype=str(cfg.get("dtype", "bf16")),
-                         dataset_size=fat_prompts.size(0),
-                         prompt_format=prompt_format)
-    else:
-        cache.save(cache_path, prompts=fat_prompts, responses=fat_responses)
-    return cache, fat_prompts, fat_responses
 
 
 # ----------------------------- 编排器 -----------------------------

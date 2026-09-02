@@ -210,3 +210,8 @@ python -c "from fullstack_opd_v2.model import CausalToyLM; m=CausalToyLM(...); m
 | Stage1 | vLLM phase2 + `--top_k 64` | 稀疏 top-K 缓存 |
 | Stage2 | `torchrun --nproc_per_node=2 python -m fullstack_opd_v2 ...` | `E[Δ_T]↑` + `age>0` |
 | 导出 | `save_pretrained('/shared/models/student_final')` | 下游评估 |
+> ⚠️ **2026-08-31 P-OPD 标注**：本手册的 Stage 1/2（离线缓存 + base 池）已删除——训练 = 纯
+> on-policy 交替相位（`run_refresh_phase` ↔ `train_refresh_phase`），教师 only_stu 实时打分 +
+> CPU offload，vLLM 权重同步走 off 逃生舱（tp=1）。验收关注 on-policy 占比 100%、ring buffer 增长、
+> 空相位不触发（`max_empty_phases`）。
+

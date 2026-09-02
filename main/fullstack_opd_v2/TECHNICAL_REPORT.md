@@ -22,6 +22,18 @@
 
 ---
 
+# ⚠️ P-OPD 重建（2026-08-31）：阅读本文档前的必读声明
+
+**2026-08-31 起，训练 = 纯 on-policy 交替相位**（commit `c744c32`）：
+- **删除**：stage1 预计算教师 Δ 缓存（Lightning-OPD 离线缓存）、base 池（固定 D）训练、warmup 胖 D、`cache_store.py` 磁盘缓存、v1 `fullstack_opd/` 包、`cli cache` 子命令。
+- **当前架构**：学生每相位新鲜 rollout → 教师 rl/ref **only_stu 实时前向**算 Δ（学生 top-K 完整支撑 `gather−logsumexp`，无交集稀释）→ ring buffer（学生支撑）→ `_train_step_refresh` 训练（teacher-free，α 冻结 1.0 = 100% on-policy）。vLLM 权重同步走 `rollout_weight_sync=off` 逃生舱（`apply_model(load_weights)` 直拷，仅 tp=1）。
+
+> **本文档 §0–§3 及 §4.6.1–4.6.4 描述的是"重建前"的离线缓存 + base 池架构**（历史，供理解演进）。
+> **当前架构的唯一权威描述在 §4.6.5**。§5–§9 实验数字为历史产物（重建前 L0/L1/静态路径），
+> P-OPD 实测待服务器跑完后补充。
+
+---
+
 # 第一部分 · 工程实现（按原始论文修改后的版本）
 
 > 本文只讲**代码是怎么搭的**：线程、队列、版本号、缓存张量、张量形状、函数名。
@@ -32,9 +44,12 @@
 
 | 工程问题 | 落地机制 | 主要文件 |
 |---|---|---|
-| 学生 rollout 与更新**异步** | 4 阶段线程 + 有界队列 + 全局版本号 + 双截断 | `scheduler.py`、`buffer.py` |
-| 教师**离线** | 训练前一次性批量预算 + 设备常驻/稀疏缓存，训练期零 live teacher | `cache.py`、`scheduler.py` |
-| Direct-OPD **信用分配** | 离线 Δ_T 张量 + 分布级 PG 的逐张量操作 | `cache.py`、`losses.py`、`scheduler.py` |
+| 学生 rollout 与训练**交替相位** | rollout 相位（学生生成 + 教师 only_stu 前向）↔ 训练相位（`_train_step_refresh`），`while step_done` 驱动，α 冻结 1.0 | `pipeline.py`、`adaptive_cache.py`、`scheduler.py` |
+| 教师**实时打分** | 每相位 only_stu 前向（教师对学生 top-K 完整支撑 logp 差），CPU offload 省显存 | `adaptive_cache.py`（`_rl_ref_delta_only_stu`）、`pipeline.py` |
+| Direct-OPD **信用分配** | 实时 Δ_T（学生支撑）+ 分布级 PG 的逐张量操作 | `adaptive_cache.py`、`losses.py`、`scheduler.py` |
+| **工程化底座（P0）** | pydantic 配置强校验 + CLI 子命令 + run 目录 + 断点续跑 + 指标追踪 + 结构化日志 + 类型异常 + 可插拔数据/模型 + AIME 评估 | `config.py`、`cli.py`、`run.py`、`checkpoint.py`、`metrics.py`、`logging.py`、`exceptions.py`、`data.py`、`model_factory.py`、`eval_aime.py` |
+| **P-OPD 纯 on-policy** | 纯 refresh 交替相位（无 base 池/无预计算缓存）、ring buffer 学生支撑、空相位防护、vLLM off 逃生舱 | `adaptive_cache.py`、`scheduler.py`、`pipeline.py`、`rollout_vllm.py` |
+| **预算感知评估** | 统一 reasoning token 预算 B 下公平比较（Accuracy(B) + 预算曲线/AUC/nAUC/效率） | `budget_eval.py`、`budget_curve.py` |
 
 ---
 
@@ -216,12 +231,12 @@ $$
 
 上一框确认了：固定 $D$ 必然产生曝光偏差。Lightning-OPD 的**根治**就是让学生**自回归 rollout** 自己的响应、再由教师实时打分——使训练上下文来自学生当前（漂移中）策略，而非固定 $D$。问题是：Direct-OPD 的"预加载"恰恰是为了**省掉教师实时打分**。两者存在成本张力，因此真正可落地的是一条**谱**，按"训练期教师推理开销"与"上下文新鲜度"权衡：
 
-| 级别 | 上下文来源 | 教师打分时机 | 训练期教师开销 | 曝光偏差 | 对应代码改动量 |
+| 级别 | 上下文来源 | 教师打分时机 | 训练期教师开销 | 曝光偏差 | 状态 / 对应代码 |
 |---|---|---|---|---|---|
-| **L0（当前 Direct-OPD）** | 固定 $D$ 的 $(p_i,r_i)$ | 仅 Stage 1 离线一次 | 零 | 最大（永久固定） | — |
-| **L1（离线 rollout 暖缓存，已实现）** | Stage 1 用学生/教师分布**采样多条** $(p_i, r'_i)$ 拼胖 D | 仅 Stage 1 离线一次（但上下文变丰富） | 零（训练期仍预加载） | 大幅降低（上下文覆盖学生/教师支撑） | 仅改 `pipeline.py`（stage1_build_cache + run 接线） |
-| **L2（周期性在线刷新）** | 训练期每 $K$ 步用**当前学生** rollout 一批 $(p,r')$ | 每 $K$ 步一次（教师常驻） | 摊销后小 | 有界（新鲜度 ≤ $K$ 步漂移） | 加 refresh 线程 + 动态缓存 |
-| **L3（全在线 Lightning-OPD）** | 每批都来自当前学生 rollout | 每批实时 | 最大（回到 live teacher） | 近零 | 退化为 Lightning-OPD 本身 |
+| **L0（Direct-OPD）** | 固定 $D$ 的 $(p_i,r_i)$ | 仅 Stage 1 离线一次 | 零 | 最大（永久固定） | 默认静态路径 |
+| **L1（离线 rollout 暖缓存）** | Stage 1 用学生/教师分布**采样多条** $(p_i, r'_i)$ 拼胖 D | 仅 Stage 1 离线一次（但上下文变丰富） | 零（训练期仍预加载） | 大幅降低（上下文覆盖学生/教师支撑） | **默认开启**（`warmup_M=4, warmup_source=student_init`） |
+| **L2（Adaptive Teacher Cache）** | 训练期每 $K$ 步用**当前学生** rollout 一批 $(p,r')$ | 每 $K$ 步一次（教师常驻） | 摊销后小 | 有界（新鲜度 ≤ $K$ 步漂移） | **已实现并接线**（`adaptive_cache.py` + `scheduler.py` + `pipeline.py`）；`l2.enabled=false`（默认）退回 L0/L1 |
+| **L3（全在线 Lightning-OPD）** | 每批都来自当前学生 rollout | 每批实时 | 最大（回到 live teacher） | 近零 | 骨架（`VLLMRolloutEngine` + 实时 Δ_T 路径），未完整跑通 |
 
 **关键洞察**：rollout 环节**不必在训练期在线**——它可以是 **Stage 1 的离线增强**（`generate_batch` / vLLM `generate` 在 Stage 1 即可生成多条轨迹并预缓存 $\Delta_T$）。这样**零训练期教师开销**就把上下文从"每 prompt 一条固定 $r_i$"扩成"多条学生/教师分布采样轨迹"，直接压低曝光偏差，且**调度器 `_train_step` 一行不动**（仍是消费预加载缓存）。这是性价比最高、风险最低的第一步。
 
@@ -251,7 +266,9 @@ $$
 - **代价**：教师推理开销**仍只在 Stage 1 一次**（`1+M` 倍于 L0，但离线、可批处理）；训练期零教师开销。内存：`delta`/`ref_dists` 张量 $\times(1+M)$，demo 词表 64 下可忽略，真实词表须配 topk 缓存。
 - **残余缺口**：胖 $D$ 用的是 **Stage 1 时刻**的策略（初始学生 / 扰动教师）。训练期学生还在漂，所以 L1 **不保证**训练全程上下文都在学生当前支撑内——它把曝光偏差降一个量级（从"单点固定"到"分布覆盖"），但未消除。要消除需 L2。
 
-#### L2 详细机制（周期性在线刷新）
+#### L2 详细机制（周期性在线刷新）【已实现并接线，详见 §4.6】
+
+> ⚠️ **状态修正**：下文原设计稿中的 `append` 接口、`_rollout_refresh` 线程、混合 `_prompt_feeder` 均已落地——分别由 `adaptive_cache.RefreshRingBuffer`、`scheduler` 的 `train_refresh_phase` / `_train_step_refresh`、`pipeline` 的 L2 交替相位循环实现。默认 `l2.enabled=false` 退回 L0/L1，零回归风险。
 
 - **动机**：让训练上下文来自**当前学生**策略（而非 Stage 1 的旧策略），把曝光偏差的"新鲜度"有界化到 $K$ 步漂移内。
 - **具体数据流**（`scheduler.py` 加动态缓冲 + refresh 线程）：
@@ -261,7 +278,7 @@ $$
   4. **`_prompt_feeder` 改混合采样**：按 `refresh_mix_ratio` 从固定 `[0,N)` 与动态 `[N, N+dyn)` 取 `idxs`，并携带"源标记"；
   5. **`_rollout_collector`/`_train_step`** 按源标记决定读 `self.prompts` 还是 `self.dyn_prompts`（其余 `s_old`/`Δ_T`/`ref_dists` 取值逻辑完全复用）。
 - **一个额外好处**：动态样本 $(p,r')$ 的 `s_old` 是用**当前学生快照**算的（worker 刚 `acquire_if_newer` 到最新），与 `s_cur` 几乎同步 → 这些样本 **ρ≈1、近乎 on-policy**，IS 校正几乎不需要。曝光偏差与陈旧偏差在此同时被压低。
-- **代码改动**：`pipeline.py`（传教师+theta0）、`scheduler.py`（动态缓冲 + `_rollout_refresh` + 混合 `_prompt_feeder`）、`cache.py`（`append` + ring buffer）。比 L1 重，但是**增量**，可独立于 L1 实现。
+- **代码改动（已实现）**：`adaptive_cache.py`（`RefreshRingBuffer` / `DisagreementComputer` / `CacheHealthMonitor` / `DynamicRatioController` / `PromptStateStore` / `RefreshSelector` / `run_refresh_phase`）、`scheduler.py`（`_train_step_refresh` / `train_refresh_phase` + 双池 feeder）、`pipeline.py`（交替相位循环 + 保留教师供 refresh）。详见 §4.6。默认 `l2.enabled=false` 退回 L0/L1，零回归。
 - **代价**：教师推理开销被摊销到每 $K$ 步一次（而非每步），`K` 越大越省；`K` 越小新鲜度越高。教师常驻显存（与 learner 同卡需 colocated offload L6）。
 - **残余缺口**：刷新间隔内学生仍会漂 $<K$ 步，动态样本的 Δ_T 也有微小 staleness——但已由 $K$ 显式上界，且被 `StalenessQueue` 双截断兜底。
 
@@ -278,7 +295,7 @@ $$
 > - L2（dyn_cap=64, K=5）：固定 `delta` 16 条 + 动态 ring buffer 64 条；教师每 **5** 步推理一批（≈ 1/5 批次成本）；动态样本 ρ≈1 近 on-policy。
 > - L3：每步都教师推理 8 条，成本 ×5 vs L2（K=5），但曝光偏差近零。
 
-**结论**：可以保留 rollout 环节，且不必一步退回到全在线。建议路径 **L1（零改动调度器暖缓存）→ L2（动态刷新收尾）**——既保留 Direct-OPD 的"零训练期教师开销"优势，又把曝光偏差从无界压到有界。L2 的 `append` 接口与 refresh 线程是后续可独立实现的两个增量。
+**结论**：可以保留 rollout 环节，且不必一步退回到全在线。建议路径 **L1（零改动调度器暖缓存，默认开启）→ L2（Adaptive Teacher Cache 动态刷新，已实现并接线）**——既保留 Direct-OPD 的"零训练期教师开销"优势，又把曝光偏差从无界压到有界。L2 子系统的 `append`/refresh 接口与调度器接线已完成（见 §4.6）；配合 **P-OPD 纯 on-policy 交替相位**，可进一步把 OPD 推到谱的更"在线"端。
 
 ---
 
@@ -796,6 +813,167 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 - **分布级 PG vs 工业 token 级**：本代码损失是分布级（全词表算 ratio），要求完整 `π_old`。vLLM 只返 top-K，因此 `VLLMRolloutEngine` 在小词表（`vocab≤full_logprobs_cap`）走**精确重建**、大词表应改走 verl/slime 的 **token-level PPO**（引擎已另提供 `response_logprobs`）。大词表下把截断分布喂给 `pg_loss` 会得到 nan（`exp(s_cur+1e4)` 溢出），不是"不精确"而是数值崩。
 - **L2/L5 编排互斥**：learner Megatron TP=2 与"rank1 当 rollout worker"的并发模型互斥（TP 集合通信死锁），已加护栏；L2 需 colocated 交替相位调度（learner TP=2 ↔ rollout vLLM TP=2 同驻双卡 + CPU offload）。
 - **异步的陈旧度有硬上界**：`staleness_threshold`（默认 4）双截断，是"异步能多旧"的显式旋钮。
+- **P0 工程化已落地**：`config.py` 用 pydantic `extra="forbid"` 把"未知键静默忽略"变"显式报错"；`main/tests/` 共 **39 个 pytest 文件**覆盖异步 / L2 子系统 / 配置 / 断点 / 指标 / 评估协议；`pyproject.toml` 注册 `fullstack-opd-v2` console script 并声明 `[test]`/`[gpu]` 可选依赖（详见 §4.5）。
+
+---
+
+## 4.5 工程化底座（P0）：可复现、可测、可打包
+
+> 这一节补全前文未覆盖的**工程化层**——它们不改动算法内核，却是把 demo 变成"可交付工程"的关键。所有模块在 `fullstack_opd_v2/` 包内，已通过 **39 个 pytest 文件**覆盖（见 §4.5.9）。
+
+### 4.5.1 配置：pydantic schema + 点分 CLI 覆盖（`config.py`）
+
+`config.py`（516 行）用 **pydantic v2 + `extra="forbid"`** 强校验：任何拼错/多余的键直接 `ValidationError`，而非静默忽略。Schema 分层：
+
+- `Stage0Cfg / Stage1Cfg / Stage2Cfg`：三阶段各自消费的键；
+- `L2Cfg`（含 `L2CacheCfg / L2RolloutCfg / L2DisagreementCfg / L2HealthMonitorCfg / L2RefreshRatioCfg / L2SelectiveRolloutCfg / L2UtilityCfg`）：L2 子系统完整 schema；
+- `RunCfg / LoggingCfg / MetricsCfg / DatasetCfg / EvalCfg / BaseCfg / CacheCfg`：`OPDConfig` 的其余顶层块。
+
+`load_config()` 的流水线（已实测）：① 读 YAML → ② 与 `DEFAULT_CONFIG_V2` 深合并 → ③ 解析 `--set stage2.lr=1e-4` 这种**点分路径**覆盖 → ④ 顶层部署键（`dtype/top_k_*/offload_to_cpu`）**下渗**进对应 stage 子字典（修复早期"顶层定义、stage 子字典读取、云配置被静默忽略"的坑）→ ⑤ pydantic 校验。
+
+> ⚠️ 下渗是 `extra="forbid"` 兼容的关键：`stage1` 只消费 `cache_mode/top_k_teacher`、`stage2` 只消费 `dtype/top_k_student/offload_to_cpu`，下渗在校验前完成，使 `config.yaml` 快照天然含下渗结果。
+
+### 4.5.2 CLI 子命令（`cli.py`）
+
+`cli.py`（386 行）提供 **6 个子命令**，统一经 `load_config` 解析：
+
+- `train`：跑全栈（Stage 0/1/2），支持 `--resume` 续跑；
+- `cache`：只建 Lightning 离线缓存（Stage 1）；
+- `eval`：评 checkpoint 健康信号；
+- `info`：打印解析后完整配置（调试点分覆盖结果）；
+- `eval-aime`：真实模型 AIME24/25 评估（`--model` 直评 / `--run-dir` 桥接读 `config.yaml` 的 `eval.model_path`）；
+- `eval-holdout`：holdout 集评估（与 `_eval_holdout` 线程呼应）。
+
+`pyproject.toml` 注册 console script `fullstack-opd-v2 = fullstack_opd_v2.cli:main`，`pip install -e .` 后可直接 `fullstack-opd-v2 train ...`。
+
+### 4.5.3 可复现 run 目录（`run.py`）
+
+`RunManager` 把"一次训练"变成可复现单元：`runs/<timestamp>/` 下快照 `config.yaml`（解析后完整配置）、`metrics.csv`、`logs/train.log`、`checkpoints/step_<N>.pt`。无 `--run-dir` 时自动时间戳建目录，`--resume` 时复用并续跑。
+
+### 4.5.4 断点续跑（`checkpoint.py`）
+
+`CheckpointManager.save/load/resume` 存 `state_dict + weight_store_version + step + cfg + metrics`，支持从最新断点续跑。针对多学生并发显存峰值，提供 `_release_cpu_memory`（调用 `malloc_trim` 释放 RSS）与 `_opt_state_to_cpu`（优化器状态卸 CPU）。
+
+### 4.5.5 指标追踪（`metrics.py`）
+
+`MetricsRecorder` 后端 `csv`（默认）或 `wandb`；**wandb 缺失自动 fallback CSV**（不崩）；append 续写（resume 不丢历史）、`flush_every`、线程锁保证多线程安全。每步落 `loss/pg/kl/adv/reward/age/version` 等。
+
+### 4.5.6 结构化日志 / 类型异常（`logging.py` / `exceptions.py`）
+
+`setup_logging` 统一时间戳+级别+控制台+文件，`name` 幂等（重复调用不叠 handler）。`exceptions.py` 把散落的 `RuntimeError/ValueError` 收敛为 `OPDError` 子类（`ConfigError/DataError/ModelError/CheckpointError/TrainingError`），调用方可按阶段精确捕获。
+
+### 4.5.7 可插拔数据 / 模型 / 缓存接口（`data.py` / `model_factory.py` / `cache_store.py`）
+
+- `data.py`：`DataLoader`(ABC) + `ToyDataLoader` + `JsonLinesDataLoader` + `build_data_loader`——Skywork-OR1 论文数据经 `dataset.type=jsonl` 零代码改动接入（见 §8.4 接口就绪）。
+- `model_factory.py`：`build_model(cfg, device, role)` + `HFCausalLM` 适配器（接真实 HF 模型；骨架，需 GPU 验证）。
+- `cache_store.py`：`DiskTeacherCache`（mmap 磁盘教师缓存，与 `TensorTeacherCache` 同接口，解决 50K×8192 显存墙；metadata 13 键一致性校验）。
+
+### 4.5.8 AIME 评估（`eval_aime.py`）
+
+`AimeEvaluator` + `extract_answer` / `normalize_answer` / `format_prompt`：支持 AIME24/25，boxed 提取 + sympy 等价判定，`--n-samples`（`ave@N`）+ 逐题落盘 + **resume 跳过已完成题**（修复长生成中断全丢）。
+
+### 4.5.9 测试与打包（P0 落地）
+
+- **测试**：`main/tests/` 共 **39 个 pytest 文件**（含 `test_adaptive_cache`、`test_l2_integration`、`test_l2_rollout`、`test_vllm_dist`、`test_run_s2_real_parallel`、`test_budget_eval`、`test_pipeline`、`test_config`、`test_perf_equivalence`、`test_checkpoint`、`test_metrics`、`test_eval_aime`、`test_data`、`test_model_factory`、`test_cache_store` 等），覆盖异步、L2 子系统、配置、断点、指标、评估协议。
+- **打包**：`pyproject.toml`（`name=fullstack-opd v2.0.0`）声明 `torch/pydantic/pyyaml` 依赖、`[test]=pytest`、`[gpu]=vllm/megatron-core/ray` 可选依赖、`[project.scripts] fullstack-opd-v2`、`packages=[fullstack_opd, fullstack_opd_v2]`、`pytest.testpaths=tests`。
+
+---
+
+## 4.6 L2 Adaptive Teacher Cache 子系统（已实现并接线）
+
+> ⚠️ **状态修正**：报告旧版称"L2 未实现"。实际 `adaptive_cache.py`（1291 行）已落地完整子系统，且已在 `scheduler.py`（`_train_step_refresh` / `train_refresh_phase`）与 `pipeline.py`（L2 交替相位循环）**接线**。`l2.enabled=False`（默认）时退回 L0/L1 静态路径，故默认行为不变、零回归风险。
+
+### 4.6.1 设计目标
+
+L2 把"训练期用**当前学生** rollout 一批 $(p,r')$、教师实时算 $\Delta_T$、写动态缓存"从设计稿变成可运行子系统，并把"什么时候 refresh、refresh 多少、refresh 哪些 prompt"交给**自适应控制器**而非硬编码。默认 `l2.enabled=false` 退回 L0/L1。
+
+### 4.6.2 核心组件（`adaptive_cache.py`）
+
+| 类 | 职责 |
+|---|---|
+| `RefreshRingBuffer` | 动态缓存环形缓冲（capacity/top_k/vocab）；`append` 写教师 top-K Δ + 行为 `s_old` 支撑 + ref 锚点支撑；`delta_at_student_topk` / `s_old_at_student_topk` / `ref_anchor_at_student_topk` 按当前学生支撑取回；`_utility`（衰减效用）/ `_value_threshold`（价值阈值）；`state_dict` / `load_state_dict` 支持续跑；`mean_disagreement` |
+| `DisagreementComputer` | 算教师 RL/ref 分布对学生的分歧 `D_i^abs`，作为刷新质量信号（`compute` / `gather_chosen_logp`） |
+| `CacheHealthMonitor` | 七维观测（命中率/失效/重复/刷新年龄 p95 等）+ `classify` 状态机 + `record` + `_reason` 文本诊断；observe-only，不影响训练信号 |
+| `DynamicRatioController` | 三信号（base_age / policy_drift / refresh_quality）→ 自适应 $\alpha$；`mode="adaptive"/"fixed"`；`cold_start_adjust` 冷启动调比 |
+| `PromptStateStore` | 每 prompt 状态（reward / disagreement / resp_len / 复用计数 → `novelty`） |
+| `RefreshSelector` | 候选池两阶段价值选择（80% value + 20% coverage）：`select` / `select_with_budget`（Budget-Aware 分桶） |
+| `run_refresh_phase` | 学生短 rollout → 4 次 `response_dists` 取 logp → 算 `D_i^abs` → `append` 进 ring buffer |
+| `compute_rollout_metrics` | 刷新相位产出 `rollout/accuracy_proxy` / `rollout_tokens` / `useful_per_token`（Performance / RolloutTokens / Eff） |
+| `assign_budgets` / `enforce_budget` / `group_by_budget` | Budget-Aware 分桶与 token 预算执行（§4.7） |
+
+### 4.6.3 调度器接线（`scheduler.py`）
+
+- `train_refresh_phase(rb, alpha, n_refresh_steps)`：从 ring buffer 采 `n_refresh_steps` 批做 refresh 训练；$\alpha$ 由 `DynamicRatioController` 决定。
+- `_train_step_refresh(done, rb_idxs, rb)`：refresh 池样本的 teacher-free 稀疏 top-K PG + KL（双池 feeder，G1 闭环）；`REFRESH_LOG_RATIO_MAX=3.0` 对 log-ratio 全局 clamp（IS 上界）+ 纵深防御屏蔽支撑外 `log0`；`_REFRESH_CHUNK=4` 把整批 `(M,T,V)` 拆 chunk 累积，规避双卡并行 OOM。
+- 双池契约：**base 池 s_old 恒用 HF/toy worker**（vLLM 只负责 L2 生成，IMP-2/P1）；**仅 refresh 池**（存 rollout 时刻行为 `s_old`）受陈旧度约束（IMP-2/P3）。
+
+### 4.6.4 管线交替相位（`pipeline.py`）
+
+`pipeline.py` 的 L2 分支（任务 6.1，§13 整合）：启用时**保留** `teacher_rl/teacher_ref` + `warmup_student` 供 refresh rollout（非 L2 仍释放，L0/L1 静态路径零开销）；`l2.enabled` 时进入**交替相位循环**——base 训练相位与 refresh 训练相位交替，`refresh_buffer` 的 `state_dict` 参与 checkpoint 续跑。`async`（默认）与 L2 交替相位互斥时由护栏报错。
+
+### 4.6.5 P-OPD：纯 on-policy 交替相位（2026-08-31，当前唯一训练路径）
+
+**动机**：官方代码重算证明 Eq.13 only_stu 口径信号强（Skywork +0.539 / MATH500 +0.596，RC4 推翻）；
+失败归因转 **RC1（固定 D off-policy 主嫌）** → 纯 on-policy 化（用户决策，回滚 v2 基线后重建）。
+
+**架构**（`l2.pure_refresh=true` + `stage1.skip=true`）：
+```
+[构造] 静态 prompt 集 → 加载教师对（_stage0_teachers，跳过 Stage0 RL）→ 占位 cache（仅 top_k/vocab）
+[循环] while step_done < n_total:
+  [rollout 相位] 当前学生 rollout（m_refresh × n_rollout 条）
+     → 教师 rl/ref only_stu 前向（_rl_ref_delta_only_stu）算 Δ
+     → append ring buffer（ids=学生 top-K，delta，行为 s_old，ref 锚点）
+  [训练相位] train_refresh_phase：从 ring buffer 采样 _train_step_refresh（teacher-free，α 冻结 1.0）
+     → step_done 推进；连续空相位 > max_empty_phases 明确失败
+```
+
+**only_stu 教师 Δ**（`_rl_ref_delta_only_stu`，adaptive_cache.py）：
+$$\Delta_T = \log\pi_{\text{rl}}(y|s)\big|_{\text{学生 top-}K} - \log\pi_{\text{ref}}(y|s)\big|_{\text{学生 top-}K}$$
+- 教师对**学生 top-K 完整支撑**取 logp（`gather(logits, ids) − logsumexp`，与官方 `_compute_teacher_top_k_log_probs` 数学一致），**无交集稀释**（对比旧 `_rl_ref_delta_k`：教师 rl 自身 top-K + ref gather，交集才有效）。
+- 跨词表：学生 id 超教师词表 → Δ 置 0（clamp + mask）；vLLM prompt_logprobs 无法取任意 ids logp → 教师前向一律 HF（per-chunk 省显存）。
+- **F1 约束**：`student_top_k == cache.top_k`（only_stu Δ 写宽与 ring buffer 槽位宽一致，否则 append shape 崩）。
+
+**ring buffer 学生支撑**：`RefreshRingBuffer.ids = s_old_ids`（行为学生 top-K），训练时
+`delta_at_student_topk` 在 s_cur top-K 上匹配（refresh 紧跟 rollout，匹配率近 100%）。
+
+**vLLM 逃生舱**（`rollout_weight_sync="off"`，rollout_vllm.py）：vLLM 0.16 NCCL WeightTransferEngine
+在 Blackwell/Ada 均报 `Expected ... got:cuda`（E18）→ `LLM.apply_model(lambda m: m.load_weights(...))`
+直拷学生权重（仅 `tp_size=1`），保 on-policy 且不依赖 NCCL。
+
+**预算模式 T 恒定**：`max_b = max(budget_set)`（非每相位 `budgets.max()`）——冷启动 v 全等 vs
+后续分位数展开会导致 ring buffer 槽位 T 变化 shape 崩。
+
+**数据量**：每相位 `m_refresh × n_rollout` 条 on-policy 样本入 ring buffer（容量 `refresh_size`）；
+300 步 / `t_train=2` = 150 相位 × 32 = 4800 条 on-policy（默认配置）。
+
+**验证**：`test_onpolicy_refresh.py` 9 项（only_stu 与官方公式一致/跨词表 clamp/学生支撑语义/
+纯 refresh 无 base/断点 round-trip）；全量 599 passed（重建时）。
+
+> 💡 纯 on-policy 下 IS 几乎不需要（refresh 样本 `s_old` 用最新快照算，ρ≈1）；`l2.enabled=false`
+> 明确报错（base 池已删）。
+
+---
+
+## 4.7 预算感知评估（Budget-Aware Evaluation，Stage 1.6 / 1.7）
+
+把"完整 CoT + EOS"的隐式必要条件重构为 **Accuracy(B)**——$B$ = max reasoning token budget，在 Base/L0/L2 间**统一预算**公平比较。
+
+- `budget_eval.py`（468 行）：`extract_final_answer`（boxed → Final Answer marker → benchmark parser → fallback）+ `BudgetEvaluator(AimeEvaluator)`（逐位 EOS 判定 + 双指标 outcome/prefix + token 记账）+ `run_matrix` 跑 `Base/L0/L2 × B∈{256,512,1024,2048,4096}` → md 报告 + 4 图。
+- `budget_curve.py`（344 行）：在 `budget_eval.all_results` 上加效率维度——Budget Curve / AUC / **nAUC**（消除 benchmark 量纲差）/ Efficiency / GainPerToken / ΔA(OPD Gain) / B(A*)。伦理约束：**效率一律用真实 generated reasoning tokens，绝不拿 `max_new_tokens` 当 E[L]**。
+
+---
+
+## 4.8 L2 消融实验矩阵（`experiment.py`）
+
+`experiment.py`（349 行）把"L2 各模块贡献"做成可重跑的 ablation：
+
+- `EXPERIMENT_MATRIX`（**E0-E6**，§10 累加语义）：E0 关 L2 基线 → E1 加 fixed refresh → E2 加 Disagreement → E3 加 Health Monitor → E4 加 Dynamic Ratio → E5 加 Selective Rollout → E6 全开 + Random Rollout 对照。
+- `STAGE2_ROLLOUT_MATRIX`（**S2_E0-E3**）：P-OPD 纯 on-policy 对照 + OPD + 短 rollout 512/1024/2048。
+- `STAGE3_MATRIX`（**S3_E0-E2**）：Budget-Aware Selective Rollout 对比（random 单预算 / selective 单预算 / selective + adaptive 预算）。
+- 工具：`build_config`（点分覆盖生成 toy/CPU 可跑配置）、`run_experiment` / `run_matrix` / `save_results`、`plot_experiments`（8 图，含"teacher compute vs perf"最重要一张）、`aggregate_stage3`（Performance/RolloutTokens/Eff 聚合）。
+- `report_stage2.py`：消费 S2 训练 summary + budget_eval 长预算结果，产出 Q1-Q4 markdown 报告（无数据字段以 `—` 占位，如实标注待服务器实跑）。
+
+> 这些是**实验驱动验证 L2 子系统**的工程骨架，当前 toy/CPU 可跑协议抽象、真实长预算待服务器实跑（见 §5.3 / §9.2）。
 
 ---
 
@@ -817,6 +995,18 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 | vLLM rollout（L3） | `VLLMRolloutEngine.response_dists / update_weights` | `rollout_vllm.py` |
 | Megatron TP=2 learner（L2） | `MegatronCausalToyLM / parallelize_learner_tp2` | `model_megatron.py` |
 | 异步轨迹 (s,a,logp_old) 的承载 | `s_old` 随 `_rq` 元组携带；`a`/`s` 由 `idxs` 索引现取（见 §1.8） | `scheduler.py` |
+| 配置 schema（pydantic, extra=forbid） | `OPDConfig` / `load_config` | `config.py` |
+| CLI 子命令 | `cli:main`（train/cache/eval/info/eval-aime/eval-holdout） | `cli.py` |
+| 可复现 run 目录 | `RunManager` | `run.py` |
+| 断点续跑 | `CheckpointManager`（state_dict+version+step+cfg+metrics） | `checkpoint.py` |
+| 指标追踪 | `MetricsRecorder`（csv/wandb fallback） | `metrics.py` |
+| 结构化日志 / 类型异常 | `setup_logging` / `OPDError` 子类 | `logging.py` / `exceptions.py` |
+| 可插拔数据 / 模型 / 磁盘缓存 | `build_data_loader` / `build_model`(HFCausalLM) / `DiskTeacherCache` | `data.py` / `model_factory.py` / `cache_store.py` |
+| AIME 评估 | `AimeEvaluator` / `extract_answer` | `eval_aime.py` |
+| L2 Adaptive Teacher Cache | `RefreshRingBuffer` / `DisagreementComputer` / `CacheHealthMonitor` / `DynamicRatioController` / `PromptStateStore` / `RefreshSelector` / `run_refresh_phase` | `adaptive_cache.py` |
+| L2 调度器接线 | `_train_step_refresh` / `train_refresh_phase` | `scheduler.py` |
+| 预算感知评估 | `BudgetEvaluator` / `run_matrix` / `budget_curve` 指标 | `budget_eval.py` / `budget_curve.py` |
+| L2 消融矩阵 | `EXPERIMENT_MATRIX`(E0-E6) / `STAGE2_ROLLOUT_MATRIX` / `STAGE3_MATRIX` | `experiment.py` |
 
 ---
 
@@ -837,6 +1027,10 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 | **动作 a** | 本 OPD 里 = `responses`（固定离线数据），按 `idxs` 索引现取，不持久缓存 |
 | **rollout 阶段 log prob** | = `s_old`，随批次入队，learner 重算不了（旧权重已消失），必须携带 |
 | **重放缓冲 replay buffer** | 论文/工业用大容量持久缓冲反复复用样本；本实现是有界在途队列（只走一遍、超期即丢），非 replay buffer |
+| **L2 Adaptive Teacher Cache** | 训练期自适应刷新教师缓存的子系统：ring buffer + 分歧/健康/价值/选择器控制器，把"何时刷、刷多少、刷哪些"自动化 |
+| **P-OPD** | 纯 on-policy 交替相位 OPD：跳过预计算教师得分，refresh 相位现算信号，比标准 OPD 更"在线" |
+| **Budget-Aware Evaluation** | 统一 reasoning token 预算 B 下公平比较 Base/L0/L2 的评估框架（Accuracy(B) + 预算曲线/AUC/nAUC/效率） |
+| **run 目录** | 一次训练的独立可复现目录（config.yaml 快照 + metrics.csv + train.log + checkpoints/） |
 
 ---
 
@@ -1054,8 +1248,8 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 
 ### 9.1 未实现项 / 已知边界（工程）
 
-- **L2 周期刷新**未实现（动态数据集 + refresh 线程 + ring buffer，见第一部分 L2 机制）；
-- **L3 全在线**未实现（回到 Lightning-OPD live teacher）；
+- **L2 周期刷新**已实现并接线（`adaptive_cache.py` + `scheduler.py` `_train_step_refresh` / `train_refresh_phase` + `pipeline.py` 交替相位），默认 `l2.enabled=false` 退回 L0/L1；真实长预算消融（E0-E6 / S2 / S3）待服务器实跑（见 §4.6 / §4.8）。
+- **L3 全在线**为骨架（`VLLMRolloutEngine` + 实时 Δ_T 路径），未完整跑通；
 - **训练数据未用论文 Skywork**：当前训练走默认数据，Skywork-OR1 math 仅完成规格设计未落地
   （见 §8.4【待办】）——这使当前分数无法与论文直接逐点比对；
 - **7B 未蒸馏**：词表硬约束（OPD 要求学生=教师同词表；student=152064 vs teacher=151936）→
@@ -1093,17 +1287,23 @@ loss_pg = pg_loss(s_cur, s_old, delta_d, mask, self.clip_eps)   # 内核不变�
 | 学生更新 | 同步（论文基线） | **异步**（AsyncBatchedScheduler 四线程流水线） |
 | 信用分配 | 分布级 PG | 同 + 稀疏支撑 `delta_for_student_topk` |
 | KL 锚 | 对初始学生分布 | 同 + `low_var_kl_support` 稀疏版（有界近似） |
+| L2 流式适应 | 论文无（离线固定 D） | **已实现**：`adaptive_cache` 子系统 + 双池 feeder 交替相位；`l2.enabled=false` 默认退回 L0/L1 |
+| P-OPD 纯 on-policy | 论文无 | **新增**：`p_oped` / `l2.pure_refresh` 跳过预计算教师得分、纯 on-policy 交替相位 |
 
-### 9.4 复现步骤
+### 9.4 复现步骤（P-OPD 纯 on-policy，2026-08-31）
 
-**训练**（服务器，2×RTX PRO 6000，多学生并发）：
+**训练**（服务器 2×RTX PRO 6000 Blackwell；vLLM 0.16 用 off 逃生舱）：
 
 ```bash
 cd /root/opd/main
-# 单学生：1.7B 200 步 / 4B 60 步
-python -m fullstack_opd_v2 train --config <student_config.yaml>
-# 多学生并发编排（模块 4）
-bash scripts/multistudent/run_all.sh          # SMOKE=1 toy / MODEL_MODE=real 真实
+# 冒烟（n_steps=20 / m_refresh=8）
+python -m fullstack_opd_v2 train --config configs/qwen3_r1_onpolicy.yaml \
+  --run-dir /root/autodl-tmp/runs_r1p/smoke --set stage2.n_steps=20 \
+  --set stage2.rollout_engine=vllm --set stage2.gradient_checkpointing=true \
+  --set stage2.rollout_gpu_mem=0.55 --set stage2.rollout_max_model_len=4096 \
+  --set stage2.teacher_offload=true --set l2.m_refresh=8 \
+  --set l2.rollout.eos_token_id=151645
+# 冒烟通过后全量 300 步（去掉 --set l2.m_refresh=8，用配置默认 32）
 ```
 
 **评估**（论文协议对齐，逐题落盘 + resume）：
@@ -1113,8 +1313,11 @@ python -m fullstack_opd_v2 eval-aime \
   --model <HF 模型路径> \
   --datasets AIME24 AIME25 \
   --n-samples 8 --temperature 0.7 --top-p 0.95 \
-  --metric ave --prompt-style boxed --scoring sympy --chat-template \
+  --metric ave --prompt-style dapo --scoring sympy --chat-template \
   --batch-size 1 --max-new-tokens 8192 --dtype bf16 \
   --out <输出目录> --device cuda:0
 # 中断后重跑同 --out：自动跳过已完成题（resume）
 ```
+
+> **判据**：AIME24/25 ave@32 ≥ 基线 26.7 + 5（论文同口径）；对照 v2 混合方案
+> （E2 0.376 vs Base 0.816 已失败）。

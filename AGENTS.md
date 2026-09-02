@@ -8,9 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 同时打破 **常驻教师 / 同步等待 / 迁移终态** 三重限制。
 
 ```
-小模型 RL ──► 离线缓存「教师对」log-ratio Δ_T ──► Direct-OPD 训练跑在 AsyncOPD 调度器上
- (Stage 0)      (Stage 1 · Lightning-OPD)          (Stage 2 · Direct + Async)
+学生 rollout ──► 教师 only_stu 实时打分 Δ_T ──► ring buffer ──► Direct-OPD 训练
+ (rollout 相位)   (每相位现算, 非预计算)          (学生支撑)   (训练相位, α 冻结 1.0)
 ```
+
+> **2026-08-31 P-OPD 重建**：stage1 预计算缓存（Lightning-OPD 离线 Δ_T）与 base 池（固定 D）
+> **已删除**。训练 = 纯 on-policy 交替相位（rollout ↔ 训练），教师 Δ 用 only_stu 口径
+> （教师对学生 top-K 完整支撑 logp 差，官方重算信号强 Eq.13 +0.539/+0.596）。
 
 | 目录 | 性质 | 说明 |
 |------|------|------|
@@ -32,24 +36,24 @@ Python 解释器注意：顶层 `.venv/` 是空壳（无 torch/pytest）。实�
 ```bash
 cd main
 
-# 测试（42 个，全 CPU，~16s）
+# 测试（569 个，全 CPU，~2min）
 python -m pytest tests/ -q
 python -m pytest tests/test_losses.py -q                      # 单文件
 python -m pytest tests/test_scheduler.py::test_ages_bounded -q # 单测试
 
-# 运行 v2（推荐入口，三者等价；子命令 train 见 cli.py）
+# 运行 P-OPD（推荐入口；子命令 train 见 cli.py）
 python -m fullstack_opd_v2 train
 fullstack-opd-v2 train
 python run_fullstack_v2.py train
 
-# YAML 配置 + 点分 CLI 覆盖
-python -m fullstack_opd_v2 train --config configs/fullstack_opd.yaml
-python -m fullstack_opd_v2 train --set stage2.n_steps=50 --set stage1.warmup_source=mix --set stage1.warmup_M=4
+# P-OPD 主配置（纯 on-policy） + 点分 CLI 覆盖
+python -m fullstack_opd_v2 train --config configs/qwen3_r1_onpolicy.yaml
+python -m fullstack_opd_v2 train --config configs/qwen3_r1_onpolicy.yaml \
+  --set stage2.n_steps=300 --set l2.rollout.eos_token_id=151645
 python -m fullstack_opd_v2 train --device cpu
 
-# v1 基线 / v1-vs-v2 基准
-python run_fullstack.py
-python benchmark.py
+# toy demo（历史路径，仅供 CPU 冒烟）
+python -m fullstack_opd_v2 train --config configs/fullstack_opd.yaml
 ```
 
 上游 repo 的命令（仅在需要对照原版时）：
@@ -61,36 +65,35 @@ python -m opd.cli.train --config configs/examples/opd_gsm8k_0.5b_4gpu.yaml --ove
 
 ## `main/` 架构
 
-**两个并存的包，算法内核相同、执行底座不同。新工作走 v2。**
+**仅 `fullstack_opd_v2/`（v1 `fullstack_opd/` 与 precompute 子系统已于 2026-08-31 删除）。**
 
-- `fullstack_opd/`（v1）：逐样本执行底座，作为算法正确性基线保留。已完整审阅修复 11 处。
-- `fullstack_opd_v2/`（v2）：批量化重构 + GPU 部署骨架。**默认工作目标。**
-
-v2 模块职责：
+v2 模块职责（P-OPD 纯 on-policy）：
 
 | 模块 | 角色 |
 |------|------|
-| `pipeline.py` | 编排器 `FullStackOPDv2` + `DEFAULT_CONFIG_V2` + `CLOUD_CONFIG`（2×RTX PRO 6000 预设）+ `stage0_small_rl` / `stage1_build_cache` |
-| `config.py` | pydantic schema（`extra="forbid"`）+ `load_config()`：YAML → 默认合并 → 点分覆盖 → 校验 |
-| `cache.py` | `TensorTeacherCache`：设备常驻 Δ_T 张量，dense `(N,T,V)` 或 topk `(N,T,K)`；teacher 一致性校验 |
-| `losses.py` | `pg_loss` / `low_var_kl` / `low_var_kl_support` / `expected_reward` |
-| `buffer.py` | `StalenessQueue`（版本号 + 双截断）、`WeightStore`（`acquire_if_newer` 按需加载 + 可选 CPU offload） |
-| `scheduler.py` | `AsyncBatchedScheduler` 四线程流水线；`DistAsyncScheduler` / `WeightBroadcaster` / `parallelize_learner_tp2`（GPU 骨架） |
-| `model.py` / `model_megatron.py` | `CausalToyLM`（占位小 transformer）/ Megatron TP+SP 版 |
-| `rollout_vllm.py` | `VLLMRolloutEngine`：与 `response_dists` 接口对齐的 vLLM 替换 |
-| `demo.py` / `__main__.py` | CLI 入口 |
+| `pipeline.py` | 编排器 `FullStackOPDv2`：加载教师对（`_stage0_teachers`）+ 占位 cache → 纯 refresh 交替相位循环（`run_refresh_phase` ↔ `train_refresh_phase`，`while step_done` 驱动，α 冻结 1.0） |
+| `adaptive_cache.py` | `run_refresh_phase`（学生 rollout → 教师 only_stu 前向算 Δ → ring buffer）、`RefreshRingBuffer`、`_rl_ref_delta_only_stu`（教师对学生 top-K 完整支撑 logp 差） |
+| `config.py` | pydantic schema（`extra="forbid"`）+ `load_config()`；`l2.pure_refresh` / `stage1.skip` / `l2.cache.max_empty_phases` |
+| `cache.py` | `TensorTeacherCache` **占位**（仅 mode/top_k/vocab，无 Δ 数据；base 池已删，训练不消费缓存） |
+| `scheduler.py` | `AsyncBatchedScheduler`（`_train_step_refresh` teacher-free 训练 + `train_refresh_phase`；base 池 `_train_step` 保留标注废弃）；GPU 骨架 `DistAsyncScheduler` / `WeightBroadcaster` |
+| `losses.py` / `buffer.py` | `pg_loss` / `low_var_kl` / `low_var_kl_support`；`StalenessQueue` / `WeightStore` |
+| `model.py` / `model_factory.py` | `CausalToyLM`（toy）/ `HFCausalLM`（真实 HF 模型） |
+| `rollout_vllm.py` | `VLLMRolloutEngine`：vLLM 替换；`rollout_weight_sync=off` 时 `apply_model(load_weights)` 直拷逃生舱（tp=1） |
+| `eval_aime.py` / `budget_eval.py` | 论文对齐评估（ave@32 / DAPO 模板） |
 
-### Stage 2 四线程流水线（`AsyncBatchedScheduler`）
+### P-OPD 交替相位（rollout ↔ 训练）
 
 ```
-PromptFeeder ──(B,)索引──► RolloutCollector ──(idxs,s_old,ver)──► TeacherScorer ──贴 Δ_T──► TrainDispatcher
+[rollout 相位] 当前学生 rollout（m_refresh×n_rollout 条）
+   → 教师 rl/ref only_stu 前向算 Δ（学生 top-K 完整支撑，gather−logsumexp）
+   → append ring buffer（ids=学生 top-K，行为 s_old，ref 锚点）
+[训练相位]   `_train_step_refresh` 从 ring buffer 采样稀疏 top-K PG + KL（teacher-free）
+   → step_done 推进；α 冻结 1.0（100% on-policy）
 ```
 
-- `RolloutCollector` **名字有误导性**：它不自回归采样，只对固定 `(prompts, responses)`
-  做 teacher-forcing 算 `s_old`。真正的 `generate_batch` 只在 Stage 0 和 Stage 1 warmup 用。
-- 权重只在版本推进时加载（`acquire_if_newer`），不是每样本 `load_state_dict`。
-- 陈旧度**双截断**：入队侧 `StalenessQueue.put` 拒收过旧，消费侧 `_train_step` 再查一次。
-- `TrainDispatcher` 用**当前** student 一次批量前向重算 `s_cur`（learner-side recompute 代理）。
+- **无 base 池**：`l2.enabled=false` 明确报错（纯 on-policy 唯一路径）；`scheduler.run`（旧 base 池）不再被调用。
+- 空相位防护：冷启动/池空/rollout 全无效连续超过 `l2.cache.max_empty_phases` 次 → 明确失败（防死循环/静默空跑）。
+- 断点：checkpoint 含 ring buffer（`refresh_buffer`）+ optimizer + RNG，resume 可续跑。
 
 ## 不可回退的算法约束
 
@@ -107,8 +110,9 @@ PromptFeeder ──(B,)索引──► RolloutCollector ──(idxs,s_old,ver)�
 - **teacher 一致性**：`teacher_rl` 与 `teacher_ref` 必须同架构/词表/`d_model`/`max_len`，
   否则引入不可约梯度偏差（`TensorTeacherCache` 会抛 `TeacherConsistencyError`）。
 
-健康信号：`E[Δ_T]` 应随训练单调上升（修复后 −0.18 → +0.72），`staleness age > 0`
-证明异步确实在消费陈旧样本，训练循环内不应出现任何 teacher 前向。
+健康信号：`E[Δ_T]` 应随训练单调上升（旧实验 −0.18 → +0.72 参考）；纯 on-policy 下
+训练相位（`_train_step_refresh`）**无 teacher 前向**（teacher 只在 rollout 相位
+`run_refresh_phase` 算 Δ），`l2.rollout.require_weight_sync` 保证 vLLM 权重同步 fail-closed。
 
 ## 配置约定
 
@@ -124,26 +128,25 @@ stage1 ← {cache_mode, top_k_teacher}，stage2 ← {dtype, top_k_student, offlo
 新增顶层部署键时**必须同步**：在 `_STAGE1_SEEP_KEYS` / `_STAGE2_SEEP_KEYS` 分流表加键 +
 在对应 stage schema 加下渗槽位，否则该开关会被静默忽略、退回默认路径。
 
-## 曝光偏差与 L0–L3 谱
+## 曝光偏差与 on-policy 化
 
-离线固定 `D` 的 OPD 有固有曝光偏差（**不是 bug**，是离线程度的代价）。缓解路径成谱：
+**2026-08-31 P-OPD：已彻底 on-policy**——stage1 预计算缓存（L0/L1 静态路径）与 base 池固定 `D`
+**已删除**。训练样本全部来自**当前学生每相位新鲜 rollout**（rollout 相位 ↔ 训练相位交替），
+教师 Δ 用 only_stu 口径（学生 top-K 完整支撑）实时计算，无曝光偏差、无固定 D 的离线代价。
 
-- **L0** 固定 `D` 永久固定（偏差最大）
-- **L1 已实现**：Stage 1 用初始 student / 教师分布额外采样 M 条拼「胖 D」再 `cache.build`。
-  由 `stage1.warmup_M` / `warmup_source`（`none` | `student_init` | `teacher_perturbed` | `mix`）
-  / `warmup_temperature` 控制，**默认开启（= L1：学生 ref 一次性 rollout 拼胖 D）**，
-  关闭则 `warmup_M=0`+`warmup_source=none`。调度器与缓存内核**零改动**。
-  `stage1_build_cache` 返回 `(cache, fat_prompts, fat_responses)`，Stage 2 的 KL 锚点与调度器
-  都用 `fat_*`——warmup 分布与 KL 锚点必须同源（`student` 因此提前到 Stage 1 前创建）。
-  计数：`student_init` M → `N×(1+M)`；`mix` M → `N×(1+2M)`。
-- **L2 未实现**：周期刷新（常驻 teacher + `_rollout_refresh` 线程 + `cache.append` ring buffer + 混合 feeder）
-- **L3** = 全在线，即退回原版 Lightning-OPD
+历史谱（供理解演进）：
+- **L0** 固定 `D` 永久固定（旧，已删）
+- **L1** warmup 拼胖 D（旧，已删——`stage1.warmup_M` / `warmup_source` 不再消费）
+- **L2（现唯一路径）** 周期刷新 → 已演进为**纯 on-policy 交替相位**（无 base 池，
+  `run_refresh_phase` ↔ `train_refresh_phase`，α 冻结 1.0）
+- **L3** = 全在线（概念保留；当前 P-OPD 即全在线变体）
 
 ## GPU 部署骨架状态
 
 `distributed` / `tp_size>1` / `rollout_engine: vllm` 是**带护栏的骨架**（ray / megatron-core /
-vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。L2 的 colocated 交替相位仍待实现。
-算法内核在分布式路径下被直接复用（`_train_step` 不动）。
+vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。**P-OPD 交替相位已落地**
+（rollout 相位学生生成 + 教师 only_stu 前向 ↔ 训练相位，teacher 在 refresh 相位 CPU offload
+搬回 GPU）。算法内核在分布式路径下被直接复用（`_train_step_refresh` 不动）。
 
 服务器部署方案见 `DEPLOY.md`（统一环境：Python 3.12 / torch 2.9.1 / CUDA 12.8 / vLLM 0.16.0，
 不装完整 verl、裁掉 sglang）与 `OPTIMIZATION_PLAN*.md`（8×A100 / 8×4090 / 2×RTX PRO 6000 三套）。
@@ -159,13 +162,12 @@ vllm 为可选导入，缺失时报错）。本地 CPU demo 默认全关。L2 �
   `--device cuda:0/1` 分别起进程），而非单卡串行 200 条。
 - **训练 / 建缓存**：batch/样本可分片时优先多卡并行（FSDP / 数据并行）；规模超过单卡内存时
   用多卡分载（如 2×RTX PRO 6000 96GB 双卡）。
-- **NCCL 权重同步布局硬约束（vLLM ≥0.16 WeightTransferEngine）**：trainer(rank0) 与
-  vLLM worker(rank1) **必须落在不同物理 GPU**，否则 NCCL 报 `Duplicate GPU detected`
-  且卡死（2026-08-17 GPU 实测）。因此任何含 vLLM on-policy 权重同步（L2 刷新相位 /
-  训练侧 VLLMRolloutEngine）的布局都必须是**交叉分卡**（E1 训练@GPU0+vLLM@GPU1、
-  E2 反之），单卡共置布局从此不可用；规划 4 卡 / DP 布局时须为每对 (训练, vLLM) 预留
-  两组互斥的物理卡。参考实现：`FullStackOPDv2._weight_transfer_init_16` /
-  `trainer_init`（显式 set_device 训练卡）与 vLLM engine 的 `device` 参数。
+- **vLLM 权重同步逃生舱（2026-08-31）**：vLLM 0.16 NCCL WeightTransferEngine 在
+  Blackwell(sm_120) 与 Ada(sm_89) 均报 `Expected ... got:cuda`（`init_weight_transfer_engine`
+  worker 侧，engine poisoned，见 training-errors.md E18）→ **统一用 `rollout_weight_sync=off`**
+  逃生舱：`LLM.apply_model(load_weights)` 直拷（仅 `tp_size=1`，不跨 TP 分发）。on-policy
+  保持（每次 rollout 相位前直拷学生权重进 vLLM）。vLLM 修复后可改回 `auto`（NCCL，需
+  trainer/worker 异卡交叉分卡，2026-08-17 实测 `Duplicate GPU detected` 教训）。
 - 决策顺序：先判断任务是否可分片 → 可分片则**优先并行**；只有任务本身有顺序依赖 / 显存或
   通信瓶颈使并行无收益 / 用户显式指定单卡时，才回退单卡，且应说明原因。
 
@@ -205,11 +207,11 @@ source /etc/network_turbo   # AutoDL 学术加速（代理 github/huggingface）
 
 ## 深入阅读
 
-- `main/README.md` — 三篇论文核心抽取、代码地图、v1→v2 重构对照表、审阅修复记录
+- `main/README.md` — 三篇论文核心抽取、代码地图、P-OPD 重建说明
 - `main/fullstack_opd_v2/TECHNICAL_REPORT.md` — **技术文档与训练分析报告（唯一权威）**：
-  §0–§4 工程实现（端到端时序、数学模型、异步机制、教师离线、信用分配、边界）、
-  §5 benchmark 分数与评估协议、§6 显存、§7 用时、§8 数据构成、§9 已知边界与复现
-- `DEPLOY.md` — 依赖冲突的架构裁剪方案与安装步骤
+  工程实现（端到端时序、数学模型、only_stu 教师 Δ、交替相位、逃生舱）、
+  benchmark 分数与评估协议、显存、用时、数据构成、已知边界与复现
+- `DEPLOY.md` — 依赖冲突的架构裁剪方案与安装步骤（P-OPD：教师 offload + vLLM off 逃生舱）
 
 ## 文档要求（工程实现技术文档 + 训练分析报告）
 
@@ -219,9 +221,10 @@ source /etc/network_turbo   # AutoDL 学术加速（代理 github/huggingface）
 该文档**必须包含**以下部分，缺一不可：
 
 1. **工程实现（按原始论文修改后）**：完整描述三篇论文机制如何叠加、每一步相对原始论文
-   的改动及其理由（例如：离线固定 `D` 的 L0/L1 改动、`renormalize_topk_support` 对齐原始
-   Direct-OPD、跨词表 `delta_for_student_topk`、async 调度器解耦等）。可参考/继承
-   `TECHNICAL_REPORT.md` §0–§4 的数学对齐写法，但要按「当前代码的真实状态」更新。
+   的改动及其理由（例如：**纯 on-policy 交替相位**（删 stage1 预计算缓存 + base 池固定 D）、
+   **only_stu 教师 Δ 口径**（`_rl_ref_delta_only_stu` 对学生 top-K 完整支撑 gather−logsumexp）、
+   `renormalize_topk_support` 对齐原始 Direct-OPD、vLLM `rollout_weight_sync=off` 逃生舱等）。
+   可参考/继承 `TECHNICAL_REPORT.md` 的数学对齐写法，但要按「当前代码的真实状态」更新。
 
 2. **训练分析（必须含 benchmark 分数与协议）**：
    - **训练前后（pre/post）的 benchmark 分数对比**：基座 vs 学生（如 1.7B/7B/4B 三档），
@@ -232,7 +235,7 @@ source /etc/network_turbo   # AutoDL 学术加速（代理 github/huggingface）
      协议测出，绝不混用（本项目踩过 pass@1 vs ave@32 混报的坑）。
    - 若某数字是短生成（如 2048）测的，必须显式标注"短生成，非论文协议"。
 
-3. **训练与评估的显存占用分析**：逐阶段（stage0 RL / stage1 cache build / stage2 训练 /
+3. **训练与评估的显存占用分析**：逐阶段（教师对加载 / 交替相位训练 + 教师 only_stu 前向 /
    AIME 评估）实测或推算显存峰值，说明构成（权重 / KV cache / logits / 激活 / 中间张量）。
    记录关键教训，例如：长序列（32K）× 大 vocab（151936）下 **logits 张量是隐形显存杀手**；
    `attn_implementation` 未显式设 flash_attn 时 SDPA 开销大；batch_size 与峰值显存的关系。
@@ -242,10 +245,11 @@ source /etc/network_turbo   # AutoDL 学术加速（代理 github/huggingface）
 
 5. **训练数据构成分析**：数据集来源（Skywork/DAPO/AIME）、训练集与评估集划分、每条样本
    prompt 模板、`max_prompt_length` / `max_response_length` / `MAX_VAL_RESP_LENGTH` 等长度
-   配置、教师对 Δ_T 的缓存模式（dense/topk、top_k）、warmup 拼接对数据量的影响（`N×(1+M)`）。
+   配置、**纯 on-policy 数据量**（每相位 `m_refresh × n_rollout` × 相位数，ring buffer 容量
+   `refresh_size`）、only_stu 教师 Δ 的 top_k 支撑（= `cache.top_k`，无预计算缓存）。
 
-6. **其他必要信息**：参考原始论文的机制速查、已知边界与未实现项（如 L2 周期刷新）、
-   复现步骤（命令 + 配置）、与本文件其它节（架构/算法约束/配置约定）的交叉引用。
+6. **其他必要信息**：参考原始论文的机制速查、已知边界与未实现项（如 vLLM weight transfer
+   逃生舱仅 tp=1）、复现步骤（命令 + 配置）、与本文件其它节（架构/算法约束/配置约定）的交叉引用。
 
 > 写作时遵循「代码注释、文档、提交信息均用中文」的全局要求。文档随代码演进持续维护，
 > 不要让它过期（当前代码的真实状态为准，不沿用旧描述）。

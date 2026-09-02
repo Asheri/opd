@@ -3,9 +3,13 @@
 把三篇 OPD 论文**全栈叠加**成一个可运行的流水线 demo：
 
 ```
-小模型 RL  ──►  离线缓存「教师对」log-ratio (Δ_T)  ──►  Direct-OPD 训练跑在 AsyncOPD 调度器上
- (Stage 0)        (Stage 1 · Lightning-OPD)              (Stage 2 · Direct + Async)
+学生 rollout ──► 教师 only_stu 实时打分 Δ_T ──► ring buffer ──► Direct-OPD 训练
+ (rollout 相位)   (每相位现算, 非预计算)         (学生支撑)   (训练相位, α 冻结 1.0)
 ```
+
+> **2026-08-31 P-OPD 重建**：stage1 预计算缓存（Lightning-OPD 离线 Δ_T）与 base 池（固定 D）
+> **已删除**，训练 = 纯 on-policy 交替相位（only_stu 教师 Δ 口径，官方重算信号强 +0.539/+0.596）。
+> 历史描述（Lightning-OPD 离线缓存）见下方 §1，供理解演进。
 
 目标：**同时摆脱三重限制**——
 
@@ -65,10 +69,19 @@ main/
 
 ```bash
 cd C:/Users/12062/OneDrive/Desktop/opd/main
-python run_fullstack.py
+
+# P-OPD 主训练配置（纯 on-policy，见 AGENTS.md 开发命令）
+python -m fullstack_opd_v2 train --config configs/qwen3_r1_onpolicy.yaml
+# CPU toy 冒烟（历史 demo 配置）
+python -m fullstack_opd_v2 train --config configs/fullstack_opd.yaml --device cpu
+
+# 全量测试
+python -m pytest tests/ -q
 ```
 
-> demo 仅依赖 `torch`（CPU、极小词表即可跑通端到端，证明全栈叠加逻辑正确）。真实训练时把 `ToyModel` 换成 `async-opd` 的 rollout/trainer、`Direct-OPD/verl` 的 actor、`Lightning-OPD/slime` 的 teacher 缓存即可。
+> demo 仅依赖 `torch`（CPU、极小词表即可跑通端到端，证明全栈叠加逻辑正确）。真实训练时把
+> `ToyModel` 换成 `async-opd` 的 rollout/trainer、`Direct-OPD/verl` 的 actor；vLLM rollout
+> 权重同步走 `rollout_weight_sync=off` 逃生舱（`apply_model(load_weights)` 直拷，仅 tp=1）。
 
 ---
 

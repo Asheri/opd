@@ -23,7 +23,7 @@ gpu = ["vllm", "megatron-core>=0.16", "ray"]
 fullstack-opd-v2 = "fullstack_opd_v2.cli:main"
 
 [tool.setuptools]
-packages = ["fullstack_opd", "fullstack_opd_v2"]
+packages = ["fullstack_opd_v2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

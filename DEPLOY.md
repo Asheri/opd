@@ -138,3 +138,8 @@ P2：梯度裁剪、全局播种、dropout=0、teacher 一致性校验加强、w
 - `requirements-lightning-opd.txt` — 备选：完整 slime 训练器
 - `requirements-demo.txt` — `main/` demo 最小环境（仅 torch）
 - `main/` — 全栈叠加 demo（CPU 可跑，已审阅修复，回归 exit 0）
+
+> ⚠️ **2026-08-31 P-OPD 标注**：本指南的 Stage 1 离线缓存（Lightning-OPD 预计算教师 Δ）
+> 已删除——训练 = 纯 on-policy 交替相位（only_stu 实时打分 + vLLM `rollout_weight_sync=off`
+> 逃生舱仅 tp=1）。主配置 `main/configs/qwen3_r1_onpolicy.yaml`，见 AGENTS.md / TECHNICAL_REPORT §4.6.5。
+
