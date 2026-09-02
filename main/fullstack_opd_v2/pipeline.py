@@ -570,7 +570,11 @@ class FullStackOPDv2:
                     # （把 OOM 从训练中提前到启动，并打印双方占用）。
                     if str(rollout_device).startswith("cuda") and torch.cuda.is_available():
                         _free_gb = torch.cuda.mem_get_info(rollout_device)[0] / 2**30
-                        _eng_gb = float(s2cfg.get("rollout_gpu_mem", 0.9)) * 96.0
+                        # 2026-09-02（重建后恢复 bd74496 修复）：按 vLLM 检测到的卡显存动态算，
+                        # 非硬编码 96.0——2×48GB（RTX4090）下 0.55×96=52.8 > 47 误判 fail-fast。
+                        _rollout_total = torch.cuda.get_device_properties(
+                            rollout_device).total_memory / 2**30
+                        _eng_gb = float(s2cfg.get("rollout_gpu_mem", 0.9)) * _rollout_total
                         # 异卡（train@cuda:0 / rollout@cuda:1）时 rollout 卡无训练驻留，
                         # 只要求引擎份额；同卡（训练+vLLM 共卡）才叠加训练侧预留。
                         _min_free = (float(s2cfg.get("rollout_min_free_gb", 25.0))
